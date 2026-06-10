@@ -1,0 +1,223 @@
+version: '3'
+
+set: [errexit, pipefail]
+
+# Optional, untracked local overrides (personal tasks, machine-specific tweaks).
+includes:
+  local:
+    taskfile: Taskfile.local.yml
+    optional: true
+    flatten: true
+
+vars:
+  # CARGO_HOME: '{{.HOME}}/.local/share/cargo'
+  BIN_NAME: ji
+
+# env:
+#   CARGO_HOME: '{{.CARGO_HOME}}'
+#   RUSTUP_HOME: '{{.HOME}}/.local/share/rustup'
+#   PATH: '{{.CARGO_HOME}}/bin:{{.PATH}}'
+
+tasks:
+
+  # === BUILD ===
+
+  build:
+    desc: Build in debug mode
+    sources:
+      - src/**/*.rs
+      - Cargo.toml
+      - Cargo.lock
+    generates:
+      - target/debug/{{.BIN_NAME}}
+    cmds:
+      - cargo build
+
+  build:clean:
+    desc: Nuke all caches and do a full dev build + install from scratch
+    cmds:
+      - task: clean
+      - cargo build
+
+  release:
+    # Use `task release --force` to rebuild regardless of file fingerprints.
+    desc: Build universal macOS binary, generate man + completions, and install
+    sources:
+      - src/**/*.rs
+      - xtask/src/**/*.rs
+      - Cargo.toml
+      - Cargo.lock
+    cmds:
+      # Universal binary: build for both architectures, then lipo.
+      # `rustup target add` is idempotent; cheap re-run is safe.
+      - rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - cargo build --release --target aarch64-apple-darwin
+      - cargo build --release --target x86_64-apple-darwin
+      - mkdir -p target/universal
+      - lipo -create
+          -output target/universal/{{.BIN_NAME}}
+          target/aarch64-apple-darwin/release/{{.BIN_NAME}}
+          target/x86_64-apple-darwin/release/{{.BIN_NAME}}
+      - task: gen-man
+      - task: gen-completions
+      - cp target/universal/{{.BIN_NAME}} '{{.HOME}}/.local/bin/'
+      # Apple universal-binary flow: lipo merge first, codesign the merged
+      # output. Re-signing per-architecture would also work but doubles the
+      # work and signs binaries the user never installs.
+      - codesign -f -s - '{{.HOME}}/.local/bin/{{.BIN_NAME}}'
+      - mkdir -p '{{.HOME}}/.local/share/man/man1'
+      - cp target/man/{{.BIN_NAME}}.1 '{{.HOME}}/.local/share/man/man1/'
+      - '{{.HOME}}/.local/bin/{{.BIN_NAME}} config shell install fish'
+      - '{{.HOME}}/.local/bin/{{.BIN_NAME}} config shell install zsh'
+
+  gen-man:
+    desc: Generate the ji(1) man page (target/man/ji.1)
+    cmds:
+      - cargo xtask gen-man
+
+  gen-completions:
+    desc: Generate shell completions (target/completions/)
+    cmds:
+      - cargo xtask gen-completions
+
+  release:clean:
+    desc: Nuke all caches and do a full release build + install from scratch
+    cmds:
+      - task: clean
+      - task: release
+
+  # === CLEAN ===
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - cargo clean
+      - rm -rf .task
+
+  # === CODE QUALITY ===
+
+  check:
+    desc: Run cargo check (fast type/borrow checking)
+    cmds:
+      - cargo check
+
+  clippy:
+    desc: Run clippy lints across lib, bins, tests, examples, and xtask
+    cmds:
+      # --all-targets covers integration tests and the xtask crate. Plain
+      # `cargo clippy` would only lint lib + main bin and miss test files.
+      - cargo clippy --all-targets -- -D warnings
+
+  fmt:
+    desc: Format code
+    cmds:
+      - cargo fmt
+
+  fmt-check:
+    desc: Check formatting without modifying files
+    cmds:
+      - cargo fmt -- --check
+
+  lint:
+    desc: Run all lints (clippy + format check)
+    cmds:
+      - task: clippy
+      - task: fmt-check
+
+  test:
+    desc: Run all tests
+    cmds:
+      # --locked: fail loudly on a stale Cargo.lock instead of silently
+      # rewriting it (same discipline in CI and on contributor machines).
+      - cargo test --locked
+
+  tests:
+    desc: Alias for test
+    cmds:
+      - task: test
+
+  deny:
+    desc: Supply-chain audit (cargo-deny)
+    cmds:
+      - cargo install --locked cargo-deny
+      - cargo deny check
+
+  machete:
+    desc: Detect unused dependencies (cargo-machete)
+    cmds:
+      - cargo install --locked cargo-machete
+      - cargo machete
+
+  ci:
+    desc: Mirror of CI workflow — build + lint + test + deny + machete
+    cmds:
+      - cargo build --release --locked
+      - task: lint
+      - task: test
+      - task: deny
+      - task: machete
+
+  # === RUN & DEBUG ===
+
+  run:
+    desc: Run ji with arguments
+    deps: [build]
+    cmds:
+      - ./target/debug/{{.BIN_NAME}} {{.CLI_ARGS}}
+
+  ws:
+    desc: Run ji ws (workspace switcher)
+    deps: [build]
+    cmds:
+      - ./target/debug/{{.BIN_NAME}} ws
+
+  # === DEVELOPMENT ===
+
+  dev:
+    desc: Watch source files and rebuild on change
+    watch: true
+    sources:
+      - src/**/*.rs
+      - Cargo.toml
+    cmds:
+      - cargo build 2>&1
+
+  # === MAINTENANCE ===
+
+  update:
+    desc: Update Rust toolchain and all dependencies to latest versions
+    cmds:
+      - rustup update
+      # Bump rust-version in Cargo.toml to match the installed stable so
+      # cargo upgrade / cargo update don't constrain to the old MSRV.
+      - sed -i '' "s/^rust-version = .*/rust-version = \"$(rustc +stable --version | grep -oE '[0-9]+\.[0-9]+')\"/g" Cargo.toml
+      # cargo-edit provides `cargo upgrade`, which is the only path past
+      # the semver-major boundary that `cargo update` refuses to cross.
+      - cargo install --locked cargo-edit
+      - cargo upgrade --incompatible
+      - cargo update
+      - cargo fetch
+
+  # === INTERACTIVE TESTING ===
+
+  playground:
+    desc: Scaffold a test repo with multiple workspaces
+    cmds:
+      - ./tests/interactive.sh
+
+  playground:paths:
+    desc: Test workspace path expansion with unrecognized template variable
+    cmds:
+      - ./tests/playground_paths.sh
+
+  playground:advance:
+    desc: Test advance-parent behavior when creating workspaces
+    cmds:
+      - ./tests/playground_advance.sh
+
+  playground:divergence:
+    desc: Scaffold a test repo with divergent revisions
+    cmds:
+      - ./tests/playground_divergent.sh
+
+

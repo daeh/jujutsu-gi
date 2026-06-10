@@ -1,0 +1,9 @@
+# Build artifacts.
+/target
+/.task
+
+# ji runtime logs (written when JI_LOG is enabled).
+/.ji/
+
+# macOS Finder metadata.
+.DS_Store

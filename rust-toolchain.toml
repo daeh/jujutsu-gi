@@ -1,0 +1,7 @@
+[toolchain]
+channel = "stable"
+# Minimal install (rustc + rust-std + cargo) plus the two tools `task lint`
+# needs. Faster `rustup` on fresh checkouts than the default profile, which
+# also pulls rust-docs and rust-analyzer.
+components = ["clippy", "rustfmt"]
+profile = "minimal"

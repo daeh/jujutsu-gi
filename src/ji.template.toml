@@ -1,0 +1,107 @@
+# ji project configuration
+# Location: .config/ji.toml (check into version control)
+#
+# ============================================================================
+# Template variables
+# ============================================================================
+#
+# workspace-path variables:
+#   {{ home }}                    - user home directory
+#   {{ repo }}                    - repo name (see below; defaults to directory name)
+#   {{ bookmark }}                - bookmark name (/ replaced with -)
+#   {{ default_workspace_path }}  - absolute path to the default workspace
+#
+# Hook and file template variables (all of the above, plus):
+#   {{ workspace_path }}          - absolute path to the new workspace
+#   {{ workspace_name }}          - directory name of the new workspace
+#   {{ change_id }}               - jj change ID of the new workspace's @
+#
+# ============================================================================
+# Repo Name
+# ============================================================================
+# Override the "{{ repo }}" template variable. Defaults to the repository
+# directory name if unset or empty.
+# In workspace-path, "{{ bookmark }}" is required to ensure each workspace has
+# a unique path.
+# Use "{{ home }}" for the home directory ("~" and "${HOME}" are not expanded).
+#
+# repo = "myproject"
+#
+# workspace-path = "../{{ repo }}.{{ bookmark }}"
+#
+# ============================================================================
+# Log Template
+# ============================================================================
+# Custom jj template for the graph pane display. Passed to `jj log --template`.
+# If unset, jj's default 2-line template is used.
+# NB:
+# - The number of "\n" in the template determines lines per revision.
+# - Conditional "\n" in templates may cause the change-id overlay to misalign.
+#
+# log-template = '''
+# concat(
+#   separate(" ",
+#     change_id.shortest(),
+#     if(working_copies, label("rest", "{ " ++ working_copies ++ " }"), ""),
+#     if(bookmarks, label("rest", "[ " ++ bookmarks ++ " ]"), ""),
+#     if(empty, label("empty", "(empty)"), ""),
+#     if(conflict, label("conflict", "CONFLICT"), ""),
+#     if(self.divergent(), label("divergent", "DIVERGENT"), ""),
+#     if(self.hidden(), "(hidden)", "")
+#   ),
+#   " > ",
+#   if(description == "",
+#     label("description placeholder", "(no desc)"),
+#     label("rest", description.first_line())
+#   ),
+#   "\n"
+# )
+# '''
+#
+# ============================================================================
+# Author Override
+# ============================================================================
+# Override the author on revisions created by ji.
+# Format: "Name <email>"
+#
+# ji-author = "Jujutsu Gi <ji@null.com>"
+#
+# ============================================================================
+# Hooks
+# ============================================================================
+# Hooks run in the new workspace directory after creation.
+# Each entry is a named command run via `sh -c`.
+# NB:
+# - pre-start hooks are blocking (sequential, fail-fast).
+# - post-start hooks are fire-and-forget (spawned in background).
+#
+# [pre-start]
+# deps = "uv sync"
+# mcp = """
+# if [ -f .mcp.json ]; then
+#   sed -i '' "s|{{ default_workspace_path }}|{{ workspace_path }}|g" .mcp.json
+# fi
+# """
+#
+# [post-start]
+# server = "npm run dev"
+#
+# ============================================================================
+# File Templates
+# ============================================================================
+# Files to generate in new workspaces. Key is the relative path, value is the 
+# content with template variables expanded. 
+# File Templates use the template variables as hooks ("{{ workspace_path }}", etc.).
+# Parent directories are created automatically.
+#
+# [templates]
+# ".mcp.json" = """
+# {
+#   "mcpServers": {
+#     "myserver": {
+#       "command": "node",
+#       "args": ["{{ workspace_path }}/server.js"]
+#     }
+#   }
+# }
+# """

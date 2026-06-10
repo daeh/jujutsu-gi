@@ -1,0 +1,8 @@
+# Stable rustfmt accepts only stable options. Unstable options (e.g.
+# imports_granularity, group_imports) emit a warning on stable channel
+# and are not applied; left out here. Nightly contributors can override
+# via their own rustfmt.toml or a `--unstable-features` flag.
+edition = "2024"
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true

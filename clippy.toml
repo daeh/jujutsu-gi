@@ -1,0 +1,7 @@
+# Project-level clippy thresholds.
+#
+# Looser-than-default for the TUI/event-handler god-object in src/tui/mod.rs
+# (~3kLoC). Tightening these is a follow-up structural refactor.
+
+cognitive-complexity-threshold = 30
+too-many-lines-threshold = 300

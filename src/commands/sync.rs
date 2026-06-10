@@ -1,0 +1,91 @@
+use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use crate::{jj_utils, jujutsu, operations};
+
+use super::types::SyncModeInfo;
+
+/// Owned-data mirror of the borrow-typed args to `sync_with_info`, used to
+/// shuttle a deferred sync invocation from a TUI key-handler into the
+/// `run_tui` drain block (see `PendingHandoff::Sync`).
+pub struct SyncParamsOwned {
+    pub repo_root: PathBuf,
+    pub info: SyncModeInfo,
+    pub source_name: String,
+    pub source_path: PathBuf,
+    pub target_name: String,
+    pub target_path: PathBuf,
+    pub workspace_path_template: String,
+    pub repo_name: String,
+    pub author: Option<String>,
+}
+
+/// Execute sync between two workspaces.
+///
+/// Detects sync mode, validates head info, calls `operations::sync`,
+/// and handles post-op cleanup (staleness + bookmark advancement).
+#[allow(clippy::too_many_arguments)]
+pub fn sync(
+    repo: &Path,
+    src_name: &str,
+    src_path: &Path,
+    tgt_name: &str,
+    tgt_path: &Path,
+    workspace_path_template: &str,
+    repo_name: &str,
+    author: Option<&str>,
+) -> Result<operations::SyncOutcome> {
+    sync_with_info(
+        repo,
+        &super::detect_sync_mode(repo, src_name, tgt_name),
+        src_name,
+        src_path,
+        tgt_name,
+        tgt_path,
+        workspace_path_template,
+        repo_name,
+        author,
+    )
+}
+
+/// Execute sync with pre-computed sync info (TUI path).
+#[allow(clippy::too_many_arguments)]
+pub fn sync_with_info(
+    repo: &Path,
+    info: &SyncModeInfo,
+    src_name: &str,
+    src_path: &Path,
+    tgt_name: &str,
+    tgt_path: &Path,
+    workspace_path_template: &str,
+    repo_name: &str,
+    author: Option<&str>,
+) -> Result<operations::SyncOutcome> {
+    let (src_hi, tgt_hi) = super::validate_head_info(repo, info, src_name, tgt_name)?;
+
+    let outcome = operations::sync(
+        repo, src_name, src_path, &src_hi, tgt_name, tgt_path, &tgt_hi, author,
+    )?;
+
+    if let operations::SyncOutcome::Done { mut warnings } = outcome {
+        // Resolve the legitimate stale state created when each workspace's `@`
+        // was rewritten from the other via --ignore-working-copy. Not a hedge
+        // against jj 0.41's reduced sibling-op false positives (#9314).
+        let _ = jujutsu::update_workspace_stale(src_path);
+        let _ = jujutsu::update_workspace_stale(tgt_path);
+        // Advance singular bookmarks for both workspaces to their effective head.
+        for ws_name in [src_name, tgt_name] {
+            if let Err(e) = jj_utils::advance_singular_bookmark_to_effective_head(
+                repo,
+                workspace_path_template,
+                repo_name,
+                ws_name,
+            ) {
+                warnings.push(format!("{e:#}"));
+            }
+        }
+        return Ok(operations::SyncOutcome::Done { warnings });
+    }
+
+    Ok(outcome)
+}

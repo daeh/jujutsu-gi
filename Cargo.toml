@@ -1,0 +1,112 @@
+[workspace]
+members = [".", "xtask"]
+
+[package]
+name = "ji"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Jujutsu workspace manager TUI"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/daeh/jujutsu-gi"
+homepage = "https://github.com/daeh/jujutsu-gi"
+categories = ["development-tools"]
+keywords = ["jj", "jujutsu", "tui", "vcs"]
+
+[lib]
+name = "ji"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ji"
+path = "src/main.rs"
+
+[dependencies]
+ansi-to-tui = "8.0"
+blake3 = "1"
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+crossterm = "0.29"
+humantime = "2"
+ratatui = "0.30"
+semver = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+rust_2024_compatibility = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+# Deferred:
+# - missing_debug_implementations: 18 sites; low value for an application crate
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Pedantic opt-outs — idiomatic noise for an application (not a library).
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# High-volume lints deferred for now:
+doc_markdown = "allow"            # pedantic doc-style, low value
+missing_const_for_fn = "allow"    # would inflate diff substantially
+cast_possible_truncation = "allow" # TUI uses usize→u16 deliberately
+cast_possible_wrap = "allow"      # same rationale
+cast_sign_loss = "allow"          # same rationale
+cast_lossless = "allow"           # same rationale
+struct_field_names = "allow"      # pedantic noise
+needless_pass_by_value = "allow"  # would require many signature changes
+trivially_copy_pass_by_ref = "allow"
+too_many_lines = "allow"          # known TUI/event-handler hot spots
+map_unwrap_or = "allow"           # readability is a wash
+option_if_let_else = "allow"      # ditto
+similar_names = "allow"           # ditto
+items_after_statements = "allow"  # ditto
+# uninlined_format_args: pedantic default (warn) applies.
+redundant_closure_for_method_calls = "allow"
+redundant_pub_crate = "allow"     # bulk pub(crate) sweep deferred
+derive_partial_eq_without_eq = "allow"
+match_same_arms = "allow"
+single_match_else = "allow"
+manual_let_else = "allow"         # auto-fixable; defer
+collapsible_if = "allow"
+collapsible_else_if = "allow"
+fn_params_excessive_bools = "allow"
+struct_excessive_bools = "allow"
+unnested_or_patterns = "allow"
+bool_to_int_with_if = "allow"
+needless_raw_string_hashes = "allow"
+range_plus_one = "allow"
+unused_self = "allow"
+too_long_first_doc_paragraph = "allow"
+collapsible_match = "allow"
+let_underscore_must_use = "allow"
+let_underscore_untyped = "allow"
+useless_let_if_seq = "allow"
+needless_late_init = "allow"
+single_match = "allow"
+ignored_unit_patterns = "allow"
+format_push_string = "allow"
+or_fun_call = "allow"
+unnecessary_wraps = "allow"
+use_self = "allow"                # 30 sites — pedantic stylistic
+needless_bool = "allow"
+needless_return = "allow"
+unnecessary_semicolon = "allow"
+nonminimal_bool = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# panic = "abort" intentionally NOT set — anyhow's chain-of-context relies
+# on unwind, so abort would lose error context on panic.
