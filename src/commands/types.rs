@@ -187,16 +187,13 @@ impl TryFrom<Operation> for TransferMethod {
 // ---------------------------------------------------------------------------
 
 /// Result of close/transfer execution.
-#[allow(dead_code)]
 pub struct CloseTransferResult {
-    /// The concrete operation that was executed.
-    pub operation_used: Operation,
     /// Workspaces that remained stale after post-op cleanup.
     pub stale_warnings: Vec<String>,
     /// Third-party workspaces predicted to become stale by this operation.
+    /// Production resolves these internally; integration tests read the set
+    /// to pin the prediction logic.
     pub predicted_stale: Vec<String>,
-    /// Source workspace was closed (forgotten).
-    pub source_forgotten: bool,
     /// Path to remove if user confirms file deletion.
     pub pending_remove_path: Option<PathBuf>,
 }

@@ -3,6 +3,15 @@ use std::path::Path;
 
 use crate::{jj_utils, jj_utils::WorkspaceHeadInfo, jujutsu};
 
+/// A workspace as the operations layer consumes it: name, on-disk path, and
+/// pre-computed head info.
+#[derive(Clone, Copy)]
+pub struct WsRef<'a> {
+    pub name: &'a str,
+    pub path: &'a Path,
+    pub info: &'a WorkspaceHeadInfo,
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -135,6 +144,7 @@ pub fn create_workspace(
 // ---------------------------------------------------------------------------
 
 /// Outcome of a sync operation.
+#[derive(Debug)]
 pub enum SyncOutcome {
     AlreadyInSync,
     /// Sync completed. May carry warnings from non-critical cleanup
@@ -150,19 +160,14 @@ pub enum SyncOutcome {
 /// or merge) via the last common ancestor, then executes the operation.
 ///
 /// Callers are responsible for resolving workspace staleness afterward.
-#[allow(clippy::too_many_arguments)]
 pub fn sync(
     repo: &Path,
-    src_name: &str,
-    src_path: &Path,
-    src_info: &WorkspaceHeadInfo,
-    tgt_name: &str,
-    tgt_path: &Path,
-    tgt_info: &WorkspaceHeadInfo,
+    src: WsRef<'_>,
+    tgt: WsRef<'_>,
     author: Option<&str>,
 ) -> Result<SyncOutcome> {
-    let src_head = &src_info.effective_head;
-    let tgt_head = &tgt_info.effective_head;
+    let src_head = &src.info.effective_head;
+    let tgt_head = &tgt.info.effective_head;
 
     let lca = jujutsu::last_common_ancestor(repo, src_head, tgt_head)
         .context("failed to find common ancestor")?;
@@ -176,83 +181,68 @@ pub fn sync(
 
     if tgt_at_lca {
         // Safety: target @ is moved to new child of source's head.
-        if tgt_info.trivial_id.is_none() {
-            let tgt_revset = jj_utils::ws_head_revset(tgt_name);
+        if tgt.info.trivial_id.is_none() {
+            let tgt_revset = jj_utils::ws_head_revset(tgt.name);
             if let jj_utils::RevisionSafety::AtRisk { change_id } =
-                jj_utils::check_working_copy_safety(repo, &tgt_revset, tgt_path)?
+                jj_utils::check_working_copy_safety(repo, &tgt_revset, tgt.path)?
             {
                 bail!(
-                    "workspace {tgt_name} has undescribed work in {change_id}; \
-                     describe the revision first"
+                    "workspace {ws_name} has undescribed work in {change_id}; \
+                     describe the revision first",
+                    ws_name = tgt.name
                 );
             }
         }
-        let warnings = fast_forward(
-            repo,
-            tgt_name,
-            tgt_path,
-            tgt_info.trivial_id.as_deref(),
-            src_name,
-            src_head,
-            author,
-        )?;
-        let _ = jj_utils::step_head(repo, src_name, src_path, None, author);
+        let warnings = fast_forward(repo, tgt, src.name, src_head, author)?;
+        let _ = jj_utils::step_head(repo, src.name, src.path, None, author);
         return Ok(SyncOutcome::Done { warnings });
     }
 
     if src_at_lca {
         // Safety: source @ is moved to new child of target's head.
-        if src_info.trivial_id.is_none() {
-            let src_revset = jj_utils::ws_head_revset(src_name);
+        if src.info.trivial_id.is_none() {
+            let src_revset = jj_utils::ws_head_revset(src.name);
             if let jj_utils::RevisionSafety::AtRisk { change_id } =
-                jj_utils::check_working_copy_safety(repo, &src_revset, src_path)?
+                jj_utils::check_working_copy_safety(repo, &src_revset, src.path)?
             {
                 bail!(
-                    "workspace {src_name} has undescribed work in {change_id}; \
-                     describe the revision first"
+                    "workspace {ws_name} has undescribed work in {change_id}; \
+                     describe the revision first",
+                    ws_name = src.name
                 );
             }
         }
-        let warnings = fast_forward(
-            repo,
-            src_name,
-            src_path,
-            src_info.trivial_id.as_deref(),
-            tgt_name,
-            tgt_head,
-            author,
-        )?;
-        let _ = jj_utils::step_head(repo, tgt_name, tgt_path, None, author);
+        let warnings = fast_forward(repo, src, tgt.name, tgt_head, author)?;
+        let _ = jj_utils::step_head(repo, tgt.name, tgt.path, None, author);
         return Ok(SyncOutcome::Done { warnings });
     }
 
-    let warnings = merge(
-        repo, src_name, src_path, src_info, tgt_name, tgt_path, tgt_info, author,
-    )?;
+    let warnings = merge(repo, src, tgt, author)?;
     Ok(SyncOutcome::Done { warnings })
 }
 
-/// Fast-forward `behind` workspace to `ahead_head`.
+/// Fast-forward the `behind` workspace to `ahead_head`.
 ///
-/// `behind_trivial` is the pre-computed trivial head ID for the behind
-/// workspace (if any). Avoids a redundant `check_trivial_head` call.
+/// `behind.info.trivial_id` is trusted as pre-computed — avoids a redundant
+/// `check_trivial_head` call.
 ///
 /// Callers are responsible for resolving workspace staleness afterward.
 pub fn fast_forward(
     repo: &Path,
-    behind_name: &str,
-    behind_path: &Path,
-    behind_trivial: Option<&str>,
+    behind: WsRef<'_>,
     ahead_name: &str,
     ahead_head: &str,
     author: Option<&str>,
 ) -> Result<Vec<String>> {
     // 1. Create FF revision — moves behind's @ to a new revision on ahead_head.
-    let detail = format!("{behind_name}@ to {ahead_name}@{ahead_head}");
+    let detail = format!(
+        "{behind_name}@ to {ahead_name}@{ahead_head}",
+        behind_name = behind.name
+    );
     jj_utils::make_head(
         repo,
-        behind_name,
-        behind_path,
+        behind.name,
+        behind.path,
         Some(ahead_head),
         jj_utils::Op::FastForward,
         Some(&detail),
@@ -261,53 +251,40 @@ pub fn fast_forward(
     .context("fast-forward failed (jj undo to recover)")?;
 
     // 2. Abandon the old trivial head now that the new structure is in place.
-    let warnings = match behind_trivial {
-        Some(id) => match jj_utils::abandon_trivial_heads(repo, &[id]) {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format!("{e:#}")],
-        },
-        None => Vec::new(),
-    };
-
-    Ok(warnings)
+    Ok(find_abandon_trivial_heads(repo, &[behind.info]))
 }
 
 /// Merge two workspaces using pre-computed effective heads.
 ///
 /// Callers are responsible for resolving workspace staleness afterward.
-#[allow(clippy::too_many_arguments)]
 pub fn merge(
     repo: &Path,
-    src_name: &str,
-    src_path: &Path,
-    src_info: &WorkspaceHeadInfo,
-    tgt_name: &str,
-    tgt_path: &Path,
-    tgt_info: &WorkspaceHeadInfo,
+    src: WsRef<'_>,
+    tgt: WsRef<'_>,
     author: Option<&str>,
 ) -> Result<Vec<String>> {
-    let src_eff = &src_info.effective_head;
-    let tgt_eff = &tgt_info.effective_head;
+    let src_eff = &src.info.effective_head;
+    let tgt_eff = &tgt.info.effective_head;
 
     // Snapshot target before mutating (source is handled by new_merge's
     // auto-snapshot — it runs without --ignore-working-copy).
-    jujutsu::snapshot_ws(tgt_path)?;
+    jujutsu::snapshot_ws(tgt.path)?;
 
     // 1. Create merge with effective heads as parents.
-    let detail = merge_detail(src_name, src_eff, tgt_name, tgt_eff);
+    let detail = merge_detail(src.name, src_eff, tgt.name, tgt_eff);
     let merge_msg = jj_utils::make_desc(jj_utils::Op::Merge, Some(&detail));
-    let merge_id = jujutsu::new_merge(src_path, &[src_eff, tgt_eff], &merge_msg, author)
+    let merge_id = jujutsu::new_merge(src.path, &[src_eff, tgt_eff], &merge_msg, author)
         .context("merge failed (jj undo to recover)")?;
 
     // 2. Step both workspaces forward from the merge.
     let step_msg = jj_utils::make_desc(jj_utils::Op::Step, None);
-    jujutsu::progress_workspace(src_path, &step_msg, author)
-        .with_context(|| format!("step {src_name}"))?;
-    jujutsu::new_on_in_workspace(tgt_path, &merge_id, &step_msg, author)
-        .with_context(|| format!("step {tgt_name}"))?;
+    jujutsu::progress_workspace(src.path, &step_msg, author)
+        .with_context(|| format!("step {}", src.name))?;
+    jujutsu::new_on_in_workspace(tgt.path, &merge_id, &step_msg, author)
+        .with_context(|| format!("step {}", tgt.name))?;
 
     // 3. Abandon trivial heads (non-critical cleanup).
-    let warnings = find_abandon_trivial_heads(repo, &[src_info, tgt_info]);
+    let warnings = find_abandon_trivial_heads(repo, &[src.info, tgt.info]);
 
     Ok(warnings)
 }
@@ -319,32 +296,27 @@ pub fn merge(
 /// Merge source into target using pre-computed effective heads, then forget source.
 ///
 /// Callers are responsible for resolving workspace staleness afterward.
-#[allow(clippy::too_many_arguments)]
 pub fn merge_close(
     repo: &Path,
-    src_name: &str,
-    src_path: &Path,
-    src_info: &WorkspaceHeadInfo,
-    tgt_name: &str,
-    tgt_path: &Path,
-    tgt_info: &WorkspaceHeadInfo,
+    src: WsRef<'_>,
+    tgt: WsRef<'_>,
     author: Option<&str>,
 ) -> Result<Vec<String>> {
-    let src_eff = &src_info.effective_head;
-    let tgt_eff = &tgt_info.effective_head;
+    let src_eff = &src.info.effective_head;
+    let tgt_eff = &tgt.info.effective_head;
 
     // 1. Forget source workspace (snapshots source before forgetting).
-    forget_workspace(repo, src_path, src_name)?;
+    forget_workspace(repo, src.path, src.name)?;
 
     // 2. Create merge with effective heads as parents (in target workspace).
     // new_merge auto-snapshots target (runs without --ignore-working-copy).
-    let detail = merge_detail(src_name, src_eff, tgt_name, tgt_eff);
+    let detail = merge_detail(src.name, src_eff, tgt.name, tgt_eff);
     let merge_msg = jj_utils::make_desc(jj_utils::Op::Merge, Some(&detail));
-    jujutsu::new_merge(tgt_path, &[src_eff, tgt_eff], &merge_msg, author)
+    jujutsu::new_merge(tgt.path, &[src_eff, tgt_eff], &merge_msg, author)
         .context("merge failed (jj undo to recover)")?;
 
     // 3. Abandon trivial heads (non-critical cleanup).
-    let warnings = find_abandon_trivial_heads(repo, &[src_info, tgt_info]);
+    let warnings = find_abandon_trivial_heads(repo, &[src.info, tgt.info]);
 
     Ok(warnings)
 }
@@ -352,35 +324,30 @@ pub fn merge_close(
 /// Squash source's unique chain, merge with target, then forget source.
 ///
 /// Callers are responsible for resolving workspace staleness afterward.
-#[allow(clippy::too_many_arguments)]
 pub fn merge_squash_close(
     repo: &Path,
-    src_name: &str,
-    src_path: &Path,
-    src_info: &WorkspaceHeadInfo,
-    tgt_name: &str,
-    tgt_path: &Path,
-    tgt_info: &WorkspaceHeadInfo,
+    src: WsRef<'_>,
+    tgt: WsRef<'_>,
     lca: &str,
     author: Option<&str>,
 ) -> Result<Vec<String>> {
-    let src_eff = &src_info.effective_head;
-    let tgt_eff = &tgt_info.effective_head;
+    let src_eff = &src.info.effective_head;
+    let tgt_eff = &tgt.info.effective_head;
 
     // 1. Forget source workspace (snapshots source before forgetting).
-    forget_workspace(repo, src_path, src_name)?;
+    forget_workspace(repo, src.path, src.name)?;
 
     // 2-3. Squash unique chain into a single commit.
-    let squash_target = squash_chain(repo, src_name, src_eff, tgt_name, tgt_eff, lca)?;
+    let squash_target = squash_chain(repo, src.name, src_eff, tgt.name, tgt_eff, lca)?;
 
     // 4. Create merge with squashed source and target (in target workspace).
-    let detail = merge_detail(src_name, &squash_target, tgt_name, tgt_eff);
+    let detail = merge_detail(src.name, &squash_target, tgt.name, tgt_eff);
     let merge_msg = jj_utils::make_desc(jj_utils::Op::Merge, Some(&detail));
-    jujutsu::new_merge(tgt_path, &[&squash_target, tgt_eff], &merge_msg, author)
+    jujutsu::new_merge(tgt.path, &[&squash_target, tgt_eff], &merge_msg, author)
         .context("merge failed (jj undo to recover)")?;
 
     // 5. Abandon trivial heads.
-    let warnings = find_abandon_trivial_heads(repo, &[src_info, tgt_info]);
+    let warnings = find_abandon_trivial_heads(repo, &[src.info, tgt.info]);
 
     Ok(warnings)
 }
@@ -393,17 +360,15 @@ pub fn merge_squash_close(
 /// Callers are responsible for resolving workspace staleness afterward.
 pub fn fast_forward_close(
     repo: &Path,
-    src_name: &str,
-    src_path: &Path,
-    src_info: &WorkspaceHeadInfo,
+    src: WsRef<'_>,
     tgt_path: &Path,
     tgt_info: &WorkspaceHeadInfo,
 ) -> Result<Vec<String>> {
     // 1. Forget source workspace. src_effective_head remains in the graph.
-    forget_workspace(repo, src_path, src_name)?;
+    forget_workspace(repo, src.path, src.name)?;
 
     // 2. Move target's @ directly onto src_effective_head (no new commit).
-    jj_utils::edit_workspace_head(tgt_path, &src_info.effective_head)
+    jj_utils::edit_workspace_head(tgt_path, &src.info.effective_head)
         .context("fast-forward failed (jj undo to recover)")?;
 
     // 3. Abandon target's old trivial head, if any.
@@ -419,18 +384,15 @@ pub fn fast_forward_close(
 /// the source stays at its rebased effective head.
 ///
 /// Callers are responsible for resolving workspace staleness afterward.
-#[allow(clippy::too_many_arguments)]
 pub fn rebase(
     repo: &Path,
     src_info: &WorkspaceHeadInfo,
-    tgt_name: &str,
-    tgt_path: &Path,
-    tgt_info: &WorkspaceHeadInfo,
+    tgt: WsRef<'_>,
     lca: &str,
     author: Option<&str>,
 ) -> Result<()> {
     let src_eff = &src_info.effective_head;
-    let tgt_eff = &tgt_info.effective_head;
+    let tgt_eff = &tgt.info.effective_head;
 
     // 1. Rebase source's unique chain onto target's effective head.
     let source_revset = format!("roots({lca}..{src_eff})");
@@ -438,7 +400,7 @@ pub fn rebase(
         .context("rebase failed (jj undo to recover)")?;
 
     // 2. Step target forward (no-op if already has trivial head).
-    jj_utils::step_head(repo, tgt_name, tgt_path, None, author)?;
+    jj_utils::step_head(repo, tgt.name, tgt.path, None, author)?;
 
     Ok(())
 }
@@ -447,45 +409,40 @@ pub fn rebase(
 /// with the target.
 ///
 /// Callers are responsible for resolving workspace staleness afterward.
-#[allow(clippy::too_many_arguments)]
 pub fn merge_squash(
     repo: &Path,
-    src_name: &str,
-    src_path: &Path,
-    src_info: &WorkspaceHeadInfo,
-    tgt_name: &str,
-    tgt_path: &Path,
-    tgt_info: &WorkspaceHeadInfo,
+    src: WsRef<'_>,
+    tgt: WsRef<'_>,
     lca: &str,
     author: Option<&str>,
 ) -> Result<Vec<String>> {
-    let src_eff = &src_info.effective_head;
-    let tgt_eff = &tgt_info.effective_head;
+    let src_eff = &src.info.effective_head;
+    let tgt_eff = &tgt.info.effective_head;
 
     // Snapshot target before mutating (source is handled by new_merge's
     // auto-snapshot — it runs without --ignore-working-copy).
-    jujutsu::snapshot_ws(tgt_path)?;
+    jujutsu::snapshot_ws(tgt.path)?;
 
     // 1-2. Squash unique chain into a single commit.
-    let squash_target = squash_chain(repo, src_name, src_eff, tgt_name, tgt_eff, lca)?;
+    let squash_target = squash_chain(repo, src.name, src_eff, tgt.name, tgt_eff, lca)?;
 
     // 3. Create merge with squashed source (change_id stable) and target.
-    let detail = merge_detail(src_name, &squash_target, tgt_name, tgt_eff);
+    let detail = merge_detail(src.name, &squash_target, tgt.name, tgt_eff);
     let merge_msg = jj_utils::make_desc(jj_utils::Op::Merge, Some(&detail));
-    let merge_id = jujutsu::new_merge(src_path, &[&squash_target, tgt_eff], &merge_msg, author)
+    let merge_id = jujutsu::new_merge(src.path, &[&squash_target, tgt_eff], &merge_msg, author)
         .context("merge failed (jj undo to recover)")?;
 
     // 5. Step both workspaces forward from the merge.
     let step_msg = jj_utils::make_desc(jj_utils::Op::Step, None);
-    jujutsu::progress_workspace(src_path, &step_msg, author)
-        .with_context(|| format!("step {src_name}"))?;
-    jujutsu::new_on_in_workspace(tgt_path, &merge_id, &step_msg, author)
-        .with_context(|| format!("step {tgt_name}"))?;
+    jujutsu::progress_workspace(src.path, &step_msg, author)
+        .with_context(|| format!("step {}", src.name))?;
+    jujutsu::new_on_in_workspace(tgt.path, &merge_id, &step_msg, author)
+        .with_context(|| format!("step {}", tgt.name))?;
 
     // 6. Abandon both trivial heads.
     // Source trivial head is outside the squash range (beyond src_eff)
     // and persists as an orphan after the squash. Must explicitly abandon.
-    let warnings = find_abandon_trivial_heads(repo, &[src_info, tgt_info]);
+    let warnings = find_abandon_trivial_heads(repo, &[src.info, tgt.info]);
 
     Ok(warnings)
 }
@@ -493,41 +450,40 @@ pub fn merge_squash(
 /// Merge using actual `@` heads, with pre-computed head info.
 ///
 /// Callers are responsible for resolving workspace staleness afterward.
-#[allow(clippy::too_many_arguments)]
 pub fn merge_abandon_parents_old(
     repo: &Path,
-    src_name: &str,
-    src_path: &Path,
-    src_info: &WorkspaceHeadInfo,
-    tgt_name: &str,
-    tgt_path: &Path,
-    tgt_info: &WorkspaceHeadInfo,
+    src: WsRef<'_>,
+    tgt: WsRef<'_>,
     author: Option<&str>,
 ) -> Result<Vec<String>> {
-    let src_head = &src_info.actual_head;
-    let tgt_head = &tgt_info.actual_head;
-    let src_eff = &src_info.effective_head;
-    let tgt_eff = &tgt_info.effective_head;
+    let src_head = &src.info.actual_head;
+    let tgt_head = &tgt.info.actual_head;
+    let src_eff = &src.info.effective_head;
+    let tgt_eff = &tgt.info.effective_head;
 
     // Snapshot target before mutating (source is handled by new_merge's
     // auto-snapshot — it runs without --ignore-working-copy).
-    jujutsu::snapshot_ws(tgt_path)?;
+    jujutsu::snapshot_ws(tgt.path)?;
 
     // 1. Create merge with actual heads as parents.
-    let merge_detail = format!("{tgt_name}@{tgt_eff} into {src_name}@{src_eff}");
+    let merge_detail = format!(
+        "{tgt_name}@{tgt_eff} into {src_name}@{src_eff}",
+        tgt_name = tgt.name,
+        src_name = src.name
+    );
     let merge_msg = jj_utils::make_desc(jj_utils::Op::Merge, Some(&merge_detail));
-    let merge_id = jujutsu::new_merge(src_path, &[src_head, tgt_head], &merge_msg, author)
+    let merge_id = jujutsu::new_merge(src.path, &[src_head, tgt_head], &merge_msg, author)
         .context("merge failed (jj undo to recover)")?;
 
     // 2. Step both workspaces forward from the merge.
     let step_msg = jj_utils::make_desc(jj_utils::Op::Step, None);
-    jujutsu::new_on_in_workspace(src_path, &merge_id, &step_msg, author)
-        .with_context(|| format!("step {src_name}"))?;
-    jujutsu::new_on_in_workspace(tgt_path, &merge_id, &step_msg, author)
-        .with_context(|| format!("step {tgt_name}"))?;
+    jujutsu::new_on_in_workspace(src.path, &merge_id, &step_msg, author)
+        .with_context(|| format!("step {}", src.name))?;
+    jujutsu::new_on_in_workspace(tgt.path, &merge_id, &step_msg, author)
+        .with_context(|| format!("step {}", tgt.name))?;
 
     // 3. Abandon trivial heads — jj rebases the merge onto their parents.
-    let warnings = find_abandon_trivial_heads(repo, &[src_info, tgt_info]);
+    let warnings = find_abandon_trivial_heads(repo, &[src.info, tgt.info]);
 
     Ok(warnings)
 }

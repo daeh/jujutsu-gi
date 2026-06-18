@@ -17,6 +17,29 @@ pub(crate) fn short(id: &str) -> &str {
     &id[..id.len().min(4)]
 }
 
+/// Render a `label: value` line with an inverse-video cursor cell at
+/// `cursor_pos`. Grapheme-aware: the cursor cell holds one full grapheme
+/// (not one codepoint), or a space at end-of-line.
+pub(crate) fn field_with_cursor<'a>(
+    label: &'a str,
+    value: &'a str,
+    cursor_pos: usize,
+    label_style: Style,
+    val_style: Style,
+) -> Line<'a> {
+    let (before, after) = value.split_at(cursor_pos);
+    let (cursor_display, after_cursor) = text_utils::peel_first_grapheme_for_cursor(after);
+    Line::from(vec![
+        Span::styled(label, label_style),
+        Span::styled(before, val_style),
+        Span::styled(
+            cursor_display,
+            Style::default().bg(Color::White).fg(Color::Black),
+        ),
+        Span::styled(after_cursor, val_style),
+    ])
+}
+
 /// Layout state for dialog rendering.
 ///
 /// Tracks position within a dialog's inner area. All y-coordinates are

@@ -45,7 +45,7 @@ workspace-path = "{{ home }}/ji-test-workspaces/{{ repo }}.{{ bookmark }}"
 TOML
 
 EXPECTED="$HOME/ji-test-workspaces/eg.test-home"
-JI_DIRECTIVE_FILE="$DIRECTIVE" command ji ws test/home --create --revision main -m "test home"
+JI_DIRECTIVE_FILE="$DIRECTIVE" command ji new test/home --revision main -m "test home"
 
 if [ -d "$EXPECTED" ]; then
     echo "  PASS: {{ home }} expanded to $HOME"
@@ -74,7 +74,7 @@ EXPECTED="$REPO_ABS/../workspaces/eg.test-pwp"
 # Normalize
 EXPECTED="$(cd "$REPO_ABS/.." && pwd -P)/workspaces/eg.test-pwp"
 
-JI_DIRECTIVE_FILE="$DIRECTIVE" command ji ws test/pwp --create --revision main -m "test pwp"
+JI_DIRECTIVE_FILE="$DIRECTIVE" command ji new test/pwp --revision main -m "test pwp"
 
 if [ -d "$EXPECTED" ]; then
     echo "  PASS: {{ default_workspace_path }} expanded correctly"
@@ -96,7 +96,7 @@ cat > .config/ji.toml << 'TOML'
 workspace-path = "../aaa/{{ bbb }}/workspaces/{{ repo }}.{{ bookmark }}"
 TOML
 
-JI_DIRECTIVE_FILE="$DIRECTIVE" command ji ws test/unknown --create --revision main -m "test unknown" 2>"$STDERR_FILE" || true
+JI_DIRECTIVE_FILE="$DIRECTIVE" command ji new test/unknown --revision main -m "test unknown" 2>"$STDERR_FILE" || true
 STDERR_OUTPUT="$(cat "$STDERR_FILE")"
 
 if echo "$STDERR_OUTPUT" | grep -q "unknown template variable"; then
@@ -121,7 +121,7 @@ cat > .config/ji.toml << 'TOML'
 workspace-path = "{{home}}/workspaces/{{ repo }}.{{ bookmark }}"
 TOML
 
-JI_DIRECTIVE_FILE="$DIRECTIVE" command ji ws test/malformed --create --revision main -m "test malformed" 2>"$STDERR_FILE" || true
+JI_DIRECTIVE_FILE="$DIRECTIVE" command ji new test/malformed --revision main -m "test malformed" 2>"$STDERR_FILE" || true
 STDERR_OUTPUT="$(cat "$STDERR_FILE")"
 
 if echo "$STDERR_OUTPUT" | grep -q "malformed template variable"; then

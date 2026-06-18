@@ -20,6 +20,13 @@ const TMPL_ID_EMPTY_MERGE_DESC: &str = r#"change_id ++ "\x1f" ++ if(empty, "true
 const TMPL_ID_BOOKMARKS_DESC: &str =
     r#"change_id ++ "\x1f" ++ bookmarks ++ "\x1f" ++ description ++ "\x1e""#;
 
+/// Template: `change_id \x1f empty? \x1e`.
+const TMPL_ID_EMPTY: &str = r#"change_id ++ "\x1f" ++ if(empty, "true", "false") ++ "\x1e""#;
+
+/// Template: `change_id \x1f empty? \x1f parents.len() \x1f description` —
+/// single-record query, no record terminator.
+const TMPL_ID_EMPTY_PARENTS_DESC: &str = r#"change_id ++ "\x1f" ++ if(empty, "true", "false") ++ "\x1f" ++ parents.len() ++ "\x1f" ++ description"#;
+
 // ---------------------------------------------------------------------------
 // Structured descriptions
 // ---------------------------------------------------------------------------
@@ -66,6 +73,32 @@ pub fn make_desc(op: Op, detail: Option<&str>) -> String {
 /// Build the `"<ws_name>"` revset fragment for a workspace (without the `@` suffix).
 fn ws_at_revset(ws_name: &str) -> String {
     format!(r#""{}""#, jujutsu::escape_revset_string(ws_name))
+}
+
+/// Change IDs of revisions unique to a workspace relative to default
+/// (`"default"@.."<ws>"@`) — the same set definition `list_workspaces` uses
+/// to build per-workspace revision lists (`workspace_revisions_with_bookmarks`
+/// evaluates it with change-id endpoints; here the workspace refs resolve
+/// live). Deliberately NOT an LCA-relative range: the LCA is source-vs-target
+/// and diverges from this producer definition for non-default targets.
+pub fn workspace_unique_change_ids(repo: &Path, ws_name: &str) -> Result<Vec<String>> {
+    let revset = format!("{}..{}", ws_head_revset("default"), ws_head_revset(ws_name));
+    let out = jujutsu::run_jj(
+        repo,
+        &[
+            "log",
+            "--no-graph",
+            "--revision",
+            &revset,
+            "--template",
+            r#"change_id ++ "\n""#,
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Build the `"<ws_name>"@` revset for a workspace's working-copy commit.
@@ -499,10 +532,8 @@ pub fn check_chain_safety(
         ],
     )?;
 
-    let undescribed: Vec<&str> = out
-        .split(jujutsu::DELIM_RECORD)
+    let undescribed: Vec<&str> = jujutsu::records(&out)
         .filter_map(|record| {
-            let record = record.trim_start_matches('\n');
             let (id, desc) = record.split_once(jujutsu::DELIM_FIELD)?;
             if id.is_empty() {
                 return None;
@@ -520,9 +551,7 @@ pub fn check_chain_safety(
     }
 
     // Step 2: bulk emptiness query — snapshot if ws_path provided.
-    // Layout: change_id \x1f empty? \x1e
     let empty_revset = undescribed.join(" | ");
-    let empty_template = r#"change_id ++ "\x1f" ++ if(empty, "true", "false") ++ "\x1e""#;
     let empty_out = if let Some(ws) = ws_path {
         jujutsu::run_jj_ws_live(
             ws,
@@ -532,7 +561,7 @@ pub fn check_chain_safety(
                 "--revision",
                 &empty_revset,
                 "--template",
-                empty_template,
+                TMPL_ID_EMPTY,
             ],
         )?
     } else {
@@ -544,15 +573,13 @@ pub fn check_chain_safety(
                 "--revision",
                 &empty_revset,
                 "--template",
-                empty_template,
+                TMPL_ID_EMPTY,
             ],
         )?
     };
 
-    let at_risk: Vec<String> = empty_out
-        .split(jujutsu::DELIM_RECORD)
+    let at_risk: Vec<String> = jujutsu::records(&empty_out)
         .filter_map(|record| {
-            let record = record.trim_matches('\n');
             let (id, is_empty) = record.split_once(jujutsu::DELIM_FIELD)?;
             if is_empty == "false" {
                 Some(id.to_string())
@@ -596,29 +623,6 @@ fn check_emptiness(
     }
 }
 
-#[allow(dead_code)]
-/// Abandon a revision only if it is empty (no diff from parent).
-/// Returns `true` if the revision was abandoned, `false` if it had content.
-pub fn abandon_empty(repo: &Path, change_id: &str) -> Result<bool> {
-    let out = jujutsu::run_jj(
-        repo,
-        &[
-            "log",
-            "--no-graph",
-            "--revision",
-            change_id,
-            "--template",
-            r#"if(empty, "true", "false")"#,
-        ],
-    )?;
-    if out.trim() == "true" {
-        jujutsu::abandon_revisions(repo, &[change_id])?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
 /// Abandon revisions only if each is still a trivial head (head + empty + trivial description).
 /// Re-checks each revision immediately before abandoning. Abandons those that are still
 /// trivial, then returns an error if any were not trivial heads.
@@ -655,13 +659,6 @@ pub fn abandon_trivial_heads(repo: &Path, change_ids: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Return the actual `@` change-id for a workspace (no effective-head logic).
-#[allow(dead_code)]
-pub fn resolve_workspace_head(repo: &Path, ws_name: &str) -> Result<String> {
-    let ws = ws_at_revset(ws_name);
-    resolve_change_id(repo, &format!("{ws}@"))
-}
-
 /// Return the change-id of the effective head for a workspace.
 ///
 /// Walks backward from `@` through trivial-content revisions (empty with a
@@ -692,9 +689,7 @@ const MAX_TRIVIAL_WALK: usize = 10;
 /// becomes a trivial head. By walking past it now, we avoid placing bookmarks
 /// on revisions that will become trivial heads after cleanup.
 fn find_nontrivial_target(repo: &Path, starting_revset: &str) -> Result<String> {
-    // Layout: change_id \x1f empty? \x1f parents.len() \x1f description
-    // Single-record query, no DELIM_RECORD terminator needed.
-    let template = r#"change_id ++ "\x1f" ++ if(empty, "true", "false") ++ "\x1f" ++ parents.len() ++ "\x1f" ++ description"#;
+    let template = TMPL_ID_EMPTY_PARENTS_DESC;
 
     let mut current_revset = starting_revset.to_string();
     let mut last_change_id = String::new();
@@ -747,25 +742,6 @@ fn find_nontrivial_target(repo: &Path, starting_revset: &str) -> Result<String> 
 
     // Depth limit reached — return the last revision we examined.
     Ok(last_change_id)
-}
-
-#[allow(dead_code)]
-/// If the workspace's `@` is a trivial head, abandon it.
-///
-/// Returns the change-id of `@` after the operation: the parent if trimming
-/// happened, or the unchanged `@` if no trim was needed.
-pub fn trim_trivial_head(repo: &Path, ws_name: &str) -> Result<String> {
-    let ws = ws_at_revset(ws_name);
-    let ws_at = format!("{ws}@");
-
-    match check_trivial_head(repo, &ws_at)? {
-        Some(wip_id) => {
-            let parent_id = resolve_change_id(repo, &format!("{ws}@-"))?;
-            let _ = abandon_trivial_heads(repo, &[&wip_id]);
-            Ok(parent_id)
-        }
-        None => resolve_change_id(repo, &ws_at),
-    }
 }
 
 /// Ensure the workspace has a fresh trivial head.

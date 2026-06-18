@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-const MIN_JJ_VERSION: &str = "0.40.0";
+const MIN_JJ_VERSION: &str = "0.42.0";
 const JJ_INSTALL_URL: &str = "https://jj-vcs.github.io/jj/latest/install-and-setup/";
 
 pub struct Workspace {
@@ -50,7 +50,6 @@ pub struct RevisionInfo {
 }
 
 /// A single jj operation from `jj op log`.
-#[allow(dead_code)]
 pub struct Operation {
     pub id: String,
     pub description: String,
@@ -80,10 +79,10 @@ const MAX_DESTRUCTIVE_REVISIONS: usize = 50;
 // arises when a record-separator choice is changed without updating its
 // parser.
 //
-// Rust-side parsers must split on the corresponding DELIM_* constant
-// (e.g. `stdout.split(DELIM_RECORD)`) so a template-edit that forgets to
-// update the parser is caught by the source-level drift test (see
-// tests/jj_integration.rs).
+// Rust-side parsers must split on the corresponding DELIM_* constant —
+// record-framed output goes through `records()` below — so a template-edit
+// that forgets to update the parser is caught by the source-level drift
+// test (see tests/jj_integration.rs).
 
 pub(crate) const DELIM_RECORD: char = '\x1e';
 pub(crate) const DELIM_FIELD: char = '\x1f';
@@ -92,22 +91,90 @@ pub(crate) const DELIM_LIST: char = '\x01';
 /// Template: `change_id \x1f description \x1e`.
 pub(crate) const TMPL_ID_DESC: &str = r#"change_id ++ "\x1f" ++ description ++ "\x1e""#;
 
+/// Split `DELIM_RECORD`-framed jj output into records: framing newlines
+/// trimmed (descriptions and jj's trailing output newline land inside/after
+/// records), empty records skipped (including the tail after the final
+/// terminator). Field/arity handling stays with the caller — it varies by
+/// record layout.
+pub(crate) fn records(output: &str) -> impl Iterator<Item = &str> {
+    output
+        .split(DELIM_RECORD)
+        .map(|r| r.trim_matches('\n'))
+        .filter(|r| !r.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Working-copy snapshot policy — taxonomy and census
+// ---------------------------------------------------------------------------
+//
+// TOTAL RULE: a jj call auto-snapshots the working copy iff it omits
+// `--ignore-working-copy`.
+//   - omit (live):    `jj_cmd_wc`, `jj_cmd_ws_wc` (+ the `run_jj_ws_live`
+//                     wrapper)
+//   - include (read): `jj_cmd`, `jj_cmd_ws`, `jj_cmd_bootstrap` (+ `run_jj`
+//                     and the raw readers consuming them)
+// Every jj subprocess in production code is constructed via one of these
+// builders (`run_jj*`, `run_jj_output`, and direct `.status()` calls all
+// consume one); the only exceptions are the builder bodies themselves and
+// the version-detection call in `jj_version`. Pinned by the census test
+// `jj_call_census_is_maintained` below.
+//
+// Variant taxonomy — which form belongs at a site:
+//
+// 1. Read recorded state ........ ignore-WC (`jj_cmd`/`jj_cmd_ws`/`run_jj`).
+// 2. Involved-workspace freshness (gate / CLI entry) ... explicit
+//    `snapshot_ws` (conditional) via `commands::snapshot_workspaces` —
+//    capture src/tgt pending edits so the planned operation reflects
+//    reality.
+// 3. Execution-time freshness + third-party protection ... explicit
+//    `snapshot_ws`, broad + fail-loud, descendant-first, in
+//    `commands::prepare_execution_freshness` — capture every workspace's
+//    pending edits before a rewrite can rebase/stale them.
+// 4. WC-behind detection (which workspaces need `update-stale`) ... live
+//    `jj status` (`is_workspace_stale`/`stale_workspace_names`); the
+//    conditional snapshot side effect is incidental (and load-bearing only
+//    at the TUI dialog-open probe in `refresh()`).
+// 5. Safety inspection of the live WC ... live `jj log`
+//    (`jj_utils::check_revision_safety`/`check_working_copy_safety`/
+//    `check_chain_safety`) — forces pending edits into the emptiness test.
+// 6. WC-ahead probe (pending edits without folding them) ...
+//    `has_unsnapshotted_changes` — reserved for a future indicator; no
+//    production caller.
+// 7. Mutation that reads/writes the WC ... live builders — auto-snapshot
+//    inherent (`op_restore`, `create_workspace`, `split_revision`,
+//    `update_stale`, `update_workspace_stale`, `new_merge`;
+//    `jj_utils::step_head`/`make_head`/`edit_workspace_head` via
+//    `run_jj_ws_live`).
+// 8. Mutation under ignore-WC with freshness from a preceding explicit
+//    snapshot ... `workspace_forget` (here), the `operations.rs` merge
+//    paths (`snapshot_ws(tgt)` then ignore-WC merge) and create's
+//    step-source path.
+//
+// Census of live/snapshot call sites (update alongside the tripwire table
+// in `jj_call_census_is_maintained` when adding/removing a site):
+//   - `snapshot_ws`: `workspace_forget` (here);
+//     `commands::snapshot_workspaces` (bucket 2);
+//     `commands::prepare_execution_freshness` ×2 tiers (bucket 3);
+//     `operations.rs` create step-source, `merge`, `merge_squash`,
+//     `merge_abandon_parents_old` target snapshots (bucket 8).
+//   - `run_jj_ws_live`: `jj_utils` head movers + safety checks (buckets
+//     5, 7).
+//   - `jj_cmd_wc` (repo-live): `op_restore`, `create_workspace`,
+//     `split_revision`, `update_stale`, `is_working_copy_stale`.
+//   - `jj_cmd_ws_wc` (workspace-live): `snapshot_ws`,
+//     `has_unsnapshotted_changes` preview, `run_jj_ws_live`, `new_merge`,
+//     `is_workspace_stale`, `update_workspace_stale`.
+//   - `is_workspace_stale`: `stale_workspace_names` (batch), the TUI
+//     `refresh()` dialog-open probe, `operations::forget_workspace`,
+//     the protection phase's stale-skip classifier (bucket 3).
+//   - `stale_workspace_names`: `commands::post_op_stale` (WC-behind
+//     report), TUI selection staleness.
+//   - `update_workspace_stale`: post-op staleness resolution in
+//     sync/close/transfer + `resolve_predicted_stale` + TUI stale actions.
+
 // ---------------------------------------------------------------------------
 // Core helpers — all jj commands go through here
 // ---------------------------------------------------------------------------
-
-/// Working-copy access policy for jj subprocess calls.
-#[allow(dead_code)]
-pub(crate) enum WcPolicy {
-    /// Default. Adds `--ignore-working-copy`. No WC snapshot or update.
-    Ignore,
-    /// Runs `jj util snapshot` first, then command with `--ignore-working-copy`.
-    /// Use when pending WC edits must be captured before the command.
-    SnapshotFirst,
-    /// No `--ignore-working-copy`. jj snapshots WC before and updates after.
-    /// Use when the command must read or write the working copy.
-    Live,
-}
 
 /// Build a `Command` targeting a repo via `--repository`. Includes `--ignore-working-copy`.
 /// Sets `current_dir(repo)` so that any paths in jj output are repo-root-relative.
@@ -158,29 +225,72 @@ pub(crate) fn run_jj(repo: &Path, args: &[&str]) -> Result<String> {
     run_jj_inner(jj_cmd(repo), args)
 }
 
-/// Run a jj command with an explicit working-copy policy.
-#[allow(dead_code)]
-pub(crate) fn run_jj_with(repo: &Path, args: &[&str], policy: WcPolicy) -> Result<String> {
-    match policy {
-        WcPolicy::Ignore => run_jj_inner(jj_cmd(repo), args),
-        WcPolicy::SnapshotFirst => {
-            snapshot(repo)?;
-            run_jj_inner(jj_cmd(repo), args)
-        }
-        WcPolicy::Live => run_jj_inner(jj_cmd_wc(repo), args),
-    }
-}
-
-/// Snapshot the working copy of the default workspace (captures pending edits).
-pub fn snapshot(repo: &Path) -> Result<()> {
-    run_jj_inner(jj_cmd_wc(repo), &["util", "snapshot"])?;
-    Ok(())
-}
-
 /// Snapshot the working copy of a specific workspace (captures pending edits).
+///
+/// `jj util snapshot` is conditional (verified on jj 0.42): a clean working
+/// copy — including mtime-only changes — produces "No snapshot needed." and
+/// leaves the op head untouched; only a content change creates an operation.
+///
+/// FAILS on a jj-stale working copy. Callers rely on this both as a safety
+/// property (`workspace_forget`) and as a classifier (the execution-time
+/// protection phase skips workspaces whose snapshot failed *because* they
+/// are stale — see `commands::prepare_execution_freshness`).
 pub fn snapshot_ws(ws_path: &Path) -> Result<()> {
     run_jj_inner(jj_cmd_ws_wc(ws_path), &["util", "snapshot"])?;
     Ok(())
+}
+
+/// Probe whether a workspace's working copy has changes not yet snapshotted
+/// into `@`, without integrating any operation: op heads and the visible op
+/// log are unchanged by the probe (the preview runs in a staged,
+/// never-integrated operation — staged data is written to the op store but
+/// never becomes a head).
+///
+/// Two queries:
+///   A: `@`'s currently recorded commit id (stale view, no working-copy scan).
+///   B: the would-be commit id after a snapshot, computed under
+///      `--no-integrate-operation` (`--quiet` suppresses the staged-op hint).
+/// Unsnapshotted changes exist iff A != B. Full commit ids are compared —
+/// any content difference changes the id, unlike file-list comparisons.
+///
+/// Not to be confused with `is_workspace_stale`: that detects a working copy
+/// *behind* the repo (needs `jj workspace update-stale`); this detects one
+/// *ahead* of it (pending edits).
+///
+/// No production caller, by design: this is the non-mutating WC-ahead
+/// primitive reserved for a future unsaved-edits indicator. It is NOT a
+/// cheap pre-check for `snapshot_ws` — it scans the whole working copy and
+/// writes staged (non-integrated) op-store data, so probe-then-snapshot is
+/// pure overhead over a direct (already-conditional) `snapshot_ws`.
+/// Exercised by the `probe_detects_*` integration tests.
+pub fn has_unsnapshotted_changes(ws_path: &Path) -> Result<bool> {
+    let recorded = run_jj_inner(
+        jj_cmd_ws(ws_path),
+        &[
+            "log",
+            "--no-graph",
+            "--revision",
+            "@",
+            "--template",
+            "commit_id",
+        ],
+    )
+    .context("probe recorded @ commit id")?;
+    let preview = run_jj_inner(
+        jj_cmd_ws_wc(ws_path),
+        &[
+            "--no-integrate-operation",
+            "--quiet",
+            "log",
+            "--no-graph",
+            "--revision",
+            "@",
+            "--template",
+            "commit_id",
+        ],
+    )
+    .context("probe would-be @ commit id (preview snapshot)")?;
+    Ok(recorded != preview)
 }
 
 /// Run a jj command in a workspace directory WITHOUT `--ignore-working-copy`.
@@ -463,11 +573,7 @@ pub fn op_log(repo: &Path, limit: usize) -> Result<Vec<Operation>> {
         ],
     )?;
     let mut ops = Vec::new();
-    for record in output.split(DELIM_RECORD) {
-        let record = record.trim_matches('\n');
-        if record.is_empty() {
-            continue;
-        }
+    for record in records(&output) {
         let fields: Vec<&str> = record.split(DELIM_FIELD).collect();
         if fields.len() < 6 {
             continue;
@@ -498,10 +604,14 @@ pub fn op_restore(repo: &Path, op_id: &str) -> Result<String> {
 ///
 /// Returns `Ok(true)` if the heads match or only snapshots intervene.
 /// Returns `Ok(false)` if any non-snapshot operation exists between them.
-/// If `expected_op_id` is not found within 200 operations, assumes non-trivial work.
-pub fn only_snapshots_since(repo: &Path, expected_op_id: &str) -> Result<bool> {
+/// If `expected_op_id` is not found within `limit` operations, assumes
+/// non-trivial work (fail-closed). Pick `limit` generously for callers that
+/// themselves create many snapshot ops before checking (the execution-time
+/// protection phase snapshots every workspace).
+pub fn only_snapshots_since(repo: &Path, expected_op_id: &str, limit: usize) -> Result<bool> {
     // Layout: id \x1f snapshot? \x1e
     let template = r#"id ++ "\x1f" ++ if(self.snapshot(), "true", "false") ++ "\x1e""#;
+    let limit_str = limit.to_string();
     let output = run_jj(
         repo,
         &[
@@ -510,16 +620,12 @@ pub fn only_snapshots_since(repo: &Path, expected_op_id: &str) -> Result<bool> {
             "log",
             "--no-graph",
             "--limit",
-            "200",
+            &limit_str,
             "--template",
             template,
         ],
     )?;
-    for record in output.split(DELIM_RECORD) {
-        let record = record.trim_matches('\n');
-        if record.is_empty() {
-            continue;
-        }
+    for record in records(&output) {
         let Some((id, is_snap)) = record.split_once(DELIM_FIELD) else {
             continue;
         };
@@ -575,16 +681,26 @@ const LIST_TEMPLATE: &str = concat!(
     r#" ++ "\x1e""#,
 );
 
-pub fn list_workspaces(repo: &Path) -> Result<Vec<Workspace>> {
-    let stdout = run_jj(repo, &["workspace", "list", "--template", LIST_TEMPLATE])?;
+/// Lightweight workspace record from a single `jj workspace list` call.
+///
+/// Used where only identity-level data is needed (the execution-time
+/// freshness phase, path/change-id revalidation) — `list_workspaces` costs
+/// several extra jj calls per workspace for revisions/bookmarks/timestamps.
+#[derive(Clone)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    /// Empty when jj reports the root as an error (e.g. deleted directory).
+    pub path: PathBuf,
+    /// Change id of the workspace's working-copy commit (`<name>@`).
+    pub change_id: String,
+    pub description: String,
+}
 
-    let mut workspaces = Vec::new();
-    let mut default_change_id = String::new();
-    for record in stdout.split(DELIM_RECORD) {
-        let record = record.trim_matches('\n');
-        if record.is_empty() {
-            continue;
-        }
+/// List workspaces with ONE jj call (no per-workspace enrichment).
+pub fn list_workspace_entries(repo: &Path) -> Result<Vec<WorkspaceEntry>> {
+    let stdout = run_jj(repo, &["workspace", "list", "--template", LIST_TEMPLATE])?;
+    let mut entries = Vec::new();
+    for record in records(&stdout) {
         let fields: Vec<&str> = record.splitn(4, DELIM_FIELD).collect();
         if fields.len() < 4 {
             anyhow::bail!("unexpected workspace list format: {record}");
@@ -599,27 +715,43 @@ pub fn list_workspaces(repo: &Path) -> Result<Vec<Workspace>> {
         } else {
             raw_name.to_string()
         };
-        if name == "default" {
-            default_change_id = fields[2].to_string();
-        }
         let raw_path = fields[1].trim();
         let path = if raw_path.contains("<Error") {
             PathBuf::new()
         } else {
             PathBuf::from(raw_path)
         };
-        workspaces.push(Workspace {
+        entries.push(WorkspaceEntry {
             name,
             path,
             change_id: fields[2].to_string(),
             description: fields[3].to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+pub fn list_workspaces(repo: &Path) -> Result<Vec<Workspace>> {
+    let entries = list_workspace_entries(repo)?;
+    let default_change_id = entries
+        .iter()
+        .find(|e| e.name == "default")
+        .map(|e| e.change_id.clone())
+        .unwrap_or_default();
+    let mut workspaces: Vec<Workspace> = entries
+        .into_iter()
+        .map(|e| Workspace {
+            name: e.name,
+            path: e.path,
+            change_id: e.change_id,
+            description: e.description,
             bookmarks_at_head: Vec::new(),
             bookmarks_behind: Vec::new(),
             is_current: false,
             revisions: Vec::new(),
             last_modified: None,
-        });
-    }
+        })
+        .collect();
 
     // Pre-fetch revisions and bookmarks unique to each non-default workspace
     // (combined into a single jj call per workspace).
@@ -659,6 +791,52 @@ pub fn list_workspaces(repo: &Path) -> Result<Vec<Workspace>> {
     }
 
     Ok(workspaces)
+}
+
+/// Topologically order workspaces, children before parents (descendant-first).
+///
+/// Returns indices into `entries`. ONE `jj log` over all workspace `@`s
+/// (jj log's default order is reverse-topological), mapped back to entries
+/// by change id. Entries whose change id doesn't appear (e.g. raced away)
+/// keep their relative order at the end.
+///
+/// The execution-time protection phase snapshots workspaces in this order:
+/// snapshotting a dirty workspace amends its `@` and rebases descendants
+/// (which stales them), so each descendant must be captured before any
+/// ancestor's snapshot can rebase it.
+pub fn descendant_first_workspaces(repo: &Path, entries: &[WorkspaceEntry]) -> Result<Vec<usize>> {
+    if entries.len() <= 1 {
+        return Ok((0..entries.len()).collect());
+    }
+    let revset = entries
+        .iter()
+        .map(|e| format!(r#""{}"@"#, escape_revset_string(&e.name)))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let stdout = run_jj(
+        repo,
+        &[
+            "log",
+            "--no-graph",
+            "--revision",
+            &revset,
+            "--template",
+            r#"change_id ++ "\n""#,
+        ],
+    )?;
+    let rank: HashMap<&str, usize> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .enumerate()
+        .map(|(i, id)| (id, i))
+        .collect();
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| {
+        rank.get(entries[i].change_id.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    Ok(order)
 }
 
 /// Get the committer timestamp (epoch seconds) of the most recent non-empty
@@ -925,10 +1103,7 @@ pub fn revision_diff_summary(repo: &Path, change_id: &str) -> Result<DiffSummary
 
 /// Parse `change_id \x1f description \x1e` records into `RevisionInfo` structs.
 fn parse_revision_records(stdout: &str) -> Vec<RevisionInfo> {
-    stdout
-        .split(DELIM_RECORD)
-        .map(|r| r.trim_matches('\n'))
-        .filter(|r| !r.is_empty())
+    records(stdout)
         .filter_map(|record| {
             let (id, desc) = record.split_once(DELIM_FIELD)?;
             Some(RevisionInfo {
@@ -967,11 +1142,7 @@ fn workspace_revisions_with_bookmarks(
     let mut revisions = Vec::new();
     let mut bookmarks = Vec::new();
 
-    for record in stdout.split(DELIM_RECORD) {
-        let record = record.trim_matches('\n');
-        if record.is_empty() {
-            continue;
-        }
+    for record in records(&stdout) {
         let mut fields = record.splitn(3, DELIM_FIELD);
         let Some(id) = fields.next() else { continue };
         let bm_field = fields.next().unwrap_or("");
@@ -1015,39 +1186,6 @@ fn default_workspace_revisions(repo: &Path, default_change_id: &str) -> Result<V
 /// Return full change_ids for all ancestors of `change_id` (inclusive).
 pub fn ancestor_ids(repo: &Path, change_id: &str) -> Result<Vec<String>> {
     let revset = format!("::{change_id}");
-    let stdout = run_jj(
-        repo,
-        &[
-            "log",
-            "--no-graph",
-            "--revision",
-            &revset,
-            "--template",
-            r#"change_id ++ "\n""#,
-        ],
-    )?;
-    Ok(stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect())
-}
-
-/// Resolve the change_ids on a merged workspace's unique branch (display only).
-///
-/// When a workspace has been merged into default, `workspace_revisions` returns
-/// empty because `::{ws} ~ ::{default}` is ∅.  This finds the merge that
-/// absorbed the workspace and subtracts the ancestry of its *other* parents,
-/// returning just the short change_ids on the workspace's branch.
-#[allow(dead_code)]
-pub fn merged_branch_ids(
-    repo: &Path,
-    ws_change_id: &str,
-    default_change_id: &str,
-) -> Result<Vec<String>> {
-    let revset = format!(
-        "(parents(children({ws_change_id}) & merges() & ::{default_change_id}) ~ ::{ws_change_id})..{ws_change_id}"
-    );
     let stdout = run_jj(
         repo,
         &[
@@ -1123,16 +1261,6 @@ pub fn workspace_forget_orphaned(repo: &Path, name: &str) -> Result<()> {
 /// Silently override the author of `@` in a workspace directory.
 pub(crate) fn metaedit_author_in_workspace(ws_path: &Path, author: &str) -> Result<()> {
     run_jj_inner(jj_cmd_ws(ws_path), &["metaedit", "--author", author])?;
-    Ok(())
-}
-
-/// Create a new working copy commit on top of the given revision.
-#[allow(dead_code)]
-pub fn new_on(repo: &Path, revision: &str, msg: &str, author: Option<&str>) -> Result<()> {
-    run_jj(repo, &["new", "--message", msg, "--", revision])?;
-    if let Some(a) = author {
-        run_jj(repo, &["metaedit", "--author", a])?;
-    }
     Ok(())
 }
 
@@ -1241,11 +1369,7 @@ pub fn revision_descriptions(repo: &Path, revset: &str) -> Result<Vec<(String, S
         ],
     )?;
     let mut result = Vec::new();
-    for record in stdout.split(DELIM_RECORD) {
-        let record = record.trim();
-        if record.is_empty() {
-            continue;
-        }
+    for record in records(&stdout) {
         if let Some((id, desc)) = record.split_once(DELIM_FIELD) {
             result.push((id.to_string(), desc.trim_end().to_string()));
         }
@@ -1331,16 +1455,13 @@ pub fn is_stale_error(err: &anyhow::Error) -> bool {
 
 /// Check whether the working copy is stale by running a lightweight command
 /// without `--ignore-working-copy` (Live policy: must probe live WC state).
+///
+/// (`--no-graph` is NOT a `jj status` flag — passing it made this exit 2 at
+/// argument parsing, so the check silently always returned `false`. Same bug
+/// as the sibling `is_workspace_stale`.)
 pub fn is_working_copy_stale(repo: &Path) -> bool {
     let output = run_jj_output(
-        jj_cmd_wc(repo).args([
-            "status",
-            "--no-pager",
-            "--no-graph",
-            "--color",
-            "never",
-            "--quiet",
-        ]),
+        jj_cmd_wc(repo).args(["status", "--no-pager", "--color", "never", "--quiet"]),
         "status (stale check)",
     );
     match output {
@@ -1361,19 +1482,21 @@ pub fn update_stale(repo: &Path) -> Result<String> {
 
 /// Check if a specific workspace's working copy is stale.
 /// Live policy: must probe live WC state.
+///
+/// LOAD-BEARING side effect: the live `jj status` snapshots the workspace's
+/// pending working-copy edits. The TUI's `refresh()` runs this probe BEFORE
+/// rebuilding its workspace list precisely so that list-derived dialog data
+/// (revisions, bookmarks, change ids) reflects post-snapshot reality. Do not
+/// add `--ignore-working-copy` here — a stale-check structurally cannot use
+/// it, and the snapshot side effect is relied upon.
+/// (`--no-graph` is NOT a `jj status` flag; passing it made the whole probe
+/// exit 2 at argument parsing — no staleness detection, no snapshot.)
 pub fn is_workspace_stale(ws_path: &Path) -> bool {
     if !ws_path.exists() {
         return false;
     }
     let output = run_jj_output(
-        jj_cmd_ws_wc(ws_path).args([
-            "status",
-            "--no-pager",
-            "--no-graph",
-            "--color",
-            "never",
-            "--quiet",
-        ]),
+        jj_cmd_ws_wc(ws_path).args(["status", "--no-pager", "--color", "never", "--quiet"]),
         "status (workspace stale check)",
     );
     match output {
@@ -1723,8 +1846,7 @@ pub fn shortest_change_ids(repo: &Path, ids: &[&str]) -> HashMap<String, String>
         Err(_) => return HashMap::new(),
     };
     let mut map = HashMap::new();
-    for record in output.split(DELIM_RECORD) {
-        let record = record.trim_matches('\n');
+    for record in records(&output) {
         if let Some((full, short)) = record.split_once(DELIM_FIELD) {
             map.insert(full.to_string(), short.to_string());
         }
@@ -1797,5 +1919,98 @@ mod tests {
             !LIST_TEMPLATE.contains(r#""\0""#),
             "LIST_TEMPLATE still uses legacy \\0 delim"
         );
+    }
+
+    /// Collect all production source files (`src/**/*.rs`).
+    fn production_sources() -> Vec<(std::path::PathBuf, String)> {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let content = std::fs::read_to_string(&path).expect("read source file");
+                    files.push((path, content));
+                }
+            }
+        }
+        assert!(!files.is_empty(), "no source files found");
+        files
+    }
+
+    /// Count occurrences of `pat` across non-comment lines.
+    fn count_in_code(content: &str, pat: &str) -> usize {
+        content
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| l.matches(pat).count())
+            .sum()
+    }
+
+    /// Census tripwire — keeps the snapshot-policy census (doc block above
+    /// the core helpers) maintained:
+    ///
+    /// (a) Every jj subprocess in production `src/` is constructed via a
+    ///     `jj_cmd*` builder: `Command::new("jj")` appears only in this
+    ///     file — the five builders plus the version-detection call.
+    /// (b) The live/snapshot wrappers have a pinned number of mentions. A
+    ///     new call site through an existing wrapper (a new live/snapshot
+    ///     vector) fails this test until the census doc block AND this
+    ///     table are updated together.
+    ///
+    /// Counts are textual occurrences on non-comment lines (definitions
+    /// included), summed across `src/**/*.rs`.
+    #[test]
+    fn jj_call_census_is_maintained() {
+        let files = production_sources();
+
+        // (a) Builder boundary. The pattern is assembled at runtime so this
+        // test's own source never matches it.
+        let cmd_pat = format!("{}({:?})", "Command::new", "jj");
+        for (path, content) in &files {
+            let n = count_in_code(content, &cmd_pat);
+            if path.ends_with("jujutsu.rs") {
+                assert_eq!(
+                    n, 6,
+                    "expected exactly 6 jj Command constructions in jujutsu.rs \
+                     (5 builders + version detection), found {n}"
+                );
+            } else {
+                assert_eq!(
+                    n,
+                    0,
+                    "raw jj subprocess outside jujutsu.rs in {} — route it \
+                     through a jj_cmd* builder",
+                    path.display()
+                );
+            }
+        }
+
+        // (b) Live/snapshot wrapper tripwire. Function names only — the `(`
+        // is appended at runtime so the table doesn't count itself.
+        let expected: &[(&str, usize)] = &[
+            ("snapshot_ws", 9),
+            ("run_jj_ws_live", 6),
+            ("jj_cmd_wc", 6),
+            ("jj_cmd_ws_wc", 7),
+            ("is_workspace_stale", 5),
+            ("stale_workspace_names", 3),
+            ("update_workspace_stale", 12),
+            ("update_stale", 2),
+            ("has_unsnapshotted_changes", 1),
+        ];
+        for (name, want) in expected {
+            let pat = format!("{name}(");
+            let got: usize = files.iter().map(|(_, c)| count_in_code(c, &pat)).sum();
+            assert_eq!(
+                got, *want,
+                "census drift for `{pat}`: expected {want} mentions, found {got}. \
+                 Classify the new/removed site in the snapshot-policy census \
+                 (src/jujutsu.rs) and update this table."
+            );
+        }
     }
 }

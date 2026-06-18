@@ -64,7 +64,7 @@ Saved diffs, when the TUI writes them, land in `.ji/diffs/`.
 
 ## Adaptive operation is unavailable
 
-**Symptom:** `ji close --method adaptive` or `ji transfer --method adaptive` fails, or the adaptive entry is missing from the TUI dialog.
+**Symptom:** `ji close <target> --method adaptive` or `ji transfer --method adaptive` fails, or the adaptive entry is missing from the TUI dialog.
 
 **Cause:** The sync mode does not support adaptive resolution:
 
@@ -127,7 +127,7 @@ See [operations.md](operations.md#sync-mode-detection).
 - Or open the op log pane (`o`), select the desired operation, and press `R` to restore to it.
 - From the shell, `jj op log` and `jj op restore <id>` expose the same history.
 
-**Note:** `Z` / `Y` only traverse operations that ji itself initiated in the current session — they do not step through operations made outside ji (by another shell, another tool, or a previous ji session). If you want to undo something that wasn't made via ji in this session, use the op log pane (`o`) or `jj op restore` directly.
+**Note:** `Z` / `Y` only traverse actions that ji itself initiated — recorded in a persisted history (`.ji/action-history.json`) — not operations made outside ji (by another shell or another tool). If you want to undo something that wasn't made via ji, use the op log pane (`o`) or `jj op restore` directly.
 
 ---
 

@@ -15,7 +15,7 @@ The wrapper function:
 ## Install
 
 ```sh
-ji config shell install            # detect $SHELL
+ji config shell install            # detect the active shell
 ji config shell install zsh        # explicit
 ji config shell install bash
 ji config shell install fish
@@ -27,14 +27,16 @@ The installer is idempotent — re-running it leaves already-managed files and t
 |---|---|
 | zsh  | wrapper → `~/.config/ji/init.zsh`; a sourcing stanza → `~/.zshrc` |
 | bash | wrapper → `~/.config/ji/init.bash`; a sourcing stanza → `~/.bash_profile` (or `~/.bash_login` / `~/.profile`, whichever already exists) |
-| fish | wrapper function → `~/.config/fish/functions/ji.fish` (autoloaded; no rc edit) |
+| fish | wrapper function → `~/.config/fish/functions/ji.fish` (autoloaded; no rc edit); completions → `~/.config/fish/completions/ji.fish` |
+
+Paths shown assume the defaults: the wrapper directory follows `$XDG_CONFIG_HOME`, and zsh's rc file follows `$ZDOTDIR`.
 
 After install, start a new shell or source the rc file.
 
 ## Print without installing
 
 ```sh
-ji config shell init               # detect $SHELL
+ji config shell init               # detect the active shell
 ji config shell init zsh           # explicit
 ```
 
@@ -52,7 +54,7 @@ if command -v ji >/dev/null 2>&1; then eval "$(command ji config shell init)"; f
 
 ## Supported shells
 
-zsh, bash, fish. The shell is detected from `$SHELL`; pass an explicit argument to override.
+zsh, bash, fish. The shell is detected from the active shell — the one that invoked `ji`, by walking the process tree — falling back to `$SHELL` when it can't be identified; pass an explicit argument to override.
 
 ## Verification
 

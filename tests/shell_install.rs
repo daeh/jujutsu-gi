@@ -423,7 +423,7 @@ fn status_does_not_panic() {
     let tmp = TempDir::new().unwrap();
     let env = env_for(&tmp);
     install_zsh(&env, InstallOpts::default()).unwrap();
-    status(&env, "zsh", &mut fake_cmd()).unwrap();
+    status(&env, Some("zsh"), &mut fake_cmd()).unwrap();
 }
 
 #[test]

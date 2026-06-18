@@ -21,17 +21,15 @@ pub struct CloseParams<'a> {
     pub workspace_path_template: &'a str,
     pub repo_name: &'a str,
     pub author: Option<&'a str>,
-    /// All workspace (name, path) pairs for staleness tracking.
-    pub all_ws_paths: &'a [(String, PathBuf)],
 }
 
 /// Owned-data mirror of `CloseParams`, used by the deferred-handoff path
 /// in the TUI (see `PendingHandoff::Close`). The drain block destructures
 /// this and constructs a `CloseParams<'_>` inline: `bookmarks` is moved
-/// out (`Vec<String>` → `Vec<String>`); `revisions` and `all_ws_paths`
-/// are borrowed via `&owned.foo` (which deref-coerces `&Vec<T>` to
-/// `&[T]`); the remaining `&'a str` / `&'a Path` fields are also
-/// borrowed; `author: Option<String>` becomes `author.as_deref()`.
+/// out (`Vec<String>` → `Vec<String>`); `revisions` is borrowed via
+/// `&owned.revisions` (which deref-coerces `&Vec<T>` to `&[T]`); the
+/// remaining `&'a str` / `&'a Path` fields are also borrowed;
+/// `author: Option<String>` becomes `author.as_deref()`.
 pub struct CloseParamsOwned {
     pub repo_root: PathBuf,
     pub source_name: String,
@@ -47,7 +45,6 @@ pub struct CloseParamsOwned {
     pub workspace_path_template: String,
     pub repo_name: String,
     pub author: Option<String>,
-    pub all_ws_paths: Vec<(String, PathBuf)>,
 }
 
 /// Execute close, computing sync info fresh.
@@ -73,18 +70,61 @@ pub fn close_with_info(
         CloseMethod::Abandon => Operation::Abandon,
     };
 
-    // Validate head info (not needed for disposal ops).
-    let head_info = match operation {
-        Operation::Detach | Operation::Abandon => None,
-        _ => Some(super::validate_head_info(
-            repo,
-            info,
-            params.source_name,
-            params.target_name,
-        )?),
+    // Sync-state-consuming methods cannot run off an Error-mode info.
+    // Disposal ops (Detach/Abandon) don't consume sync state and may proceed
+    // with one — their freshness is still validated below (Error infos carry
+    // the real op head).
+    if !matches!(operation, Operation::Detach | Operation::Abandon)
+        && let super::types::SyncMode::Error(e) = &info.mode
+    {
+        bail!("sync state could not be determined: {e}");
+    }
+
+    // Validate head info — strict mode for ALL close methods, including
+    // Detach/Abandon (previously exempt): the close plan spans revisions,
+    // bookmarks, and target entries beyond SyncModeInfo, so any op-head
+    // movement since `info` was computed bails rather than executing a
+    // possibly divergent plan. Heads AND lca come from the validated info.
+    let validated =
+        super::validate_head_info(repo, info, params.source_name, params.target_name, false)?;
+
+    // Execution-time freshness + protection (all workspaces, fail-loud):
+    // broad descendant-first snapshot + snapshot-only revalidation. Disposal
+    // ops (Detach/Abandon) consume only the source and run on possibly
+    // Error-mode info, so their target is not involved and the plan is not
+    // re-proven via `plan_equivalent` (they re-verify the live source).
+    let disposal = matches!(operation, Operation::Detach | Operation::Abandon);
+    let advance_id = (params.bookmark_action == BookmarkAction::Advance
+        && !params.target_change_id.is_empty())
+    .then_some(params.target_change_id);
+    let fresh = super::prepare_execution_freshness(
+        repo,
+        &validated,
+        params.source_name,
+        params.source_path,
+        params.target_name,
+        params.target_path,
+        !disposal,
+        !disposal,
+        advance_id,
+    )?;
+    let validated = fresh.info;
+    let src_hi = validated.src_head_info();
+    let tgt_hi = validated.tgt_head_info();
+    let src = operations::WsRef {
+        name: params.source_name,
+        path: params.source_path,
+        info: &src_hi,
+    };
+    let tgt = operations::WsRef {
+        name: params.target_name,
+        path: params.target_path,
+        info: &tgt_hi,
     };
 
-    // Predict which third-party workspaces will become stale (pre-op query).
+    // Predict which third-party workspaces will become stale (post-phase,
+    // pre-op query; reporting/resolution only — edit survival is already
+    // covered by the protection snapshot above).
     let abandoned_ids: Vec<&str> = match operation {
         Operation::Abandon => params
             .revisions
@@ -93,18 +133,16 @@ pub fn close_with_info(
             .collect(),
         _ => vec![],
     };
-    let predicted_stale = super::predict_stale_workspaces(
-        repo,
-        operation,
-        info,
-        &abandoned_ids,
-        params.source_name,
-        params.target_name,
-    );
-    super::snapshot_predicted_stale(&predicted_stale, params.all_ws_paths);
-
-    // Staleness snapshot: record which workspaces are already stale.
-    let pre_stale: Vec<String> = jujutsu::stale_workspace_names(params.all_ws_paths);
+    // Abandon's target is not involved: a workspace descending from the
+    // abandoned revisions must stay in the resolution/report set even if it
+    // is the named target.
+    let involved: Vec<&str> = if matches!(operation, Operation::Abandon) {
+        vec![params.source_name]
+    } else {
+        vec![params.source_name, params.target_name]
+    };
+    let predicted_stale =
+        super::predict_stale_workspaces(repo, operation, &validated, &abandoned_ids, &involved);
 
     // Detach resolves the source effective head before forget.
     let mut detach_src_head: Option<String> = None;
@@ -115,7 +153,6 @@ pub fn close_with_info(
     // Execute the operation.
     match operation {
         Operation::MergeClose => {
-            let (ref src_hi, ref tgt_hi) = head_info.unwrap();
             // Safety: source @ will lose workspace status. Warn if undescribed work.
             let src_revset = jj_utils::ws_head_revset(params.source_name);
             if let jj_utils::RevisionSafety::AtRisk { change_id } =
@@ -127,22 +164,12 @@ pub fn close_with_info(
                     params.source_name,
                 ));
             }
-            op_warnings.extend(operations::merge_close(
-                repo,
-                params.source_name,
-                params.source_path,
-                src_hi,
-                params.target_name,
-                params.target_path,
-                tgt_hi,
-                params.author,
-            )?);
+            op_warnings.extend(operations::merge_close(repo, src, tgt, params.author)?);
             // Resolve target staleness from the --ignore-working-copy mutation
             // (see sync.rs / transfer.rs for the full rationale).
             let _ = jujutsu::update_workspace_stale(params.target_path);
         }
         Operation::MergeSquashClose => {
-            let (ref src_hi, ref tgt_hi) = head_info.unwrap();
             // Safety: source @ will lose workspace status. Warn if undescribed work.
             let src_revset = jj_utils::ws_head_revset(params.source_name);
             if let jj_utils::RevisionSafety::AtRisk { change_id } =
@@ -156,20 +183,15 @@ pub fn close_with_info(
             }
             op_warnings.extend(operations::merge_squash_close(
                 repo,
-                params.source_name,
-                params.source_path,
-                src_hi,
-                params.target_name,
-                params.target_path,
-                tgt_hi,
-                &info.lca,
+                src,
+                tgt,
+                &validated.lca,
                 params.author,
             )?);
             // Resolve target staleness from the --ignore-working-copy mutation.
             let _ = jujutsu::update_workspace_stale(params.target_path);
         }
         Operation::FastForwardTargetClose => {
-            let (ref src_hi, ref tgt_hi) = head_info.unwrap();
             // Safety: target @ is displaced by jj edit. The head check would
             // short-circuit (target always has source-chain descendants), so
             // use check_working_copy_safety which skips it.
@@ -185,14 +207,7 @@ pub fn close_with_info(
                     );
                 }
             }
-            op_warnings = operations::fast_forward_close(
-                repo,
-                params.source_name,
-                params.source_path,
-                src_hi,
-                params.target_path,
-                tgt_hi,
-            )?;
+            op_warnings = operations::fast_forward_close(repo, src, params.target_path, &tgt_hi)?;
             // Resolve target staleness from the jj edit (Live policy) — target
             // @ was reassigned, source workspace's WC operation lags.
             let _ = jujutsu::update_workspace_stale(params.target_path);
@@ -214,6 +229,23 @@ pub fn close_with_info(
             operations::forget_workspace(repo, params.source_path, params.source_name)?;
         }
         Operation::Abandon => {
+            // The frozen `revisions` list was computed when the dialog/CLI
+            // gathered state. Interior-chain inserts keep all HEAD change-ids
+            // stable (change ids survive rewrites), so op-head/plan checks
+            // cannot see a grown chain — verify the live set against the
+            // frozen set with the same producer definition (default-relative)
+            // before destroying anything.
+            let live = jj_utils::workspace_unique_change_ids(repo, params.source_name)?;
+            let live_set: std::collections::HashSet<&str> =
+                live.iter().map(String::as_str).collect();
+            let frozen_set: std::collections::HashSet<&str> = params
+                .revisions
+                .iter()
+                .map(|r| r.change_id.as_str())
+                .collect();
+            if live_set != frozen_set {
+                bail!("source revisions changed, please retry");
+            }
             // Safety: entire unique chain is destroyed. Snapshot + check all revisions.
             let ids: Vec<&str> = params
                 .revisions
@@ -242,11 +274,18 @@ pub fn close_with_info(
         _ => bail!("unexpected operation for close: {operation:?}"),
     }
 
-    // Post-op: resolve predicted third-party stale workspaces.
-    super::resolve_predicted_stale(&predicted_stale, params.all_ws_paths);
+    // Post-op: resolve predicted third-party stale workspaces — excluding
+    // any that were already stale pre-op (the protection phase's skip-set);
+    // those belong to the update-stale workflow and surface in the report.
+    let to_resolve: Vec<String> = predicted_stale
+        .iter()
+        .filter(|n| !fresh.stale_skipped.contains(n))
+        .cloned()
+        .collect();
+    super::resolve_predicted_stale(&to_resolve, &fresh.ws_paths);
 
     // Post-op: staleness warnings + operation warnings.
-    let mut stale_warnings = super::post_op_stale(params.all_ws_paths, &pre_stale);
+    let mut stale_warnings = super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped);
     stale_warnings.extend(op_warnings);
 
     // Post-op: singular bookmarks.
@@ -255,7 +294,7 @@ pub fn close_with_info(
         operation,
         params.source_name,
         params.target_name,
-        Some(info),
+        Some(&validated),
         params.workspace_path_template,
         params.repo_name,
         params.bookmarks.clone(),
@@ -285,10 +324,8 @@ pub fn close_with_info(
     };
 
     Ok(CloseTransferResult {
-        operation_used: operation,
         stale_warnings,
         predicted_stale,
-        source_forgotten: true,
         pending_remove_path,
     })
 }

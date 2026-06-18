@@ -1,4 +1,7 @@
+use super::dialog_common;
+use super::line_edit::LineEditor;
 use crate::hooks::{self, HookVars};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -10,7 +13,7 @@ enum Field {
     Msg,
 }
 
-const FIELDS: [Field; 4] = [Field::Bookmark, Field::Revision, Field::Path, Field::Msg];
+const FIELDS: [Field; 4] = [Field::Path, Field::Revision, Field::Bookmark, Field::Msg];
 const LABEL_WIDTH: u16 = 12;
 
 pub(crate) struct CreateDialogValues {
@@ -177,6 +180,62 @@ impl CreateDialog {
         self.selection_anchor = None;
     }
 
+    // -- Key handling --
+
+    /// Dialog-internal key handling: field navigation, cursor movement, and
+    /// text editing. Enter/Esc and revision cycling (which drives the graph
+    /// pane) stay with the App. Arm order is semantic: the bare `Char(c)`
+    /// insert arm has no modifier guard, so the guarded Ctrl/Alt arms must
+    /// stay physically ahead of it (an unhandled modifier combo inserts the
+    /// plain character).
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Tab | KeyCode::Down => {
+                self.next_field();
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.prev_field();
+            }
+            KeyCode::Left => {
+                self.move_left();
+            }
+            KeyCode::Right => {
+                self.move_right();
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_home();
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_end();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_to_start();
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_to_end();
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_word_backward();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.move_word_backward();
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.move_word_forward();
+            }
+            KeyCode::Char(c) => {
+                self.insert_char(c);
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.delete_word_backward();
+            }
+            KeyCode::Backspace => {
+                self.delete_char();
+            }
+            _ => {}
+        }
+    }
+
     // -- Field navigation --
 
     pub(crate) fn next_field(&mut self) {
@@ -200,6 +259,10 @@ impl CreateDialog {
     }
 
     // -- Editing --
+    //
+    // Text/cursor mutation delegates to `LineEditor` (grapheme-aware);
+    // the dialog layers its field-specific semantics on top: the bookmark
+    // space ban, revision-cycle exits, and selection handling.
 
     pub(crate) fn insert_char(&mut self, c: char) {
         if self.active_field == Field::Bookmark && c == ' ' {
@@ -207,9 +270,7 @@ impl CreateDialog {
         }
         self.exit_revision_cycle();
         self.delete_selection();
-        let pos = self.cursor_pos;
-        self.active_mut().insert(pos, c);
-        self.cursor_pos += c.len_utf8();
+        self.editor().insert_char(c);
     }
 
     pub(crate) fn delete_char(&mut self) {
@@ -217,15 +278,7 @@ impl CreateDialog {
         if self.delete_selection() {
             return;
         }
-        if self.cursor_pos > 0 {
-            let pos = self.cursor_pos;
-            // Grapheme-aware backspace: deletes one user-perceived character
-            // even when it is composed of multiple Unicode codepoints (e.g.
-            // a regional-indicator pair `🇯🇵`).
-            let prev = crate::text_utils::prev_grapheme_boundary(self.active_ref(), pos);
-            self.active_mut().drain(prev..pos);
-            self.cursor_pos = prev;
-        }
+        self.editor().backspace();
     }
 
     pub(crate) fn delete_to_start(&mut self) {
@@ -233,11 +286,7 @@ impl CreateDialog {
         if self.delete_selection() {
             return;
         }
-        let pos = self.cursor_pos;
-        if pos > 0 {
-            self.active_mut().drain(..pos);
-            self.cursor_pos = 0;
-        }
+        self.editor().delete_to_start();
     }
 
     pub(crate) fn delete_to_end(&mut self) {
@@ -245,8 +294,7 @@ impl CreateDialog {
         if self.delete_selection() {
             return;
         }
-        let pos = self.cursor_pos;
-        self.active_mut().truncate(pos);
+        self.editor().delete_to_end();
     }
 
     pub(crate) fn delete_word_backward(&mut self) {
@@ -254,55 +302,39 @@ impl CreateDialog {
         if self.delete_selection() {
             return;
         }
-        let pos = self.cursor_pos;
-        if pos == 0 {
-            return;
-        }
-        // Grapheme-safe word boundary: never splits multi-codepoint graphemes
-        // (e.g. 🇯🇵) but preserves the existing ASCII-space-delimited semantics.
-        let new_pos = crate::text_utils::prev_word_boundary(self.active_ref(), pos);
-        self.active_mut().drain(new_pos..pos);
-        self.cursor_pos = new_pos;
+        self.editor().delete_word_backward();
     }
 
     // -- Cursor movement --
 
     pub(crate) fn move_left(&mut self) {
         self.clear_selection();
-        if self.cursor_pos > 0 {
-            // Grapheme-aware so arrow-left over `🇯🇵` moves by one user-
-            // perceived character rather than mid-grapheme.
-            self.cursor_pos =
-                crate::text_utils::prev_grapheme_boundary(self.active_ref(), self.cursor_pos);
-        }
+        self.editor().move_left();
     }
 
     pub(crate) fn move_right(&mut self) {
         self.clear_selection();
-        let field = self.active_ref();
-        if self.cursor_pos < field.len() {
-            self.cursor_pos = crate::text_utils::next_grapheme_boundary(field, self.cursor_pos);
-        }
+        self.editor().move_right();
     }
 
     pub(crate) fn move_word_backward(&mut self) {
         self.clear_selection();
-        self.cursor_pos = crate::text_utils::prev_word_boundary(self.active_ref(), self.cursor_pos);
+        self.editor().move_word_backward();
     }
 
     pub(crate) fn move_word_forward(&mut self) {
         self.clear_selection();
-        self.cursor_pos = crate::text_utils::next_word_boundary(self.active_ref(), self.cursor_pos);
+        self.editor().move_word_forward();
     }
 
     pub(crate) fn move_home(&mut self) {
         self.clear_selection();
-        self.cursor_pos = 0;
+        self.editor().move_home();
     }
 
     pub(crate) fn move_end(&mut self) {
         self.clear_selection();
-        self.cursor_pos = self.active_ref().len();
+        self.editor().move_end();
     }
 
     // -- Mouse --
@@ -369,6 +401,20 @@ impl CreateDialog {
         }
     }
 
+    /// Line-editor view over the active field and the shared cursor.
+    fn editor(&mut self) -> LineEditor<'_> {
+        let text = match self.active_field {
+            Field::Bookmark => &mut self.bookmark,
+            Field::Revision => &mut self.revision,
+            Field::Path => &mut self.path,
+            Field::Msg => &mut self.msg,
+        };
+        LineEditor {
+            text,
+            cursor: &mut self.cursor_pos,
+        }
+    }
+
     /// Compute dialog inner area. Used by both `draw()` and `hit_test()`.
     fn layout(&self, area: Rect) -> (Rect, Rect) {
         let width = 64.min(area.width.saturating_sub(4));
@@ -407,9 +453,9 @@ impl CreateDialog {
         let sel_style = Style::default().bg(Color::DarkGray).fg(Color::White);
 
         let fields: [(Field, &str, &str, Option<&str>); 4] = [
-            (Field::Bookmark, "  Bookmark: ", &self.bookmark, None),
-            (Field::Revision, "  Revision: ", &self.revision, None),
             (Field::Path, "  Path:     ", &self.path, Some(&default_path)),
+            (Field::Revision, "  Revision: ", &self.revision, None),
+            (Field::Bookmark, "  Bookmark: ", &self.bookmark, None),
             (Field::Msg, "  Message:  ", &self.msg, None),
         ];
 
@@ -471,18 +517,13 @@ impl CreateDialog {
                     }
                 } else {
                     // No selection — just cursor.
-                    let (before, after) = value.split_at(self.cursor_pos);
-                    let (cursor_display, after_cursor) =
-                        crate::text_utils::peel_first_grapheme_for_cursor(after);
-                    Line::from(vec![
-                        Span::styled(*label, label_style),
-                        Span::styled(before, val_style),
-                        Span::styled(
-                            cursor_display,
-                            Style::default().bg(Color::White).fg(Color::Black),
-                        ),
-                        Span::styled(after_cursor, val_style),
-                    ])
+                    dialog_common::field_with_cursor(
+                        label,
+                        value,
+                        self.cursor_pos,
+                        label_style,
+                        val_style,
+                    )
                 }
             } else {
                 let display_value = if value.is_empty() {
@@ -520,5 +561,96 @@ impl CreateDialog {
                 1,
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn reset_dialog(dialog: &mut CreateDialog) {
+        dialog.reset(
+            "{{ default_workspace_path }}/{{ bookmark }}",
+            "repo",
+            "@",
+            "/home/user",
+            "/workspaces/repo",
+        );
+    }
+
+    #[test]
+    fn starts_focused_on_bookmark_and_typing_updates_bookmark() {
+        let mut dialog = CreateDialog::new();
+        reset_dialog(&mut dialog);
+
+        assert!(dialog.active_field == Field::Bookmark);
+
+        dialog.insert_char('x');
+        let values = dialog.values();
+
+        assert_eq!(values.bookmark, "x");
+        assert!(dialog.path.is_empty());
+        assert_eq!(values.path, "/workspaces/repo/x");
+    }
+
+    #[test]
+    fn field_navigation_follows_visual_order_from_bookmark() {
+        let mut dialog = CreateDialog::new();
+        reset_dialog(&mut dialog);
+
+        dialog.next_field();
+        assert!(dialog.active_field == Field::Msg);
+
+        reset_dialog(&mut dialog);
+        dialog.prev_field();
+        assert!(dialog.active_field == Field::Revision);
+    }
+
+    #[test]
+    fn hit_test_uses_visual_field_order() {
+        let mut dialog = CreateDialog::new();
+        reset_dialog(&mut dialog);
+        let area = Rect::new(0, 0, 80, 24);
+        let (inner, _) = dialog.layout(area);
+        let value_col = inner.x + LABEL_WIDTH;
+
+        let expected = [Field::Path, Field::Revision, Field::Bookmark, Field::Msg];
+
+        for (i, expected_field) in expected.iter().enumerate() {
+            let row = inner.y + 1 + (i as u16 * 2);
+            let (field_index, offset) = dialog
+                .hit_test(area, value_col, row)
+                .expect("row should hit a field");
+
+            assert!(FIELDS[field_index] == *expected_field);
+            assert_eq!(offset, 0);
+        }
+    }
+
+    #[test]
+    fn draw_renders_labels_in_visual_order() {
+        let mut dialog = CreateDialog::new();
+        reset_dialog(&mut dialog);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| dialog.draw(frame, frame.area()))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        let positions = ["Path:", "Revision:", "Bookmark:", "Message:"]
+            .map(|label| rendered.find(label).expect("label should be rendered"));
+
+        assert!(positions.windows(2).all(|window| window[0] < window[1]));
     }
 }

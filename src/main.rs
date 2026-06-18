@@ -63,6 +63,7 @@ fn main() -> anyhow::Result<()> {
             let repo_root = jujutsu::workspace_root()?;
             let cfg = config::load_config(&repo_root)?;
             let repo_name = config::resolve_repo_name(&cfg, &repo_root);
+            // First list only resolves names/paths (snapshot-stable).
             let workspaces = jujutsu::list_workspaces(&repo_root)?;
 
             let (src_name, src_path, tgt_name, tgt_path) = resolve_src_tgt(
@@ -72,11 +73,18 @@ fn main() -> anyhow::Result<()> {
                 target.as_deref(),
             )?;
 
-            let ws_paths: Vec<(String, PathBuf)> = workspaces
-                .iter()
-                .filter(|w| !w.path.as_os_str().is_empty() && w.path.exists())
-                .map(|w| (w.name.clone(), w.path.clone()))
-                .collect();
+            // Entry snapshot (conditional) of the workspaces this method
+            // consumes, BEFORE gathering param state: `revisions` and
+            // `target_change_id` below must reflect post-snapshot reality.
+            let mut required: Vec<(&str, &Path)> = vec![(&src_name, &src_path)];
+            if needs_target {
+                required.push((&tgt_name, &tgt_path));
+            }
+            commands::snapshot_workspaces(&required)?;
+
+            // Re-list post-snapshot: the snapshot may have folded pending
+            // edits into a workspace's @ (emptiness, revision data).
+            let workspaces = jujutsu::list_workspaces(&repo_root)?;
 
             // Gather revisions for the source workspace (needed for abandon).
             let src_ws = workspaces.iter().find(|w| w.name == src_name);
@@ -100,7 +108,6 @@ fn main() -> anyhow::Result<()> {
                 workspace_path_template: &cfg.workspace_path,
                 repo_name: &repo_name,
                 author: cfg.ji_author.as_deref(),
-                all_ws_paths: &ws_paths,
             };
 
             let result = commands::close::close(&params)?;
@@ -130,6 +137,7 @@ fn main() -> anyhow::Result<()> {
             let repo_root = jujutsu::workspace_root()?;
             let cfg = config::load_config(&repo_root)?;
             let repo_name = config::resolve_repo_name(&cfg, &repo_root);
+            // First list only resolves names/paths (snapshot-stable).
             let workspaces = jujutsu::list_workspaces(&repo_root)?;
 
             let (src_name, src_path, tgt_name, tgt_path) = resolve_src_tgt(
@@ -139,11 +147,9 @@ fn main() -> anyhow::Result<()> {
                 target.as_deref(),
             )?;
 
-            let ws_paths: Vec<(String, PathBuf)> = workspaces
-                .iter()
-                .filter(|w| !w.path.as_os_str().is_empty() && w.path.exists())
-                .map(|w| (w.name.clone(), w.path.clone()))
-                .collect();
+            // Entry snapshot (conditional): every transfer method consumes
+            // both workspaces. Runs before param state is gathered.
+            commands::snapshot_workspaces(&[(&src_name, &src_path), (&tgt_name, &tgt_path)])?;
 
             let params = commands::transfer::TransferParams {
                 repo_root: &repo_root,
@@ -155,7 +161,6 @@ fn main() -> anyhow::Result<()> {
                 workspace_path_template: &cfg.workspace_path,
                 repo_name: &repo_name,
                 author: cfg.ji_author.as_deref(),
-                all_ws_paths: &ws_paths,
             };
 
             let result = commands::transfer::transfer(&params)?;
@@ -179,6 +184,11 @@ fn main() -> anyhow::Result<()> {
                 source.as_deref(),
                 target.as_deref(),
             )?;
+
+            // Entry snapshot (conditional): sync consumes both workspaces.
+            // Must precede the mode detection inside `sync` so pending
+            // on-disk edits are visible to it.
+            commands::snapshot_workspaces(&[(&src_name, &src_path), (&tgt_name, &tgt_path)])?;
 
             let outcome = commands::sync::sync(
                 &repo_root,
@@ -206,19 +216,15 @@ fn main() -> anyhow::Result<()> {
         }
 
         Some(Commands::Ls) => cmd_ls(),
-        Some(Commands::Init) => {
-            let ws_root = jujutsu::current_workspace_root()?;
-            config::create_config(&ws_root)
-        }
+        Some(Commands::Init) => cmd_init(),
         Some(Commands::Hook) => {
             eprintln!("(ji)::hook not yet implemented");
             Ok(())
         }
         Some(Commands::Config { command }) => match command {
-            ConfigCommands::Init => {
-                let ws_root = jujutsu::current_workspace_root()?;
-                config::create_config(&ws_root)
-            }
+            // `ji config init` is an alias of `ji init`; route through the
+            // same handler so behavior can't diverge.
+            ConfigCommands::Init => cmd_init(),
             ConfigCommands::Shell {
                 command: ShellCommands::Init { shell: sh },
             } => {
@@ -256,10 +262,9 @@ fn main() -> anyhow::Result<()> {
             ConfigCommands::Shell {
                 command: ShellCommands::Status { shell: sh },
             } => {
-                let sh = sh.map_or_else(shell::detect_shell, Ok)?;
                 let mut cmd = Cli::command();
                 let env = shell::ShellEnv::from_process_env()?;
-                shell::status(&env, &sh, &mut cmd)
+                shell::status(&env, sh.as_deref(), &mut cmd)
             }
         },
     };
@@ -318,6 +323,14 @@ fn resolve_src_tgt(
     };
 
     Ok((src_name, src_path, tgt_name, tgt_path))
+}
+
+fn cmd_init() -> anyhow::Result<()> {
+    // Write to the default workspace root, where config is loaded from, so
+    // the template lands where `ji` will read it regardless of which
+    // workspace the command is invoked from.
+    let ws_root = jujutsu::workspace_root()?;
+    config::create_config(&ws_root)
 }
 
 fn cmd_ls() -> anyhow::Result<()> {

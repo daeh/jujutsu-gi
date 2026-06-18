@@ -6,6 +6,7 @@ mod dialog_common;
 mod dialog_info;
 mod graph_pane;
 mod key_hints;
+mod line_edit;
 mod op_log_pane;
 mod revision_picker;
 mod sync_dialog;
@@ -17,7 +18,7 @@ use crate::{action_history, commands, config, hooks, jj_utils, jujutsu, operatio
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
-    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    KeyCode, KeyEventKind, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use dialog_common::TargetWorkspace;
@@ -113,16 +114,21 @@ struct App {
     /// Path of workspace files to potentially remove after close.
     pending_remove_path: Option<PathBuf>,
     /// A jj subprocess (or file-write side effect) deferred to run between
-    /// terminal-handoff (exit raw mode) and re-entry. Each variant captures
-    /// all owned params needed to invoke a jujutsu/commands function from
-    /// `run_tui`'s drain block (`drain_pending_handoff`).
+    /// frames. Non-interactive variants run while the TUI stays visible with a
+    /// blocking working overlay; interactive variants temporarily hand off the
+    /// terminal. Each variant captures all owned params needed to invoke a
+    /// jujutsu/commands function from `run_tui`'s drain block
+    /// (`drain_pending_handoff`).
     ///
     /// **Coverage:** every mutating jj or file-write site in the TUI event
     /// loop is deferred via this enum. The one synchronous exception is
     /// `Command::new("pbcopy")` in `copy_dialog.rs::copy_to_clipboard` — it
     /// runs in ≈20 ms and writes nothing to the terminal, so it doesn't need
-    /// the raw-mode handoff the deferred sites use.
+    /// the deferred drain path.
     pending_handoff: Option<PendingHandoff>,
+    /// Label for the modal shown while a non-interactive deferred operation is
+    /// blocking the event loop.
+    working_label: Option<&'static str>,
     revision_picker: Option<RevisionPicker>,
     config: config::Config,
     repo_root: PathBuf,
@@ -131,6 +137,25 @@ struct App {
     action: Option<Action>,
     /// Whether the working copy is currently stale.
     stale: bool,
+    /// Reason `refresh` could not guarantee post-snapshot workspace-list data
+    /// (probe-loop cap hit, or the list rebuild failed). While `Some`,
+    /// mutating dialogs (sync/close/transfer) refuse to open and surface the
+    /// reason — their list-derived data could be stale/pre-snapshot.
+    dialog_open_block: Option<&'static str>,
+    /// Op head captured at the end of the most recent `refresh()` — after its
+    /// probe-loop snapshot and final list rebuild, before the open handlers read
+    /// any list-derived dialog data. Used as the dialog freshness baseline so
+    /// the execute gate's op-head comparison represents the list data's
+    /// freshness (baseline <= data freshness ⇒ an external op in the dialog-open
+    /// window is detected by the gate, never masked).
+    fresh_op_head: String,
+    /// Op head at the last staleness probe (the `refresh()` loop or
+    /// `refresh_staleness`). `refresh_staleness` skips its LIVE (snapshotting)
+    /// probe when the head has not moved since: a workspace can only become
+    /// jj-stale via an operation, and every operation moves the op head, so an
+    /// unchanged head means no new staleness is possible. Keeps the periodic /
+    /// selection polls from snapshotting an idle repo's pending edits.
+    last_stale_probe_op_head: String,
     /// Error message from a failed update-stale attempt.
     stale_error: Option<String>,
     /// Transient status/error messages (rendered as stacked lines).
@@ -182,9 +207,9 @@ enum Action {
     Quit,
 }
 
-/// A jj subprocess (or file/clipboard side effect) deferred until after
-/// `run_tui`'s drain block can exit raw mode. See `App::pending_handoff`
-/// for the coverage invariant.
+/// A jj subprocess (or file/clipboard side effect) deferred until
+/// `run_tui`'s drain block can run it. See `App::pending_handoff` for the
+/// coverage invariant.
 ///
 /// Variants must hold OWNED data only — the drain block consumes the value
 /// (`match handoff { … }`), so any borrowed reference would prevent the
@@ -224,7 +249,7 @@ enum PendingHandoff {
     /// `"bookmark create {name}"` in action history.
     BookmarkCreate { name: String, change_id: String },
     /// Sequence: save_all_stale_diffs(repo_root) THEN update_stale(repo_root).
-    /// Fused so the user sees one terminal handoff rather than two flickers.
+    /// Fused so the user sees one working screen rather than two.
     /// Triggered from `Mode::StaleAlert` + 'r'.
     UpdateStaleSequence,
     /// Sequence: save_all_stale_diffs(ws_path) THEN update_workspace_stale(ws_path).
@@ -276,6 +301,33 @@ enum PendingHandoff {
     },
 }
 
+impl PendingHandoff {
+    fn requires_terminal_handoff(&self) -> bool {
+        matches!(self, Self::Split { .. })
+    }
+
+    fn working_label(&self) -> &'static str {
+        match self {
+            Self::Split { .. } => "Splitting revision",
+            Self::OpRestore { .. } | Self::OpRestoreFromLog { .. } => "Restoring operation",
+            Self::RemoveDirAll { .. } => "Removing workspace files",
+            Self::SaveDiff { .. } => "Saving diff",
+            Self::SaveAllDiffs { .. } => "Saving diffs",
+            Self::WorkspaceForget { .. } => "Forgetting workspace",
+            Self::BookmarkCreate { .. } => "Creating bookmark",
+            Self::UpdateStaleSequence | Self::UpdateWorkspaceStale { .. } => {
+                "Updating stale workspace"
+            }
+            Self::BookmarkTug { .. } => "Moving bookmark",
+            Self::BookmarkDelete { .. } => "Deleting bookmark",
+            Self::Sync { .. } => "Syncing workspaces",
+            Self::Create { .. } => "Creating workspace",
+            Self::Close { .. } => "Closing workspace",
+            Self::Transfer { .. } => "Transferring changes",
+        }
+    }
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -310,6 +362,7 @@ impl App {
             bookmarks_dialog: None,
             pending_remove_path: None,
             pending_handoff: None,
+            working_label: None,
             revision_picker: None,
             config,
             repo_root,
@@ -317,6 +370,9 @@ impl App {
             repo_name,
             action: None,
             stale: false,
+            dialog_open_block: None,
+            fresh_op_head: String::new(),
+            last_stale_probe_op_head: String::new(),
             stale_error: None,
             status_messages: Vec::new(),
             update_stale_target: None,
@@ -609,7 +665,7 @@ impl App {
         }
 
         // Op head differs — check if only snapshots intervened.
-        match jujutsu::only_snapshots_since(&self.repo_root, expected) {
+        match jujutsu::only_snapshots_since(&self.repo_root, expected, 200) {
             Ok(true) => {
                 self.execute_undo_redo(is_redo);
             }
@@ -634,6 +690,103 @@ impl App {
                     .map(|r| (ws.name.clone(), r.change_id.clone()))
             })
         });
+
+        // Freshness invariant (load-bearing): probe staleness over the PRIOR
+        // workspace list FIRST. `is_workspace_stale` runs a LIVE `jj status`,
+        // which snapshots pending working-copy edits — so every list-derived
+        // value read below (revisions, bookmarks, change ids) is
+        // post-snapshot. Mutating dialogs (sync/close/transfer) depend on
+        // this ordering for their open-time freshness; do not move the probe
+        // after the list rebuild or switch it to --ignore-working-copy.
+        let mut probed: HashSet<PathBuf> = HashSet::new();
+        let mut stale_names = Self::probe_staleness(self.ws_probe_paths(), &mut probed);
+
+        // Fail closed for mutating dialogs if the list rebuild can't be
+        // guaranteed post-snapshot (set below). Cleared on entry.
+        self.dialog_open_block = None;
+        let mut rebuilt = self.rebuild_lists(focused.as_ref());
+
+        // Workspaces discovered by the rebuild (created externally, or the
+        // very first refresh where the prior list is empty) were not probed
+        // above — their list data may be pre-snapshot. Probe them and rebuild
+        // until no new paths appear (typically 0 extra rounds). Fail closed
+        // at the cap.
+        const STALE_PROBE_MAX_ROUNDS: usize = 3;
+        for round in 0..=STALE_PROBE_MAX_ROUNDS {
+            let unprobed: Vec<(String, PathBuf)> = self
+                .ws_probe_paths()
+                .into_iter()
+                .filter(|(_, p)| !probed.contains(p))
+                .collect();
+            if unprobed.is_empty() {
+                break;
+            }
+            if round == STALE_PROBE_MAX_ROUNDS {
+                self.dialog_open_block = Some("workspace probe incomplete (repo changing rapidly)");
+                break;
+            }
+            stale_names.extend(Self::probe_staleness(unprobed, &mut probed));
+            rebuilt = self.rebuild_lists(focused.as_ref());
+        }
+        // A failed final list rebuild leaves stale (possibly pre-snapshot)
+        // list data — refuse to open mutating dialogs against it.
+        if !rebuilt {
+            self.dialog_open_block = Some("workspace list unavailable");
+        }
+        self.workspace_list.set_stale_names(stale_names);
+        // fresh_op_head (the dialog baseline) is captured inside rebuild_lists,
+        // BEFORE the list query it represents. refresh() also just probed every
+        // workspace's staleness (the live probe snapshots), so re-baseline the
+        // periodic-poll gate to that same post-probe head.
+        self.last_stale_probe_op_head
+            .clone_from(&self.fresh_op_head);
+        if self.show_files {
+            self.ensure_files_cached();
+        }
+    }
+
+    /// Workspace (name, path) pairs eligible for the staleness probe
+    /// (non-empty, existing paths) — from the CURRENT `workspace_list`.
+    fn ws_probe_paths(&self) -> Vec<(String, PathBuf)> {
+        self.workspace_list
+            .workspaces()
+            .iter()
+            .filter(|w| !w.path.as_os_str().is_empty() && w.path.exists())
+            .map(|w| (w.name.clone(), w.path.clone()))
+            .collect()
+    }
+
+    /// Probe the given workspaces for jj-staleness (live `jj status`, which
+    /// also snapshots pending edits — see the invariant note in `refresh`).
+    /// Marks each path probed; returns the names found stale.
+    fn probe_staleness(
+        pairs: Vec<(String, PathBuf)>,
+        probed: &mut HashSet<PathBuf>,
+    ) -> Vec<String> {
+        let mut stale = Vec::new();
+        for (name, path) in pairs {
+            probed.insert(path.clone());
+            if jujutsu::is_workspace_stale(&path) {
+                stale.push(name);
+            }
+        }
+        stale
+    }
+
+    /// Rebuild the workspace list and graph pane from current jj state,
+    /// restoring selection and the focused revision. Extracted from
+    /// `refresh` so the discovery loop can re-run it after late probes.
+    ///
+    /// Returns `false` if `list_workspaces` failed — the prior list is left
+    /// in place (stale), so the caller must fail closed for mutating dialogs.
+    fn rebuild_lists(&mut self, focused: Option<&(String, String)>) -> bool {
+        // Op head captured BEFORE the list query, so the dialog baseline derived
+        // from the rebuilt list is <= the list's freshness: an external op
+        // landing after this point yields current != baseline at the execute
+        // gate (Changed/refresh), never a masked stale plan. The probe-loop
+        // snapshot that precedes this rebuild already moved the head, so this is
+        // the post-snapshot, pre-list-read head.
+        let pre_query_op = jujutsu::current_op_head(&self.repo_root).unwrap_or_default();
         if let Ok(mut workspaces) = jujutsu::list_workspaces(&self.repo_root) {
             let selected_name = self
                 .workspace_list
@@ -677,7 +830,7 @@ impl App {
                 &heads_for_sort,
             );
             // Restore cursor by change_id if the same workspace+revision still exists.
-            if let Some((ref ws_name, ref cid)) = focused {
+            if let Some((ws_name, cid)) = focused {
                 self.revision_cursor = self
                     .workspace_list
                     .selected_workspace()
@@ -685,20 +838,33 @@ impl App {
                     .and_then(|ws| ws.revisions.iter().position(|r| r.change_id == *cid));
             }
             self.sync_graph_to_cursor();
-            if self.show_files {
-                self.ensure_files_cached();
+            self.fresh_op_head = pre_query_op;
+            true
+        } else {
+            if let Ok((graph, heads)) =
+                jujutsu::log_graph_with_heads(&self.repo_root, self.config.log_template.as_deref())
+            {
+                self.graph_pane = GraphPane::new(&graph, heads);
+                self.sync_graph_to_cursor();
             }
-        } else if let Ok((graph, heads)) =
-            jujutsu::log_graph_with_heads(&self.repo_root, self.config.log_template.as_deref())
-        {
-            self.graph_pane = GraphPane::new(&graph, heads);
-            self.sync_graph_to_cursor();
+            false
         }
-        self.refresh_staleness();
     }
 
     /// Query all workspaces for staleness and update the visual indicators.
+    ///
+    /// Indicator-only variant used by periodic / selection polls; the probe is
+    /// LIVE (snapshot side effect) so it is GATED on op-head movement: a
+    /// workspace can only become jj-stale via an operation, and every operation
+    /// moves the op head, so an unchanged head means no new staleness is
+    /// possible — skip, leaving an idle repo's pending edits un-snapshotted.
+    /// (`refresh` runs its own probe-first loop for the load-bearing dialog-open
+    /// snapshot; this variant only maintains the indicators.)
     fn refresh_staleness(&mut self) {
+        let current = jujutsu::current_op_head(&self.repo_root).unwrap_or_default();
+        if !current.is_empty() && current == self.last_stale_probe_op_head {
+            return;
+        }
         let ws_paths: Vec<(String, PathBuf)> = self
             .workspace_list
             .workspaces()
@@ -708,6 +874,10 @@ impl App {
             .collect();
         let stale_names = jujutsu::stale_workspace_names(&ws_paths);
         self.workspace_list.set_stale_names(stale_names);
+        // The probe may have snapshotted (moving the head); re-read so the next
+        // poll compares against the post-probe head and skips until real change.
+        self.last_stale_probe_op_head =
+            jujutsu::current_op_head(&self.repo_root).unwrap_or_default();
     }
 
     /// Drain messages from the background stale-diff thread, if any.
@@ -800,6 +970,317 @@ impl App {
     /// from the dialog state + App config and stashes it on `self`.
     /// The dialog itself is consumed; `sync_dialog`/`mode` cleanup
     /// happens at the caller.
+    /// Execute-time freshness gate for the sync dialog (lenient: sync's
+    /// `SyncModeInfo` is the complete plan). Conditionally snapshots the
+    /// involved workspaces, then verifies the dialog's cached plan still
+    /// describes reality. Returns true when the deferred execution may
+    /// proceed; false keeps the dialog open (refreshed in place + notice).
+    fn gate_sync_execute(&mut self) -> bool {
+        // The last refresh could not guarantee post-snapshot list data (probe
+        // cap, or a failed list rebuild during a prior in-place refresh). The
+        // dialog's paths/heads may be stale — refuse to execute. Make "retry"
+        // literal: re-attempt via stale_refresh, which self-heals if the block
+        // was transient or re-arms the retry notice if it persists.
+        if self.dialog_open_block.is_some() {
+            if let Some(src_name) = self.sync_dialog.as_ref().map(|d| d.source_name.clone()) {
+                self.stale_refresh_sync_dialog(&src_name);
+            }
+            return false;
+        }
+        let Some(dialog) = &self.sync_dialog else {
+            return false;
+        };
+        let Some(target) = dialog.selected_target().cloned() else {
+            return false;
+        };
+        let Some(mut info) = dialog.sync_info().cloned() else {
+            return false;
+        };
+        // Compare against the freshness baseline (op head when the dialog data
+        // was last refreshed), NOT the recompute-mutated `sync_info.op_head`
+        // (re-stamped to "now" on every target change), which would mask
+        // external movement that happened before the user pressed Enter.
+        info.op_head.clone_from(&dialog.freshness_baseline);
+        let src_name = dialog.source_name.clone();
+        let src_path = dialog.source_path.clone();
+
+        let required: Vec<(&str, &Path)> = vec![
+            (src_name.as_str(), src_path.as_path()),
+            (target.name.as_str(), target.path.as_path()),
+        ];
+        let freshness = match commands::check_freshness(
+            &self.repo_root,
+            &info,
+            &src_name,
+            &target.name,
+            &required,
+            true,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                if let Some(d) = &mut self.sync_dialog {
+                    d.notice = vec![format!("{e:#}")];
+                }
+                return false;
+            }
+        };
+        match freshness {
+            commands::Freshness::Unchanged => true,
+            commands::Freshness::Equivalent(fresh) => {
+                // SyncParamsOwned paths are executable state, and op-head
+                // movement can include a forget/re-add that relocates a
+                // workspace — verify both paths by name before deferring.
+                let paths_ok = jujutsu::list_workspaces(&self.repo_root)
+                    .ok()
+                    .is_some_and(|wss| {
+                        let path_of =
+                            |n: &str| wss.iter().find(|w| w.name == n).map(|w| w.path.clone());
+                        path_of(&src_name).as_deref() == Some(src_path.as_path())
+                            && path_of(&target.name).as_deref() == Some(target.path.as_path())
+                    });
+                if paths_ok {
+                    if let Some(d) = &mut self.sync_dialog {
+                        d.set_sync_info(*fresh);
+                    }
+                    true
+                } else {
+                    self.stale_refresh_sync_dialog(&src_name);
+                    false
+                }
+            }
+            commands::Freshness::Changed => {
+                self.stale_refresh_sync_dialog(&src_name);
+                false
+            }
+        }
+    }
+
+    /// In-place stale refresh of the sync dialog: full list refresh
+    /// (probe-first, see `refresh`), executable-input re-resolution by name,
+    /// recompute, and the warning banner. User selections survive.
+    fn stale_refresh_sync_dialog(&mut self, src_name: &str) {
+        self.refresh();
+        // If the refresh could not produce reliable list data, do NOT
+        // re-resolve the dialog from the stale list — leave the prior plan,
+        // surface the reason, and let the gate refuse the next Enter.
+        if let Some(reason) = self.dialog_open_block {
+            if let Some(d) = &mut self.sync_dialog {
+                d.notice = vec![format!("{reason} — retry")];
+            }
+            return;
+        }
+        let source_path = self
+            .workspace_list
+            .workspaces()
+            .iter()
+            .find(|w| w.name == src_name)
+            .map(|w| w.path.clone());
+        let targets = self.build_target_list(src_name);
+        // Baseline = op head as of the refresh() above (captured before this
+        // re-read of list-derived data, so an external op in the refresh window
+        // is caught by the next gate, not masked) — see fresh_op_head.
+        let baseline = self.fresh_op_head.clone();
+        let notices = vec![
+            "repo state changed — review the refreshed plan and press Enter to proceed".to_string(),
+        ];
+        if let Some(d) = &mut self.sync_dialog {
+            let mut notices = notices;
+            notices.extend(d.refresh_entries(source_path, targets));
+            d.recompute();
+            d.set_freshness_baseline(baseline);
+            d.notice = notices;
+        }
+        self.sync_graph_to_sync();
+    }
+
+    /// Execute-time freshness gate for the close/transfer dialog (strict:
+    /// the executable plan spans revisions/bookmarks/target entries beyond
+    /// `SyncModeInfo`, so ANY op-head movement refreshes and re-confirms).
+    fn gate_close_execute(&mut self, op: Operation) -> bool {
+        // See gate_sync_execute: refuse to execute against possibly-stale list
+        // data; re-attempt via stale_refresh so Enter literally retries.
+        if self.dialog_open_block.is_some() {
+            self.stale_refresh_close_dialog(op);
+            return false;
+        }
+        let Some(dialog) = &self.close_dialog else {
+            return false;
+        };
+        let src_name = dialog.workspace_name.clone();
+        let src_path = dialog.workspace_path.clone();
+        let target = dialog.selected_target().cloned();
+        let info = dialog.close_info.clone();
+        let baseline = dialog.freshness_baseline.clone();
+
+        // Snapshot exactly what the chosen operation consumes: source
+        // always; target unless this is a disposal op.
+        let disposal = matches!(op, Operation::Detach | Operation::Abandon);
+        let mut required: Vec<(&str, &Path)> = vec![(src_name.as_str(), src_path.as_path())];
+        if !disposal && let Some(t) = &target {
+            required.push((t.name.as_str(), t.path.as_path()));
+        }
+
+        let Some(mut info) = info else {
+            // No cached plan (only possible with an empty target list, which
+            // only disposal ops survive): snapshot and proceed — the defer
+            // path re-detects post-snapshot.
+            match commands::snapshot_workspaces(&required) {
+                Ok(_) => return true,
+                Err(e) => {
+                    if let Some(d) = &mut self.close_dialog {
+                        d.notice = vec![format!("{e:#}")];
+                    }
+                    return false;
+                }
+            }
+        };
+        let tgt_name = target
+            .as_ref()
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "default".to_string());
+
+        // Compare against the freshness baseline, not the recompute-mutated
+        // `close_info.op_head` (see gate_sync_execute / the field doc).
+        info.op_head = baseline;
+
+        match commands::check_freshness(
+            &self.repo_root,
+            &info,
+            &src_name,
+            &tgt_name,
+            &required,
+            false,
+        ) {
+            Ok(commands::Freshness::Unchanged) => true,
+            // Unreachable with allow_equivalent == false; treat as fresh.
+            Ok(commands::Freshness::Equivalent(_)) => true,
+            Ok(commands::Freshness::Changed) => {
+                self.stale_refresh_close_dialog(op);
+                false
+            }
+            Err(e) => {
+                if let Some(d) = &mut self.close_dialog {
+                    d.notice = vec![format!("{e:#}")];
+                }
+                false
+            }
+        }
+    }
+
+    /// In-place stale refresh of the close/transfer dialog: full list
+    /// refresh (probe-first), re-resolution of every executable input by
+    /// name (source path, revisions, bookmarks, target entries), selected-
+    /// operation restore by identity, and the warning banner. User
+    /// selections (operation, toggles, target-by-name) survive.
+    fn stale_refresh_close_dialog(&mut self, op: Operation) {
+        self.refresh();
+        // If the refresh could not produce reliable list data, do NOT
+        // re-resolve from the stale list — leave the prior plan, surface the
+        // reason, and let the gate refuse the next Enter.
+        if let Some(reason) = self.dialog_open_block {
+            if let Some(d) = &mut self.close_dialog {
+                d.notice = vec![format!("{reason} — retry")];
+            }
+            return;
+        }
+        let Some(dialog) = &self.close_dialog else {
+            return;
+        };
+        let src_name = dialog.workspace_name.clone();
+        let intent = dialog.intent;
+        let prev_target = dialog.selected_target().map(|t| t.name.clone());
+
+        let mut notices = vec![
+            "repo state changed — review the refreshed plan and press Enter to proceed".to_string(),
+        ];
+
+        // Re-resolve the source entry and its bookmark context from the
+        // refreshed list (same construction as the open handlers).
+        let singular = jj_utils::identify_singular_bookmark(
+            &self.repo_root,
+            &self.config.workspace_path,
+            &self.repo_name,
+            &src_name,
+        )
+        .map(|(name, _)| name);
+        let src_entry = self
+            .workspace_list
+            .workspaces()
+            .iter()
+            .find(|w| w.name == src_name)
+            .map(|ws| {
+                let bookmarks: Vec<String> = ws
+                    .bookmarks_at_head
+                    .iter()
+                    .chain(ws.bookmarks_behind.iter())
+                    .filter(|(name, _)| singular.as_ref() != Some(name))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                (ws.path.clone(), ws.revisions.clone(), bookmarks)
+            });
+        let targets = self.build_target_list(&src_name);
+        // Baseline = op head as of the refresh() above (captured before this
+        // re-read of list-derived data, so an external op in the refresh window
+        // is caught by the next gate, not masked) — see fresh_op_head.
+        let baseline = self.fresh_op_head.clone();
+
+        let Some(dialog) = &mut self.close_dialog else {
+            return;
+        };
+        match src_entry {
+            Some((path, revisions, bookmarks)) => {
+                dialog.workspace_path = path;
+                dialog.revisions = revisions;
+                dialog.singular_bookmark = singular;
+                if intent == DialogIntent::Close {
+                    dialog.bookmarks = bookmarks;
+                }
+                dialog.source_missing = false;
+            }
+            None => {
+                notices.push(format!("source workspace {src_name} no longer exists"));
+                dialog.source_missing = true;
+            }
+        }
+
+        // Target entries: preserve selection by name; a vanished selection
+        // disables target-consuming ops (disposal ops stay available) until
+        // the user explicitly reselects.
+        dialog.targets = targets;
+        dialog.target_unavailable = None;
+        match prev_target
+            .as_deref()
+            .and_then(|n| dialog.targets.iter().position(|t| t.name == n))
+        {
+            Some(idx) => dialog.target_index = idx,
+            None => {
+                dialog.target_index = 0;
+                if prev_target.is_some() {
+                    notices.push(
+                        "previous target no longer exists — target operations disabled until \
+                         you reselect"
+                            .to_string(),
+                    );
+                    dialog.target_unavailable =
+                        Some("previous target no longer exists".to_string());
+                }
+            }
+        }
+
+        dialog.recompute_close_mode();
+        dialog.set_freshness_baseline(baseline);
+
+        // Restore the selected operation by identity; clamp if it vanished.
+        dialog.jump_to(op);
+        if dialog.selected_op() != Some(op) {
+            let len = dialog.all_operations().len();
+            dialog.selected_index = dialog.selected_index.min(len.saturating_sub(1));
+            notices.push("previously selected operation is no longer available".to_string());
+        }
+        dialog.notice = notices;
+        self.sync_graph_to_close();
+    }
+
     fn defer_sync(&mut self, dialog: SyncDialog, label: String) {
         let Some(target) = dialog.selected_target().cloned() else {
             return;
@@ -898,14 +1379,6 @@ impl App {
         let bookmarks = dialog.bookmarks.clone();
         let revisions = dialog.revisions.clone();
 
-        let ws_paths: Vec<(String, PathBuf)> = self
-            .workspace_list
-            .workspaces()
-            .iter()
-            .filter(|w| !w.path.as_os_str().is_empty() && w.path.exists())
-            .map(|w| (w.name.clone(), w.path.clone()))
-            .collect();
-
         match intent {
             DialogIntent::Close => {
                 let Ok(method) = commands::types::CloseMethod::try_from(operation) else {
@@ -941,7 +1414,6 @@ impl App {
                     workspace_path_template: self.config.workspace_path.clone(),
                     repo_name: self.repo_name.clone(),
                     author: self.config.ji_author.clone(),
-                    all_ws_paths: ws_paths,
                 };
                 self.pending_handoff = Some(PendingHandoff::Close {
                     params,
@@ -969,7 +1441,6 @@ impl App {
                     workspace_path_template: self.config.workspace_path.clone(),
                     repo_name: self.repo_name.clone(),
                     author: self.config.ji_author.clone(),
-                    all_ws_paths: ws_paths,
                 };
                 self.pending_handoff = Some(PendingHandoff::Transfer {
                     params,
@@ -1170,914 +1641,863 @@ impl App {
             return;
         }
         match self.mode {
-            Mode::List if self.left_panel == LeftPanel::OpLog => {
-                match key.code {
-                    KeyCode::Char('o') | KeyCode::Esc if self.focus == Focus::Workspaces => {
-                        self.leave_op_log();
-                    }
-                    KeyCode::Esc if self.focus == Focus::Graph => {
-                        self.focus = Focus::Workspaces;
-                    }
-                    KeyCode::Tab if !self.show_help => {
-                        self.focus = match self.focus {
-                            Focus::Workspaces => Focus::Graph,
-                            Focus::Graph => Focus::Workspaces,
-                        };
-                    }
-                    KeyCode::Char('?') | KeyCode::Char('/') => {
-                        self.show_help = !self.show_help;
-                        if self.show_help {
-                            self.focus = Focus::Workspaces;
-                        }
-                    }
-                    KeyCode::Char('s') if self.focus == Focus::Workspaces => {
-                        if let Some(pane) = &mut self.op_log_pane {
-                            pane.toggle_snapshots();
-                            self.op_graph_debounce = std::time::Instant::now();
-                        }
-                    }
-                    KeyCode::Char('R') if self.focus == Focus::Workspaces => {
-                        if self
-                            .op_log_pane
-                            .as_ref()
-                            .and_then(|p| p.selected_operation())
-                            .is_some()
-                        {
-                            self.mode = Mode::OpRestore;
-                        }
-                    }
-                    // Graph scroll
-                    KeyCode::Up if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_up();
-                    }
-                    KeyCode::Down if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_down(self.graph_visible_height);
-                    }
-                    KeyCode::Char('k') if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_up();
-                    }
-                    KeyCode::Char('j') if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_down(self.graph_visible_height);
-                    }
-                    KeyCode::Char('u') if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_up_half(self.graph_visible_height);
-                    }
-                    KeyCode::Char('d') if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_down_half(self.graph_visible_height);
-                    }
-                    // Op log list navigation
-                    KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
-                        if self.focus == Focus::Workspaces =>
-                    {
-                        if let Some(pane) = &mut self.op_log_pane
-                            && pane.handle_key(key.code)
-                        {
-                            self.op_graph_debounce = std::time::Instant::now();
-                        }
-                    }
-                    KeyCode::Char('Z') if self.focus == Focus::Workspaces => {
-                        self.try_undo_redo(false);
-                    }
-                    KeyCode::Char('Y') if self.focus == Focus::Workspaces => {
-                        self.try_undo_redo(true);
-                    }
-                    _ => {}
+            Mode::List if self.left_panel == LeftPanel::OpLog => self.handle_key_op_log(key),
+            Mode::List => self.handle_key_list(key),
+            Mode::Copy => self.handle_key_copy(key),
+            Mode::Bookmarks => self.handle_key_bookmarks(key),
+            Mode::Sync => self.handle_key_sync(key),
+            Mode::Create => self.handle_key_create(key),
+            Mode::Close => self.handle_key_close(key),
+            Mode::ConfirmRemoveFiles => self.handle_key_confirm_remove_files(key),
+            Mode::Split => self.handle_key_split(key),
+            Mode::StaleAlert => self.handle_key_stale_alert(key),
+            Mode::UpdateStale => self.handle_key_update_stale_dialog(key),
+            Mode::ConfigWarning => self.handle_key_config_warning(key),
+            Mode::OpRestore => self.handle_key_op_restore(key),
+            Mode::UndoRedoConfirm { is_redo } => self.handle_key_undo_redo_confirm(key, is_redo),
+        }
+    }
+
+    fn handle_key_op_log(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Char('o') | KeyCode::Esc if self.focus == Focus::Workspaces => {
+                self.leave_op_log();
+            }
+            KeyCode::Esc if self.focus == Focus::Graph => {
+                self.focus = Focus::Workspaces;
+            }
+            KeyCode::Tab if !self.show_help => {
+                self.focus = match self.focus {
+                    Focus::Workspaces => Focus::Graph,
+                    Focus::Graph => Focus::Workspaces,
+                };
+            }
+            KeyCode::Char('?') | KeyCode::Char('/') => {
+                self.show_help = !self.show_help;
+                if self.show_help {
+                    self.focus = Focus::Workspaces;
                 }
             }
-            Mode::List => {
-                match key.code {
-                    KeyCode::Char('q') => {
-                        self.action = Some(Action::Quit);
+            KeyCode::Char('s') if self.focus == Focus::Workspaces => {
+                if let Some(pane) = &mut self.op_log_pane {
+                    pane.toggle_snapshots();
+                    self.op_graph_debounce = std::time::Instant::now();
+                }
+            }
+            KeyCode::Char('R') if self.focus == Focus::Workspaces => {
+                if self
+                    .op_log_pane
+                    .as_ref()
+                    .and_then(|p| p.selected_operation())
+                    .is_some()
+                {
+                    self.mode = Mode::OpRestore;
+                }
+            }
+            // Graph scroll
+            KeyCode::Up if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_up();
+            }
+            KeyCode::Down if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_down(self.graph_visible_height);
+            }
+            KeyCode::Char('k') if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_up();
+            }
+            KeyCode::Char('j') if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_down(self.graph_visible_height);
+            }
+            KeyCode::Char('u') if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_up_half(self.graph_visible_height);
+            }
+            KeyCode::Char('d') if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_down_half(self.graph_visible_height);
+            }
+            // Op log list navigation
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
+                if self.focus == Focus::Workspaces =>
+            {
+                if let Some(pane) = &mut self.op_log_pane
+                    && pane.handle_key(key.code)
+                {
+                    self.op_graph_debounce = std::time::Instant::now();
+                }
+            }
+            KeyCode::Char('Z') if self.focus == Focus::Workspaces => {
+                self.try_undo_redo(false);
+            }
+            KeyCode::Char('Y') if self.focus == Focus::Workspaces => {
+                self.try_undo_redo(true);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_list(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => {
+                self.action = Some(Action::Quit);
+            }
+            KeyCode::Esc if self.focus == Focus::Graph => {
+                self.focus = Focus::Workspaces;
+            }
+            KeyCode::Tab if !self.show_help => {
+                self.focus = match self.focus {
+                    Focus::Workspaces => Focus::Graph,
+                    Focus::Graph => Focus::Workspaces,
+                };
+            }
+            // Arrow keys: always route to the focused pane
+            KeyCode::Up if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_up();
+            }
+            KeyCode::Down if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_down(self.graph_visible_height);
+            }
+            KeyCode::Up | KeyCode::Down if self.focus == Focus::Workspaces => {
+                self.workspace_list.handle_key(key.code);
+                self.on_selection_changed();
+                if self.show_files {
+                    self.ensure_files_cached();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(ws) = self.workspace_list.selected_workspace()
+                    && !ws.revisions.is_empty()
+                {
+                    let max = ws.revisions.len() - 1;
+                    self.revision_cursor = Some(match self.revision_cursor {
+                        None => 0,
+                        Some(i) if i < max => i + 1,
+                        Some(i) => i,
+                    });
+                    self.workspace_list.reset_desc_scroll();
+                    self.sync_graph_to_revision();
+                    if self.show_files {
+                        self.ensure_files_cached();
                     }
-                    KeyCode::Esc if self.focus == Focus::Graph => {
-                        self.focus = Focus::Workspaces;
+                }
+            }
+            KeyCode::Left => {
+                if self.revision_cursor.is_some() {
+                    self.revision_cursor = match self.revision_cursor {
+                        Some(0) => None,
+                        Some(i) => Some(i - 1),
+                        None => None,
+                    };
+                    self.sync_graph_to_cursor();
+                    self.workspace_list.reset_desc_scroll();
+                    if self.show_files {
+                        self.ensure_files_cached();
                     }
-                    KeyCode::Tab if !self.show_help => {
-                        self.focus = match self.focus {
-                            Focus::Workspaces => Focus::Graph,
-                            Focus::Graph => Focus::Workspaces,
-                        };
-                    }
-                    // Arrow keys: always route to the focused pane
-                    KeyCode::Up if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_up();
-                    }
-                    KeyCode::Down if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_down(self.graph_visible_height);
-                    }
-                    KeyCode::Up | KeyCode::Down if self.focus == Focus::Workspaces => {
-                        self.workspace_list.handle_key(key.code);
-                        self.on_selection_changed();
-                        if self.show_files {
-                            self.ensure_files_cached();
+                }
+            }
+            // Vim keys: graph scroll when graph focused, workspace nav when workspace focused
+            KeyCode::Char('k') if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_up();
+            }
+            KeyCode::Char('j') if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_down(self.graph_visible_height);
+            }
+            KeyCode::Char('u') if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_up_half(self.graph_visible_height);
+            }
+            KeyCode::Char('d') if self.focus == Focus::Graph => {
+                self.graph_pane.scroll_down_half(self.graph_visible_height);
+            }
+            KeyCode::Char('P') if self.focus == Focus::Workspaces => {
+                self.clear_status();
+            }
+            KeyCode::Char('p') if self.focus == Focus::Workspaces => {
+                if !self.status_messages.is_empty() {
+                    copy_dialog::copy_to_clipboard(&self.status_messages.join("\n"));
+                }
+            }
+            KeyCode::Char('u') if self.focus == Focus::Workspaces => {
+                if let Some(ws) = self.workspace_list.selected_workspace()
+                    && self.workspace_list.is_stale(&ws.name)
+                {
+                    self.update_stale_target = Some((ws.name.clone(), ws.path.clone()));
+                    self.update_stale_diff = None;
+                    self.mode = Mode::UpdateStale;
+                }
+            }
+            KeyCode::Char('?') | KeyCode::Char('/') => {
+                self.show_help = !self.show_help;
+                if self.show_help {
+                    self.focus = Focus::Workspaces;
+                }
+            }
+            // Workspace actions — only when workspace pane is focused
+            KeyCode::Enter if self.focus == Focus::Workspaces => {
+                if let Some(ws) = self.workspace_list.selected_workspace() {
+                    self.action = Some(Action::SwitchTo(ws.path.clone()));
+                }
+            }
+            KeyCode::Char('n') if self.stale && self.focus == Focus::Workspaces => {
+                self.mode = Mode::StaleAlert;
+            }
+            KeyCode::Char('n') if self.focus == Focus::Workspaces => {
+                let ws = self.workspace_list.selected_workspace();
+                let revision = if let Some(cursor) = self.revision_cursor {
+                    ws.and_then(|w| w.revisions.get(cursor))
+                        .map(|r| r.change_id.as_str())
+                        .unwrap_or("@")
+                } else {
+                    ws.map(|w| w.change_id.as_str()).unwrap_or("@")
+                };
+                let choices: Vec<String> = ws
+                    .map(|w| w.revisions.iter().map(|r| r.change_id.clone()).collect())
+                    .unwrap_or_default();
+                let home = std::env::var("HOME").unwrap_or_default();
+                self.create_dialog.reset(
+                    &self.config.workspace_path,
+                    &self.repo_name,
+                    revision,
+                    &home,
+                    &self.repo_root.to_string_lossy(),
+                );
+                self.create_dialog.set_revision_choices(choices);
+                if self.config.warnings.is_empty() {
+                    self.mode = Mode::Create;
+                } else {
+                    self.mode = Mode::ConfigWarning;
+                }
+            }
+            KeyCode::Char('s') if self.focus == Focus::Workspaces => {
+                self.refresh();
+                if let Some(reason) = self.dialog_open_block {
+                    self.set_status(format!("{reason} — retry"));
+                    return;
+                }
+                if let Some(ws) = self.workspace_list.selected_workspace() {
+                    if self.stale {
+                        self.mode = Mode::StaleAlert;
+                    } else {
+                        let targets = self.build_target_list(&ws.name);
+                        if !targets.is_empty() {
+                            let candidate_ids: Vec<&str> =
+                                targets.iter().map(|t| t.change_id.as_str()).collect();
+                            let parent_id = jujutsu::closest_ancestor_workspace(
+                                &self.repo_root,
+                                &ws.change_id,
+                                &candidate_ids,
+                            );
+                            let default_target_idx = parent_id
+                                .and_then(|id| targets.iter().position(|t| t.change_id == id))
+                                .or_else(|| targets.iter().position(|t| t.name == "default"))
+                                .unwrap_or(0);
+                            self.sync_dialog = Some(SyncDialog::new(
+                                ws.name.clone(),
+                                ws.path.clone(),
+                                targets,
+                                default_target_idx,
+                                self.repo_root.clone(),
+                                self.config.workspace_path.clone(),
+                                self.repo_name.clone(),
+                            ));
+                            // Baseline = op head as of the refresh()
+                            // above (captured before this list-derived
+                            // dialog data was read) — see fresh_op_head.
+                            if let Some(d) = &mut self.sync_dialog {
+                                d.set_freshness_baseline(self.fresh_op_head.clone());
+                            }
+                            self.mode = Mode::Sync;
+                            self.sync_graph_to_sync();
                         }
                     }
+                }
+            }
+            KeyCode::Char('t') if self.focus == Focus::Workspaces => {
+                // Refresh before opening dialog to ensure workspace data is current.
+                self.refresh();
+                if let Some(reason) = self.dialog_open_block {
+                    self.set_status(format!("{reason} — retry"));
+                    return;
+                }
+                if let Some(ws) = self.workspace_list.selected_workspace() {
+                    if ws.name == "default" {
+                        return;
+                    }
+                    let orphaned = ws.path.as_os_str().is_empty();
+                    if orphaned {
+                        // Can't transfer an orphaned workspace — no-op.
+                    } else if self.stale {
+                        self.mode = Mode::StaleAlert;
+                    } else {
+                        let targets = self.build_target_list(&ws.name);
+                        let candidate_ids: Vec<&str> =
+                            targets.iter().map(|t| t.change_id.as_str()).collect();
+                        let parent_id = jujutsu::closest_ancestor_workspace(
+                            &self.repo_root,
+                            &ws.change_id,
+                            &candidate_ids,
+                        );
+                        let default_target_idx = parent_id
+                            .and_then(|id| targets.iter().position(|t| t.change_id == id))
+                            .or_else(|| targets.iter().position(|t| t.name == "default"))
+                            .unwrap_or(0);
+                        let singular_bookmark = jj_utils::identify_singular_bookmark(
+                            &self.repo_root,
+                            &self.config.workspace_path,
+                            &self.repo_name,
+                            &ws.name,
+                        )
+                        .map(|(name, _)| name);
+                        self.close_dialog = Some(CloseDialog::new(
+                            ws.name.clone(),
+                            ws.path.clone(),
+                            ws.revisions.clone(),
+                            DialogIntent::Transfer,
+                            targets,
+                            default_target_idx,
+                            self.repo_root.clone(),
+                            vec![],
+                            singular_bookmark,
+                            self.config.workspace_path.clone(),
+                            self.repo_name.clone(),
+                        ));
+                        // Baseline = op head as of the refresh() above
+                        // (captured before this list-derived dialog data
+                        // was read) — see fresh_op_head.
+                        if let Some(d) = &mut self.close_dialog {
+                            d.set_freshness_baseline(self.fresh_op_head.clone());
+                        }
+                        self.mode = Mode::Close;
+                        self.sync_graph_to_close();
+                    }
+                }
+            }
+            KeyCode::Char('b') if self.stale && self.focus == Focus::Workspaces => {
+                self.mode = Mode::StaleAlert;
+            }
+            KeyCode::Char('b') if self.focus == Focus::Workspaces => {
+                if let Some(ws) = self.workspace_list.selected_workspace() {
+                    let eff = jj_utils::find_effective_head(&self.repo_root, &ws.name).ok();
+                    self.bookmarks_dialog = Some(BookmarksDialog::new(ws, eff));
+                    self.mode = Mode::Bookmarks;
+                }
+            }
+            KeyCode::Char('c') if self.focus == Focus::Workspaces => {
+                if let Some(ws) = self.workspace_list.selected_workspace() {
+                    self.copy_dialog = Some(CopyDialog::new(ws));
+                    self.mode = Mode::Copy;
+                }
+            }
+            KeyCode::Char('v') if self.stale && self.focus == Focus::Workspaces => {
+                self.mode = Mode::StaleAlert;
+            }
+            KeyCode::Char('v') if self.focus == Focus::Workspaces => {
+                if let Some(ws) = self.workspace_list.selected_workspace()
+                    && !ws.revisions.is_empty()
+                {
+                    self.revision_picker =
+                        Some(RevisionPicker::new(ws.name.clone(), ws.revisions.clone()));
+                    self.mode = Mode::Split;
+                }
+            }
+            KeyCode::Char('x') if self.focus == Focus::Workspaces => {
+                self.refresh();
+                if let Some(reason) = self.dialog_open_block {
+                    self.set_status(format!("{reason} — retry"));
+                    return;
+                }
+                if let Some(ws) = self.workspace_list.selected_workspace() {
+                    if ws.name == "default" {
+                        return;
+                    }
+                    let orphaned = ws.path.as_os_str().is_empty();
+                    if orphaned {
+                        // Orphaned workspace: just forget it, no dialog needed.
+                        // Bypass stale check — forgetting doesn't touch working copy.
+                        let name = ws.name.clone();
+                        self.pending_handoff = Some(PendingHandoff::WorkspaceForget { name });
+                    } else if self.stale {
+                        self.mode = Mode::StaleAlert;
+                    } else {
+                        let targets = self.build_target_list(&ws.name);
+                        let candidate_ids: Vec<&str> =
+                            targets.iter().map(|t| t.change_id.as_str()).collect();
+                        let parent_id = jujutsu::closest_ancestor_workspace(
+                            &self.repo_root,
+                            &ws.change_id,
+                            &candidate_ids,
+                        );
+                        let default_target_idx = parent_id
+                            .and_then(|id| targets.iter().position(|t| t.change_id == id))
+                            .or_else(|| targets.iter().position(|t| t.name == "default"))
+                            .unwrap_or(0);
+                        let singular_bookmark = jj_utils::identify_singular_bookmark(
+                            &self.repo_root,
+                            &self.config.workspace_path,
+                            &self.repo_name,
+                            &ws.name,
+                        )
+                        .map(|(name, _)| name);
+                        let bookmarks: Vec<String> = ws
+                            .bookmarks_at_head
+                            .iter()
+                            .chain(ws.bookmarks_behind.iter())
+                            .filter(|(name, _)| singular_bookmark.as_ref() != Some(name))
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        self.close_dialog = Some(CloseDialog::new(
+                            ws.name.clone(),
+                            ws.path.clone(),
+                            ws.revisions.clone(),
+                            DialogIntent::Close,
+                            targets,
+                            default_target_idx,
+                            self.repo_root.clone(),
+                            bookmarks,
+                            singular_bookmark,
+                            self.config.workspace_path.clone(),
+                            self.repo_name.clone(),
+                        ));
+                        // Baseline = op head as of the refresh() above
+                        // (captured before this list-derived dialog data
+                        // was read) — see fresh_op_head.
+                        if let Some(d) = &mut self.close_dialog {
+                            d.set_freshness_baseline(self.fresh_op_head.clone());
+                        }
+                        self.mode = Mode::Close;
+                        self.sync_graph_to_close();
+                    }
+                }
+            }
+            KeyCode::Char('i') if self.focus == Focus::Workspaces => {
+                self.show_files = !self.show_files;
+                self.workspace_list.reset_desc_scroll();
+                if self.show_files {
+                    self.ensure_files_cached();
+                }
+            }
+            KeyCode::Char('r') if self.focus == Focus::Workspaces => {
+                self.revision_cursor = None;
+                self.workspace_list.toggle_sort();
+                self.sync_graph_to_selection();
+                if self.show_files {
+                    self.ensure_files_cached();
+                }
+            }
+            KeyCode::Char('o') if self.focus == Focus::Workspaces => {
+                self.enter_op_log();
+            }
+            KeyCode::Char('Z') if self.focus == Focus::Workspaces => {
+                self.try_undo_redo(false);
+            }
+            KeyCode::Char('Y') if self.focus == Focus::Workspaces => {
+                self.try_undo_redo(true);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_copy(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.copy_dialog = None;
+                self.mode = Mode::List;
+            }
+            KeyCode::Enter => {
+                if let Some(dialog) = &self.copy_dialog
+                    && let Some(value) = dialog.selected_value()
+                {
+                    copy_dialog::copy_to_clipboard(value);
+                }
+                self.copy_dialog = None;
+                self.mode = Mode::List;
+            }
+            other => {
+                if let Some(dialog) = &mut self.copy_dialog {
+                    dialog.handle_key(other);
+                }
+            }
+        }
+    }
+
+    fn handle_key_bookmarks(&mut self, key: crossterm::event::KeyEvent) {
+        if let Some(dialog) = &mut self.bookmarks_dialog {
+            if dialog.new_popup.is_some() {
+                // Delegate to new-bookmark popup
+                match key.code {
+                    KeyCode::Esc => {
+                        dialog.close_new_popup();
+                        self.sync_graph_to_selection();
+                    }
+                    KeyCode::Enter => {
+                        if let Some((name, change_id)) = dialog.confirm_new_popup() {
+                            self.pending_handoff =
+                                Some(PendingHandoff::BookmarkCreate { name, change_id });
+                            self.bookmarks_dialog = None;
+                            self.mode = Mode::List;
+                        }
+                    }
+                    // Revision cycling drives the graph pane, so Left/Right
+                    // stay here; popup Up/Down (field toggle) belong to the
+                    // dialog.
                     KeyCode::Right => {
-                        if let Some(ws) = self.workspace_list.selected_workspace()
-                            && !ws.revisions.is_empty()
-                        {
-                            let max = ws.revisions.len() - 1;
-                            self.revision_cursor = Some(match self.revision_cursor {
-                                None => 0,
-                                Some(i) if i < max => i + 1,
-                                Some(i) => i,
-                            });
-                            self.workspace_list.reset_desc_scroll();
-                            self.sync_graph_to_revision();
-                            if self.show_files {
-                                self.ensure_files_cached();
-                            }
+                        if let Some(change_id) = dialog.new_popup_cycle_revision(1) {
+                            let change_id = change_id.to_string();
+                            self.graph_pane
+                                .scroll_to_change_id(&change_id, self.graph_visible_height);
+                            let ids: HashSet<&str> = HashSet::from([change_id.as_str()]);
+                            self.graph_pane.highlight(&ids, false);
                         }
                     }
                     KeyCode::Left => {
-                        if self.revision_cursor.is_some() {
-                            self.revision_cursor = match self.revision_cursor {
-                                Some(0) => None,
-                                Some(i) => Some(i - 1),
-                                None => None,
-                            };
-                            self.sync_graph_to_cursor();
-                            self.workspace_list.reset_desc_scroll();
-                            if self.show_files {
-                                self.ensure_files_cached();
-                            }
+                        if let Some(change_id) = dialog.new_popup_cycle_revision(-1) {
+                            let change_id = change_id.to_string();
+                            self.graph_pane
+                                .scroll_to_change_id(&change_id, self.graph_visible_height);
+                            let ids: HashSet<&str> = HashSet::from([change_id.as_str()]);
+                            self.graph_pane.highlight(&ids, false);
                         }
                     }
-                    // Vim keys: graph scroll when graph focused, workspace nav when workspace focused
-                    KeyCode::Char('k') if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_up();
-                    }
-                    KeyCode::Char('j') if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_down(self.graph_visible_height);
-                    }
-                    KeyCode::Char('u') if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_up_half(self.graph_visible_height);
-                    }
-                    KeyCode::Char('d') if self.focus == Focus::Graph => {
-                        self.graph_pane.scroll_down_half(self.graph_visible_height);
-                    }
-                    KeyCode::Char('P') if self.focus == Focus::Workspaces => {
-                        self.clear_status();
-                    }
-                    KeyCode::Char('p') if self.focus == Focus::Workspaces => {
-                        if !self.status_messages.is_empty() {
-                            copy_dialog::copy_to_clipboard(&self.status_messages.join("\n"));
-                        }
-                    }
-                    KeyCode::Char('u') if self.focus == Focus::Workspaces => {
-                        if let Some(ws) = self.workspace_list.selected_workspace()
-                            && self.workspace_list.is_stale(&ws.name)
-                        {
-                            self.update_stale_target = Some((ws.name.clone(), ws.path.clone()));
-                            self.update_stale_diff = None;
-                            self.mode = Mode::UpdateStale;
-                        }
-                    }
-                    KeyCode::Char('?') | KeyCode::Char('/') => {
-                        self.show_help = !self.show_help;
-                        if self.show_help {
-                            self.focus = Focus::Workspaces;
-                        }
-                    }
-                    // Workspace actions — only when workspace pane is focused
-                    KeyCode::Enter if self.focus == Focus::Workspaces => {
-                        if let Some(ws) = self.workspace_list.selected_workspace() {
-                            self.action = Some(Action::SwitchTo(ws.path.clone()));
-                        }
-                    }
-                    KeyCode::Char('n') if self.stale && self.focus == Focus::Workspaces => {
-                        self.mode = Mode::StaleAlert;
-                    }
-                    KeyCode::Char('n') if self.focus == Focus::Workspaces => {
-                        let ws = self.workspace_list.selected_workspace();
-                        let revision = if let Some(cursor) = self.revision_cursor {
-                            ws.and_then(|w| w.revisions.get(cursor))
-                                .map(|r| r.change_id.as_str())
-                                .unwrap_or("@")
-                        } else {
-                            ws.map(|w| w.change_id.as_str()).unwrap_or("@")
-                        };
-                        let choices: Vec<String> = ws
-                            .map(|w| w.revisions.iter().map(|r| r.change_id.clone()).collect())
-                            .unwrap_or_default();
-                        let home = std::env::var("HOME").unwrap_or_default();
-                        self.create_dialog.reset(
-                            &self.config.workspace_path,
-                            &self.repo_name,
-                            revision,
-                            &home,
-                            &self.repo_root.to_string_lossy(),
-                        );
-                        self.create_dialog.set_revision_choices(choices);
-                        if self.config.warnings.is_empty() {
-                            self.mode = Mode::Create;
-                        } else {
-                            self.mode = Mode::ConfigWarning;
-                        }
-                    }
-                    KeyCode::Char('s') if self.focus == Focus::Workspaces => {
-                        self.refresh();
-                        if let Some(ws) = self.workspace_list.selected_workspace() {
-                            if self.stale {
-                                self.mode = Mode::StaleAlert;
-                            } else {
-                                let targets = self.build_target_list(&ws.name);
-                                if !targets.is_empty() {
-                                    let candidate_ids: Vec<&str> =
-                                        targets.iter().map(|t| t.change_id.as_str()).collect();
-                                    let parent_id = jujutsu::closest_ancestor_workspace(
-                                        &self.repo_root,
-                                        &ws.change_id,
-                                        &candidate_ids,
-                                    );
-                                    let default_target_idx = parent_id
-                                        .and_then(|id| {
-                                            targets.iter().position(|t| t.change_id == id)
-                                        })
-                                        .or_else(|| {
-                                            targets.iter().position(|t| t.name == "default")
-                                        })
-                                        .unwrap_or(0);
-                                    self.sync_dialog = Some(SyncDialog::new(
-                                        ws.name.clone(),
-                                        ws.path.clone(),
-                                        targets,
-                                        default_target_idx,
-                                        self.repo_root.clone(),
-                                        self.config.workspace_path.clone(),
-                                        self.repo_name.clone(),
-                                    ));
-                                    self.mode = Mode::Sync;
-                                    self.sync_graph_to_sync();
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char('t') if self.focus == Focus::Workspaces => {
-                        // Refresh before opening dialog to ensure workspace data is current.
-                        self.refresh();
-                        if let Some(ws) = self.workspace_list.selected_workspace() {
-                            if ws.name == "default" {
-                                return;
-                            }
-                            let orphaned = ws.path.as_os_str().is_empty();
-                            if orphaned {
-                                // Can't transfer an orphaned workspace — no-op.
-                            } else if self.stale {
-                                self.mode = Mode::StaleAlert;
-                            } else {
-                                let targets = self.build_target_list(&ws.name);
-                                let candidate_ids: Vec<&str> =
-                                    targets.iter().map(|t| t.change_id.as_str()).collect();
-                                let parent_id = jujutsu::closest_ancestor_workspace(
-                                    &self.repo_root,
-                                    &ws.change_id,
-                                    &candidate_ids,
-                                );
-                                let default_target_idx = parent_id
-                                    .and_then(|id| targets.iter().position(|t| t.change_id == id))
-                                    .or_else(|| targets.iter().position(|t| t.name == "default"))
-                                    .unwrap_or(0);
-                                let singular_bookmark = jj_utils::identify_singular_bookmark(
-                                    &self.repo_root,
-                                    &self.config.workspace_path,
-                                    &self.repo_name,
-                                    &ws.name,
-                                )
-                                .map(|(name, _)| name);
-                                self.close_dialog = Some(CloseDialog::new(
-                                    ws.name.clone(),
-                                    ws.path.clone(),
-                                    ws.revisions.clone(),
-                                    DialogIntent::Transfer,
-                                    targets,
-                                    default_target_idx,
-                                    self.repo_root.clone(),
-                                    vec![],
-                                    singular_bookmark,
-                                    self.config.workspace_path.clone(),
-                                    self.repo_name.clone(),
-                                ));
-                                self.mode = Mode::Close;
-                                self.sync_graph_to_close();
-                            }
-                        }
-                    }
-                    KeyCode::Char('b') if self.stale && self.focus == Focus::Workspaces => {
-                        self.mode = Mode::StaleAlert;
-                    }
-                    KeyCode::Char('b') if self.focus == Focus::Workspaces => {
-                        if let Some(ws) = self.workspace_list.selected_workspace() {
-                            let eff = jj_utils::find_effective_head(&self.repo_root, &ws.name).ok();
-                            self.bookmarks_dialog = Some(BookmarksDialog::new(ws, eff));
-                            self.mode = Mode::Bookmarks;
-                        }
-                    }
-                    KeyCode::Char('c') if self.focus == Focus::Workspaces => {
-                        if let Some(ws) = self.workspace_list.selected_workspace() {
-                            self.copy_dialog = Some(CopyDialog::new(ws));
-                            self.mode = Mode::Copy;
-                        }
-                    }
-                    KeyCode::Char('v') if self.stale && self.focus == Focus::Workspaces => {
-                        self.mode = Mode::StaleAlert;
-                    }
-                    KeyCode::Char('v') if self.focus == Focus::Workspaces => {
-                        if let Some(ws) = self.workspace_list.selected_workspace()
-                            && !ws.revisions.is_empty()
-                        {
-                            self.revision_picker =
-                                Some(RevisionPicker::new(ws.name.clone(), ws.revisions.clone()));
-                            self.mode = Mode::Split;
-                        }
-                    }
-                    KeyCode::Char('x') if self.focus == Focus::Workspaces => {
-                        self.refresh();
-                        if let Some(ws) = self.workspace_list.selected_workspace() {
-                            if ws.name == "default" {
-                                return;
-                            }
-                            let orphaned = ws.path.as_os_str().is_empty();
-                            if orphaned {
-                                // Orphaned workspace: just forget it, no dialog needed.
-                                // Bypass stale check — forgetting doesn't touch working copy.
-                                let name = ws.name.clone();
-                                self.pending_handoff =
-                                    Some(PendingHandoff::WorkspaceForget { name });
-                            } else if self.stale {
-                                self.mode = Mode::StaleAlert;
-                            } else {
-                                let targets = self.build_target_list(&ws.name);
-                                let candidate_ids: Vec<&str> =
-                                    targets.iter().map(|t| t.change_id.as_str()).collect();
-                                let parent_id = jujutsu::closest_ancestor_workspace(
-                                    &self.repo_root,
-                                    &ws.change_id,
-                                    &candidate_ids,
-                                );
-                                let default_target_idx = parent_id
-                                    .and_then(|id| targets.iter().position(|t| t.change_id == id))
-                                    .or_else(|| targets.iter().position(|t| t.name == "default"))
-                                    .unwrap_or(0);
-                                let singular_bookmark = jj_utils::identify_singular_bookmark(
-                                    &self.repo_root,
-                                    &self.config.workspace_path,
-                                    &self.repo_name,
-                                    &ws.name,
-                                )
-                                .map(|(name, _)| name);
-                                let bookmarks: Vec<String> = ws
-                                    .bookmarks_at_head
-                                    .iter()
-                                    .chain(ws.bookmarks_behind.iter())
-                                    .filter(|(name, _)| singular_bookmark.as_ref() != Some(name))
-                                    .map(|(name, _)| name.clone())
-                                    .collect();
-                                self.close_dialog = Some(CloseDialog::new(
-                                    ws.name.clone(),
-                                    ws.path.clone(),
-                                    ws.revisions.clone(),
-                                    DialogIntent::Close,
-                                    targets,
-                                    default_target_idx,
-                                    self.repo_root.clone(),
-                                    bookmarks,
-                                    singular_bookmark,
-                                    self.config.workspace_path.clone(),
-                                    self.repo_name.clone(),
-                                ));
-                                self.mode = Mode::Close;
-                                self.sync_graph_to_close();
-                            }
-                        }
-                    }
-                    KeyCode::Char('i') if self.focus == Focus::Workspaces => {
-                        self.show_files = !self.show_files;
-                        self.workspace_list.reset_desc_scroll();
-                        if self.show_files {
-                            self.ensure_files_cached();
-                        }
-                    }
-                    KeyCode::Char('r') if self.focus == Focus::Workspaces => {
-                        self.revision_cursor = None;
-                        self.workspace_list.toggle_sort();
-                        self.sync_graph_to_selection();
-                        if self.show_files {
-                            self.ensure_files_cached();
-                        }
-                    }
-                    KeyCode::Char('o') if self.focus == Focus::Workspaces => {
-                        self.enter_op_log();
-                    }
-                    KeyCode::Char('Z') if self.focus == Focus::Workspaces => {
-                        self.try_undo_redo(false);
-                    }
-                    KeyCode::Char('Y') if self.focus == Focus::Workspaces => {
-                        self.try_undo_redo(true);
-                    }
-                    _ => {}
+                    _ => dialog.handle_key(key),
                 }
-            }
-            Mode::Copy => match key.code {
-                KeyCode::Esc => {
-                    self.copy_dialog = None;
-                    self.mode = Mode::List;
-                }
-                KeyCode::Enter => {
-                    if let Some(dialog) = &self.copy_dialog
-                        && let Some(value) = dialog.selected_value()
-                    {
-                        copy_dialog::copy_to_clipboard(value);
-                    }
-                    self.copy_dialog = None;
-                    self.mode = Mode::List;
-                }
-                other => {
-                    if let Some(dialog) = &mut self.copy_dialog {
-                        dialog.handle_key(other);
-                    }
-                }
-            },
-            Mode::Bookmarks => {
-                if let Some(dialog) = &mut self.bookmarks_dialog {
-                    if dialog.new_popup.is_some() {
-                        // Delegate to new-bookmark popup
-                        match key.code {
-                            KeyCode::Esc => {
-                                dialog.close_new_popup();
-                                self.sync_graph_to_selection();
-                            }
-                            KeyCode::Enter => {
-                                if let Some((name, change_id)) = dialog.confirm_new_popup() {
-                                    self.pending_handoff =
-                                        Some(PendingHandoff::BookmarkCreate { name, change_id });
-                                    self.bookmarks_dialog = None;
-                                    self.mode = Mode::List;
-                                }
-                            }
-                            KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
-                                dialog.new_popup_toggle_field();
-                            }
-                            KeyCode::Right => {
-                                if let Some(change_id) = dialog.new_popup_cycle_revision(1) {
-                                    let change_id = change_id.to_string();
-                                    self.graph_pane
-                                        .scroll_to_change_id(&change_id, self.graph_visible_height);
-                                    let ids: HashSet<&str> = HashSet::from([change_id.as_str()]);
-                                    self.graph_pane.highlight(&ids, false);
-                                }
-                            }
-                            KeyCode::Left => {
-                                if let Some(change_id) = dialog.new_popup_cycle_revision(-1) {
-                                    let change_id = change_id.to_string();
-                                    self.graph_pane
-                                        .scroll_to_change_id(&change_id, self.graph_visible_height);
-                                    let ids: HashSet<&str> = HashSet::from([change_id.as_str()]);
-                                    self.graph_pane.highlight(&ids, false);
-                                }
-                            }
-                            KeyCode::Char(c) => {
-                                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                    match c {
-                                        'u' => dialog.new_popup_delete_to_start(),
-                                        'k' => dialog.new_popup_delete_to_end(),
-                                        'a' => dialog.new_popup_move_home(),
-                                        'e' => dialog.new_popup_move_end(),
-                                        _ => {}
-                                    }
-                                } else {
-                                    dialog.new_popup_insert_char(c);
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                dialog.new_popup_delete_char();
-                            }
-                            KeyCode::Home => {
-                                dialog.new_popup_move_home();
-                            }
-                            KeyCode::End => {
-                                dialog.new_popup_move_end();
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match key.code {
-                            KeyCode::Esc => {
-                                self.bookmarks_dialog = None;
-                                self.mode = Mode::List;
-                            }
-                            KeyCode::Char('n') => {
-                                dialog.open_new_popup();
-                            }
-                            KeyCode::Char('t') => {
-                                dialog.action = bookmarks_dialog::BookmarkAction::Tug;
-                            }
-                            KeyCode::Char('x') => {
-                                dialog.action = bookmarks_dialog::BookmarkAction::Delete;
-                            }
-                            KeyCode::Left => {
-                                dialog.action = bookmarks_dialog::BookmarkAction::Tug;
-                            }
-                            KeyCode::Right => {
-                                dialog.action = bookmarks_dialog::BookmarkAction::Delete;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                dialog.move_up();
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                dialog.move_down();
-                            }
-                            KeyCode::Char(' ') => {
-                                dialog.toggle_selection();
-                            }
-                            KeyCode::Char('a') => {
-                                dialog.toggle_select_all();
-                            }
-                            KeyCode::Char('y') | KeyCode::Enter => {
-                                if dialog.has_selection() {
-                                    let action = dialog.action;
-                                    let names = dialog.selected_bookmark_names();
-                                    let handoff = match action {
-                                        bookmarks_dialog::BookmarkAction::Tug => {
-                                            PendingHandoff::BookmarkTug {
-                                                names,
-                                                head_id: dialog.head_id.clone(),
-                                            }
-                                        }
-                                        bookmarks_dialog::BookmarkAction::Delete => {
-                                            PendingHandoff::BookmarkDelete { names }
-                                        }
-                                    };
-                                    self.pending_handoff = Some(handoff);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Mode::Sync => match key.code {
-                KeyCode::Esc => {
-                    self.sync_dialog = None;
-                    self.sync_graph_to_selection();
-                    self.mode = Mode::List;
-                }
-                KeyCode::Enter => {
-                    if let Some(dialog) = self.sync_dialog.take() {
-                        if dialog.has_operation() {
-                            let label = format!(
-                                "sync {} → {}",
-                                dialog.source_name,
-                                dialog
-                                    .selected_target()
-                                    .map(|t| t.name.as_str())
-                                    .unwrap_or("?")
-                            );
-                            self.defer_sync(dialog, label);
-                            self.sync_dialog = None;
-                            self.mode = Mode::List;
-                        } else {
-                            self.sync_dialog = Some(dialog);
-                        }
-                    }
-                }
-                other => {
-                    if let Some(dialog) = &mut self.sync_dialog {
-                        dialog.handle_key(other);
-                        dialog.recompute();
-                    }
-                    self.sync_graph_to_sync();
-                }
-            },
-            Mode::Create => match key.code {
-                KeyCode::Esc => {
-                    self.mode = Mode::List;
-                }
-                KeyCode::Enter => {
-                    let vals = self.create_dialog.values();
-                    if !vals.bookmark.is_empty() && !vals.path.is_empty() {
-                        self.refresh_staleness();
-                        self.defer_create(
-                            &vals.bookmark,
-                            &vals.revision,
-                            Path::new(&vals.path),
-                            &vals.msg,
-                        );
+            } else {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.bookmarks_dialog = None;
                         self.mode = Mode::List;
                     }
-                }
-                KeyCode::Tab | KeyCode::Down => {
-                    self.create_dialog.next_field();
-                }
-                KeyCode::BackTab | KeyCode::Up => {
-                    self.create_dialog.prev_field();
-                }
-                KeyCode::Left => {
-                    if self.create_dialog.active_is_revision() {
-                        if let Some(id) = self.create_dialog.cycle_revision(-1) {
-                            let id = id.to_string();
-                            self.graph_pane
-                                .scroll_to_change_id(&id, self.graph_visible_height);
-                            let ids: HashSet<&str> = HashSet::from([id.as_str()]);
-                            self.graph_pane.highlight(&ids, false);
-                        }
-                    } else {
-                        self.create_dialog.move_left();
-                    }
-                }
-                KeyCode::Right => {
-                    if self.create_dialog.active_is_revision() {
-                        if let Some(id) = self.create_dialog.cycle_revision(1) {
-                            let id = id.to_string();
-                            self.graph_pane
-                                .scroll_to_change_id(&id, self.graph_visible_height);
-                            let ids: HashSet<&str> = HashSet::from([id.as_str()]);
-                            self.graph_pane.highlight(&ids, false);
-                        }
-                    } else {
-                        self.create_dialog.move_right();
-                    }
-                }
-                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.create_dialog.move_home();
-                }
-                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.create_dialog.move_end();
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.create_dialog.delete_to_start();
-                }
-                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.create_dialog.delete_to_end();
-                }
-                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.create_dialog.delete_word_backward();
-                }
-                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.create_dialog.move_word_backward();
-                }
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.create_dialog.move_word_forward();
-                }
-                KeyCode::Char(c) => {
-                    self.create_dialog.insert_char(c);
-                }
-                KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.create_dialog.delete_word_backward();
-                }
-                KeyCode::Backspace => {
-                    self.create_dialog.delete_char();
-                }
-                _ => {}
-            },
-            Mode::Close => {
-                if let Some(dialog) = &mut self.close_dialog {
-                    match key.code {
-                        // Navigate operations
-                        KeyCode::Up => {
-                            dialog.move_up();
-                        }
-                        KeyCode::Down => {
-                            dialog.move_down();
-                        }
-                        // Cycle target workspace
-                        KeyCode::Left if dialog.targets.len() > 1 => {
-                            dialog.cycle_target_back();
-                            dialog.recompute_close_mode();
-                            self.sync_graph_to_close();
-                        }
-                        KeyCode::Right if dialog.targets.len() > 1 => {
-                            dialog.cycle_target();
-                            dialog.recompute_close_mode();
-                            self.sync_graph_to_close();
-                        }
-                        // Key shortcuts to jump to operation
-                        KeyCode::Char('a') => {
-                            let op = match dialog.intent {
-                                DialogIntent::Transfer => Operation::AdaptiveMerge,
-                                DialogIntent::Close => Operation::AdaptiveClose,
-                            };
-                            dialog.jump_to(op);
-                        }
-                        KeyCode::Char(c @ '1'..='4') => {
-                            dialog.jump_to_key(c);
-                        }
-                        KeyCode::Char('d') if dialog.intent == DialogIntent::Close => {
-                            dialog.jump_to(Operation::Detach);
-                        }
-                        // Confirm highlighted operation
-                        KeyCode::Char('y') | KeyCode::Enter => {
-                            if let Some(op) = dialog.selected_op() {
-                                let delete_files = dialog.delete_files;
-                                let label = match dialog.intent {
-                                    DialogIntent::Close => {
-                                        format!("close {}", dialog.workspace_name)
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        if dialog.has_selection() {
+                            let action = dialog.action;
+                            let names = dialog.selected_bookmark_names();
+                            let handoff = match action {
+                                bookmarks_dialog::BookmarkAction::Tug => {
+                                    PendingHandoff::BookmarkTug {
+                                        names,
+                                        head_id: dialog.head_id.clone(),
                                     }
-                                    DialogIntent::Transfer => {
-                                        let tgt = dialog
-                                            .selected_target()
-                                            .map(|t| t.name.as_str())
-                                            .unwrap_or("?");
-                                        format!("transfer {} → {tgt}", dialog.workspace_name)
-                                    }
-                                };
-                                let _ = self.defer_close_or_transfer(op, delete_files, label);
-                                // Always dismiss the dialog and return to
-                                // List; if the drain produces a pending
-                                // remove_path it'll switch to
-                                // ConfirmRemoveFiles after the handoff.
-                                self.close_dialog = None;
-                                self.mode = Mode::List;
-                            }
-                        }
-                        // Toggles
-                        KeyCode::Char('b')
-                            if dialog.intent == DialogIntent::Close
-                                && !dialog.bookmarks.is_empty() =>
-                        {
-                            dialog.cycle_bookmark_action();
-                        }
-                        KeyCode::Char('k') if dialog.intent == DialogIntent::Close => {
-                            dialog.toggle_delete_files();
-                        }
-                        // Copy displayed commands to clipboard
-                        KeyCode::Char('c') => {
-                            if let Some(op) = dialog.selected_op() {
-                                let cmds = dialog.planned_commands(&op);
-                                if !cmds.is_empty() {
-                                    let text = cmd_spans::lines_to_plain(&cmds);
-                                    copy_dialog::copy_to_clipboard(&text);
-                                    self.set_status("copied to clipboard".to_string());
                                 }
+                                bookmarks_dialog::BookmarkAction::Delete => {
+                                    PendingHandoff::BookmarkDelete { names }
+                                }
+                            };
+                            self.pending_handoff = Some(handoff);
+                        }
+                    }
+                    _ => dialog.handle_key(key),
+                }
+            }
+        }
+    }
+
+    fn handle_key_sync(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.sync_dialog = None;
+                self.sync_graph_to_selection();
+                self.mode = Mode::List;
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if self.sync_dialog.as_ref().is_some_and(|d| d.has_operation())
+                    && self.gate_sync_execute()
+                    && let Some(dialog) = self.sync_dialog.take()
+                {
+                    let label = format!(
+                        "sync {} → {}",
+                        dialog.source_name,
+                        dialog
+                            .selected_target()
+                            .map(|t| t.name.as_str())
+                            .unwrap_or("?")
+                    );
+                    self.defer_sync(dialog, label);
+                    self.sync_dialog = None;
+                    self.mode = Mode::List;
+                }
+            }
+            other => {
+                if let Some(dialog) = &mut self.sync_dialog {
+                    // notice is cleared inside handle_key only when the
+                    // target actually cycles, so the stale-refresh banner
+                    // survives stray keys until cycle or re-confirm.
+                    dialog.handle_key(other);
+                    dialog.recompute();
+                }
+                self.sync_graph_to_sync();
+            }
+        }
+    }
+
+    fn handle_key_create(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::List;
+            }
+            KeyCode::Enter => {
+                let vals = self.create_dialog.values();
+                if !vals.bookmark.is_empty() && !vals.path.is_empty() {
+                    self.refresh_staleness();
+                    self.defer_create(
+                        &vals.bookmark,
+                        &vals.revision,
+                        Path::new(&vals.path),
+                        &vals.msg,
+                    );
+                    self.mode = Mode::List;
+                }
+            }
+            // Revision cycling drives the graph pane, so it stays here; with
+            // the guard false, Left/Right fall through to the dialog's plain
+            // cursor moves.
+            KeyCode::Left if self.create_dialog.active_is_revision() => {
+                if let Some(id) = self.create_dialog.cycle_revision(-1) {
+                    let id = id.to_string();
+                    self.graph_pane
+                        .scroll_to_change_id(&id, self.graph_visible_height);
+                    let ids: HashSet<&str> = HashSet::from([id.as_str()]);
+                    self.graph_pane.highlight(&ids, false);
+                }
+            }
+            KeyCode::Right if self.create_dialog.active_is_revision() => {
+                if let Some(id) = self.create_dialog.cycle_revision(1) {
+                    let id = id.to_string();
+                    self.graph_pane
+                        .scroll_to_change_id(&id, self.graph_visible_height);
+                    let ids: HashSet<&str> = HashSet::from([id.as_str()]);
+                    self.graph_pane.highlight(&ids, false);
+                }
+            }
+            _ => self.create_dialog.handle_key(key),
+        }
+    }
+
+    fn handle_key_close(&mut self, key: crossterm::event::KeyEvent) {
+        if let Some(dialog) = &mut self.close_dialog {
+            match key.code {
+                // Confirm highlighted operation
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    if let Some(op) = dialog.selected_op() {
+                        let delete_files = dialog.delete_files;
+                        let label = match dialog.intent {
+                            DialogIntent::Close => {
+                                format!("close {}", dialog.workspace_name)
                             }
-                        }
-                        KeyCode::Esc => {
-                            self.mode = Mode::List;
+                            DialogIntent::Transfer => {
+                                let tgt = dialog
+                                    .selected_target()
+                                    .map(|t| t.name.as_str())
+                                    .unwrap_or("?");
+                                format!("transfer {} → {tgt}", dialog.workspace_name)
+                            }
+                        };
+                        // Freshness gate: on staleness the dialog is
+                        // refreshed in place (selections preserved)
+                        // and stays open for re-confirmation.
+                        if self.gate_close_execute(op) {
+                            let _ = self.defer_close_or_transfer(op, delete_files, label);
+                            // Always dismiss the dialog and return to
+                            // List; if the drain produces a pending
+                            // remove_path it'll switch to
+                            // ConfirmRemoveFiles after the deferred work.
                             self.close_dialog = None;
+                            self.mode = Mode::List;
                         }
-                        _ => {}
+                    }
+                }
+                // Copy displayed commands to clipboard
+                KeyCode::Char('c') => {
+                    if let Some(op) = dialog.selected_op() {
+                        let cmds = dialog.planned_commands(&op);
+                        if !cmds.is_empty() {
+                            let text = cmd_spans::lines_to_plain(&cmds);
+                            copy_dialog::copy_to_clipboard(&text);
+                            self.set_status("copied to clipboard".to_string());
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    self.mode = Mode::List;
+                    self.close_dialog = None;
+                }
+                other => {
+                    if dialog.handle_key(other) {
+                        self.sync_graph_to_close();
                     }
                 }
             }
-            Mode::ConfirmRemoveFiles => match key.code {
-                KeyCode::Char('y') => {
-                    if let Some(path) = self.pending_remove_path.take() {
-                        if path == self.current_root {
-                            self.action = Some(Action::SwitchTo(self.repo_root.clone()));
-                        }
-                        // Defer remove_dir_all to drain block (terminal handoff).
-                        // Mode transition stays inline so the next render shows List
-                        // (rather than ConfirmRemoveFiles with a now-empty path).
-                        self.pending_handoff = Some(PendingHandoff::RemoveDirAll { path });
-                    }
-                    self.mode = Mode::List;
-                }
-                _ => {
-                    if let Some(path) = &self.pending_remove_path
-                        && *path == self.current_root
-                    {
+        }
+    }
+
+    fn handle_key_confirm_remove_files(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') => {
+                if let Some(path) = self.pending_remove_path.take() {
+                    if path == self.current_root {
                         self.action = Some(Action::SwitchTo(self.repo_root.clone()));
                     }
-                    self.pending_remove_path = None;
-                    self.refresh();
+                    // Defer remove_dir_all to the drain block.
+                    // Mode transition stays inline so the next render shows List
+                    // (rather than ConfirmRemoveFiles with a now-empty path).
+                    self.pending_handoff = Some(PendingHandoff::RemoveDirAll { path });
+                }
+                self.mode = Mode::List;
+            }
+            _ => {
+                if let Some(path) = &self.pending_remove_path
+                    && *path == self.current_root
+                {
+                    self.action = Some(Action::SwitchTo(self.repo_root.clone()));
+                }
+                self.pending_remove_path = None;
+                self.refresh();
+                self.mode = Mode::List;
+            }
+        }
+    }
+
+    fn handle_key_split(&mut self, key: crossterm::event::KeyEvent) {
+        if let Some(picker) = &mut self.revision_picker {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => picker.up(),
+                KeyCode::Down | KeyCode::Char('j') => picker.down(),
+                KeyCode::Enter => {
+                    if let Some(rev) = picker.selected_revision() {
+                        self.pending_handoff = Some(PendingHandoff::Split {
+                            change_id: rev.change_id.clone(),
+                        });
+                    }
+                    self.revision_picker = None;
                     self.mode = Mode::List;
                 }
-            },
-            Mode::Split => {
-                if let Some(picker) = &mut self.revision_picker {
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => picker.up(),
-                        KeyCode::Down | KeyCode::Char('j') => picker.down(),
-                        KeyCode::Enter => {
-                            if let Some(rev) = picker.selected_revision() {
-                                self.pending_handoff = Some(PendingHandoff::Split {
-                                    change_id: rev.change_id.clone(),
-                                });
-                            }
-                            self.revision_picker = None;
-                            self.mode = Mode::List;
-                        }
-                        KeyCode::Esc => {
-                            self.revision_picker = None;
-                            self.mode = Mode::List;
-                        }
-                        _ => {}
-                    }
+                KeyCode::Esc => {
+                    self.revision_picker = None;
+                    self.mode = Mode::List;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_key_stale_alert(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Char('r') => {
+                // Defer: save_all_stale_diffs + update_stale as one fused
+                // working step (UpdateStaleSequence variant).
+                self.pending_handoff = Some(PendingHandoff::UpdateStaleSequence);
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.action = Some(Action::Quit);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_update_stale_dialog(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
+                if let Some(ref mut dlg) = self.update_stale_diff {
+                    dlg.handle_key(key.code);
                 }
             }
-            Mode::StaleAlert => match key.code {
-                KeyCode::Char('r') => {
-                    // Defer: save_all_stale_diffs + update_stale as one fused
-                    // terminal handoff (UpdateStaleSequence variant).
-                    self.pending_handoff = Some(PendingHandoff::UpdateStaleSequence);
+            KeyCode::Char('d')
+                if self.update_stale_diff.is_none() && self.stale_diff_rx.is_none() =>
+            {
+                if let Some((_, ref ws_path)) = self.update_stale_target {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let path = ws_path.clone();
+                    std::thread::spawn(move || {
+                        jujutsu::stale_workspace_diff_threaded(path, tx);
+                    });
+                    self.stale_diff_rx = Some(rx);
+                    self.stale_diff_progress = Some((0, 0));
                 }
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    self.action = Some(Action::Quit);
-                }
-                _ => {}
-            },
-            Mode::UpdateStale => match key.code {
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
-                    if let Some(ref mut dlg) = self.update_stale_diff {
-                        dlg.handle_key(key.code);
-                    }
-                }
-                KeyCode::Char('d')
-                    if self.update_stale_diff.is_none() && self.stale_diff_rx.is_none() =>
+            }
+            KeyCode::Enter => {
+                if let Some(ref dlg) = self.update_stale_diff
+                    && let Some((ws_path, kind, rel_path)) = dlg.save_diff_args()
                 {
-                    if let Some((_, ref ws_path)) = self.update_stale_target {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        let path = ws_path.clone();
-                        std::thread::spawn(move || {
-                            jujutsu::stale_workspace_diff_threaded(path, tx);
-                        });
-                        self.stale_diff_rx = Some(rx);
-                        self.stale_diff_progress = Some((0, 0));
-                    }
+                    self.pending_handoff = Some(PendingHandoff::SaveDiff {
+                        ws_path,
+                        kind,
+                        rel_path,
+                    });
                 }
-                KeyCode::Enter => {
-                    if let Some(ref dlg) = self.update_stale_diff
-                        && let Some((ws_path, kind, rel_path)) = dlg.save_diff_args()
-                    {
-                        self.pending_handoff = Some(PendingHandoff::SaveDiff {
-                            ws_path,
-                            kind,
-                            rel_path,
-                        });
-                    }
+            }
+            KeyCode::Char('a') => {
+                if let Some(ref dlg) = self.update_stale_diff {
+                    let (ws_path, items) = dlg.save_all_diffs_args();
+                    self.pending_handoff = Some(PendingHandoff::SaveAllDiffs { ws_path, items });
                 }
-                KeyCode::Char('a') => {
-                    if let Some(ref dlg) = self.update_stale_diff {
-                        let (ws_path, items) = dlg.save_all_diffs_args();
-                        self.pending_handoff =
-                            Some(PendingHandoff::SaveAllDiffs { ws_path, items });
-                    }
+            }
+            KeyCode::Char('y') => {
+                if let Some((name, path)) = self.update_stale_target.take() {
+                    self.pending_handoff = Some(PendingHandoff::UpdateWorkspaceStale {
+                        ws_path: path,
+                        name,
+                    });
                 }
-                KeyCode::Char('y') => {
-                    if let Some((name, path)) = self.update_stale_target.take() {
-                        self.pending_handoff = Some(PendingHandoff::UpdateWorkspaceStale {
-                            ws_path: path,
-                            name,
-                        });
-                    }
-                    self.update_stale_diff = None;
-                    self.stale_diff_rx = None;
-                    self.stale_diff_progress = None;
-                    self.mode = Mode::List;
+                self.update_stale_diff = None;
+                self.stale_diff_rx = None;
+                self.stale_diff_progress = None;
+                self.mode = Mode::List;
+            }
+            KeyCode::Esc => {
+                self.update_stale_target = None;
+                self.update_stale_diff = None;
+                self.stale_diff_rx = None;
+                self.stale_diff_progress = None;
+                self.mode = Mode::List;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_config_warning(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                let has_blocking = self
+                    .config
+                    .warnings
+                    .iter()
+                    .any(|w| w.kind == hooks::WarningKind::MissingBookmark);
+                if !has_blocking {
+                    self.config.warnings.clear();
+                    self.mode = Mode::Create;
                 }
-                KeyCode::Esc => {
-                    self.update_stale_target = None;
-                    self.update_stale_diff = None;
-                    self.stale_diff_rx = None;
-                    self.stale_diff_progress = None;
-                    self.mode = Mode::List;
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::List;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_op_restore(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(op) = self
+                    .op_log_pane
+                    .as_ref()
+                    .and_then(|p| p.selected_operation())
+                {
+                    let op_id = op.id.clone();
+                    self.pending_handoff = Some(PendingHandoff::OpRestoreFromLog { op_id });
                 }
-                _ => {}
-            },
-            Mode::ConfigWarning => match key.code {
-                KeyCode::Enter => {
-                    let has_blocking = self
-                        .config
-                        .warnings
-                        .iter()
-                        .any(|w| w.kind == hooks::WarningKind::MissingBookmark);
-                    if !has_blocking {
-                        self.config.warnings.clear();
-                        self.mode = Mode::Create;
-                    }
-                }
-                KeyCode::Esc => {
-                    self.mode = Mode::List;
-                }
-                _ => {}
-            },
-            Mode::OpRestore => match key.code {
-                KeyCode::Enter => {
-                    if let Some(op) = self
-                        .op_log_pane
-                        .as_ref()
-                        .and_then(|p| p.selected_operation())
-                    {
-                        let op_id = op.id.clone();
-                        self.pending_handoff = Some(PendingHandoff::OpRestoreFromLog { op_id });
-                    }
-                    self.mode = Mode::List;
-                }
-                KeyCode::Esc => {
-                    self.mode = Mode::List;
-                }
-                _ => {}
-            },
-            Mode::UndoRedoConfirm { is_redo } => match key.code {
-                KeyCode::Enter => {
-                    self.mode = Mode::List;
-                    self.execute_undo_redo(is_redo);
-                }
-                KeyCode::Esc => {
-                    self.mode = Mode::List;
-                }
-                _ => {}
-            },
+                self.mode = Mode::List;
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::List;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_undo_redo_confirm(&mut self, key: crossterm::event::KeyEvent, is_redo: bool) {
+        match key.code {
+            KeyCode::Enter => {
+                self.mode = Mode::List;
+                self.execute_undo_redo(is_redo);
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::List;
+            }
+            _ => {}
         }
     }
 
@@ -2214,6 +2634,46 @@ impl App {
                 self.draw_undo_redo_confirm(frame, frame.area(), is_redo);
             }
             Mode::List => {}
+        }
+
+        if let Some(label) = self.working_label {
+            Self::draw_working_overlay(frame, frame.area(), label);
+        }
+    }
+
+    fn draw_working_overlay(frame: &mut Frame, area: Rect, label: &str) {
+        let width = 48.min(area.width.saturating_sub(4));
+        let height = 5.min(area.height.saturating_sub(2));
+        if width == 0 || height == 0 {
+            return;
+        }
+        let x = (area.width.saturating_sub(width)) / 2;
+        let y = (area.height.saturating_sub(height)) / 2;
+        let dialog_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, dialog_area);
+        let block = Block::bordered()
+            .title(" Working ")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        frame.render_widget(
+            Paragraph::new(Span::styled(label, Style::default().fg(Color::Cyan).bold()))
+                .alignment(Alignment::Center),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+
+        if inner.height >= 3 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "Input resumes when done.",
+                    Style::default().dim(),
+                ))
+                .alignment(Alignment::Center),
+                Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), 1),
+            );
         }
     }
 
@@ -2723,14 +3183,14 @@ impl App {
 // Non-interactive CLI commands (unchanged — these still exit after execution)
 // ===========================================================================
 
-/// Non-interactive workspace switch (used by `ji ws <target>`).
+/// Non-interactive workspace switch (used by `ji switch <target>`).
 pub fn switch(target: &str) -> Result<()> {
     let repo_root = jujutsu::workspace_root()?;
     let ws_path = commands::switch::switch(&repo_root, target)?;
     shell::write_directive_cd(&ws_path)
 }
 
-/// Non-interactive create-or-switch (used by `ji ws <target> --create-if-necessary`).
+/// Non-interactive create-or-switch (used by `ji new <target> --create-if-necessary`).
 pub fn create_or_switch(
     target: &str,
     revision: Option<&str>,
@@ -2753,7 +3213,7 @@ pub fn create_or_switch(
     }
 }
 
-/// Non-interactive workspace creation (used by `ji ws --create`).
+/// Non-interactive workspace creation (used by `ji new`).
 pub fn create(
     bookmark: &str,
     revision: Option<&str>,
@@ -2859,7 +3319,8 @@ fn sort_revisions_by_graph(line_heads: &[Option<String>], workspaces: &mut [juju
 
 /// Exit raw mode + alternate screen + mouse + focus capture. Mirror of the
 /// crossterm setup sequence at the top of `run()`. Used by
-/// `drain_pending_handoff` to surrender the terminal to a subprocess.
+/// interactive `drain_pending_handoff` variants to surrender the terminal to a
+/// subprocess.
 fn exit_raw_mode(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     terminal::disable_raw_mode()?;
     crossterm::execute!(
@@ -2885,8 +3346,10 @@ fn re_enter_raw_mode(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> i
     Ok(())
 }
 
-/// Drain one pending side effect from `app.pending_handoff`, with terminal
-/// exit + dispatch + re-enter handoff. No-op if no handoff is pending.
+/// Drain one pending side effect from `app.pending_handoff`. Non-interactive
+/// work stays inside the alternate screen with a blocking working overlay;
+/// interactive work exits raw mode and hands the terminal to the subprocess.
+/// No-op if no handoff is pending.
 ///
 /// Pattern: consume-by-value. Each match arm dispatches its variant and
 /// performs any per-variant App-state mutations inline. The arm sets two
@@ -2905,7 +3368,13 @@ fn drain_pending_handoff(
     };
 
     let pre = jujutsu::current_op_id(repo_root);
-    exit_raw_mode(terminal)?;
+    let terminal_handoff = handoff.requires_terminal_handoff();
+    if terminal_handoff {
+        exit_raw_mode(terminal)?;
+    } else {
+        app.working_label = Some(handoff.working_label());
+        terminal.draw(|frame| app.draw(frame))?;
+    }
 
     let mut history_label: Option<String> = None;
     let mut enter_op_log_after = false;
@@ -2972,7 +3441,7 @@ fn drain_pending_handoff(
         }
         PendingHandoff::UpdateStaleSequence => {
             // Save diffs first as a safety net, then resolve staleness. Both
-            // steps run in one terminal handoff to avoid double-flicker.
+            // steps run under one working screen.
             let saved = update_stale_dialog::save_all_stale_diffs(repo_root).unwrap_or(0);
             match jujutsu::update_stale(repo_root) {
                 Ok(_) => {
@@ -3088,9 +3557,9 @@ fn drain_pending_handoff(
             info,
             label,
         } => {
-            // Build the borrow-typed CloseParams inline; `bookmarks`,
-            // `revisions`, and `all_ws_paths` move out of `params` into
-            // the borrow-typed struct without cloning.
+            // Build the borrow-typed CloseParams inline; `bookmarks` and
+            // `revisions` move out of `params` into the borrow-typed
+            // struct without cloning.
             let source_path_for_check = params.source_path.clone();
             let close_params = commands::close::CloseParams {
                 repo_root: &params.repo_root,
@@ -3107,7 +3576,6 @@ fn drain_pending_handoff(
                 workspace_path_template: &params.workspace_path_template,
                 repo_name: &params.repo_name,
                 author: params.author.as_deref(),
-                all_ws_paths: &params.all_ws_paths,
             };
             match commands::close::close_with_info(&close_params, &info) {
                 Ok(outcome) => {
@@ -3146,7 +3614,6 @@ fn drain_pending_handoff(
                 workspace_path_template: &params.workspace_path_template,
                 repo_name: &params.repo_name,
                 author: params.author.as_deref(),
-                all_ws_paths: &params.all_ws_paths,
             };
             match commands::transfer::transfer_with_info(&transfer_params, &info) {
                 Ok(outcome) => {
@@ -3164,7 +3631,9 @@ fn drain_pending_handoff(
         }
     }
 
-    re_enter_raw_mode(terminal)?;
+    if terminal_handoff {
+        re_enter_raw_mode(terminal)?;
+    }
     let post = jujutsu::current_op_id(repo_root);
 
     if let Some(label) = history_label {
@@ -3197,6 +3666,7 @@ fn drain_pending_handoff(
             app.mode = Mode::List;
         }
     }
+    app.working_label = None;
     Ok(())
 }
 
@@ -3336,4 +3806,46 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn handoff_terminal_classification_matches_interactivity() {
+        let split = PendingHandoff::Split {
+            change_id: "abc".to_string(),
+        };
+        let remove = PendingHandoff::RemoveDirAll {
+            path: PathBuf::from("/tmp/workspace"),
+        };
+
+        assert!(split.requires_terminal_handoff());
+        assert!(!remove.requires_terminal_handoff());
+        assert_eq!(remove.working_label(), "Removing workspace files");
+    }
+
+    #[test]
+    fn working_overlay_renders_label_and_resume_hint() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| App::draw_working_overlay(frame, frame.area(), "Syncing workspaces"))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Working"));
+        assert!(rendered.contains("Syncing workspaces"));
+        assert!(rendered.contains("Input resumes when done."));
+    }
 }

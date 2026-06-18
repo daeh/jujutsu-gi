@@ -1,4 +1,7 @@
+use super::dialog_common;
+use super::line_edit::LineEditor;
 use crate::jujutsu::{RevisionInfo, Workspace};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
 use std::collections::HashSet;
@@ -158,6 +161,77 @@ impl BookmarksDialog {
             .collect()
     }
 
+    // -- Key handling --
+
+    /// Dialog-internal key handling, branching on whether the new-bookmark
+    /// popup is open: popup field toggling and text editing, or list
+    /// navigation, selection, and the tug/delete action toggle. Esc, Enter,
+    /// and popup revision cycling (which drives the graph pane) stay with
+    /// the App.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) {
+        if self.new_popup.is_some() {
+            match key.code {
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
+                    self.new_popup_toggle_field();
+                }
+                KeyCode::Char(c) => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        match c {
+                            'u' => self.new_popup_delete_to_start(),
+                            'k' => self.new_popup_delete_to_end(),
+                            'a' => self.new_popup_move_home(),
+                            'e' => self.new_popup_move_end(),
+                            _ => {}
+                        }
+                    } else {
+                        self.new_popup_insert_char(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.new_popup_delete_char();
+                }
+                KeyCode::Home => {
+                    self.new_popup_move_home();
+                }
+                KeyCode::End => {
+                    self.new_popup_move_end();
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Char('n') => {
+                    self.open_new_popup();
+                }
+                KeyCode::Char('t') => {
+                    self.action = BookmarkAction::Tug;
+                }
+                KeyCode::Char('x') => {
+                    self.action = BookmarkAction::Delete;
+                }
+                KeyCode::Left => {
+                    self.action = BookmarkAction::Tug;
+                }
+                KeyCode::Right => {
+                    self.action = BookmarkAction::Delete;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_up();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_down();
+                }
+                KeyCode::Char(' ') => {
+                    self.toggle_selection();
+                }
+                KeyCode::Char('a') => {
+                    self.toggle_select_all();
+                }
+                _ => {}
+            }
+        }
+    }
+
     // -- New bookmark popup --
 
     pub(crate) fn open_new_popup(&mut self) {
@@ -221,57 +295,39 @@ impl BookmarksDialog {
         Some(&self.new_popup.as_ref().unwrap().change_id)
     }
 
+    // Text/cursor mutation delegates to `LineEditor` (grapheme-aware); the
+    // popup layers its field-specific semantics on top: the name space ban
+    // and revision-cycle exits.
+
     pub(crate) fn new_popup_insert_char(&mut self, c: char) {
         if let Some(popup) = &mut self.new_popup {
             // Disallow spaces in bookmark name
             if popup.active_field == PopupField::Name && c == ' ' {
                 return;
             }
-            // Typing in ChangeId exits cycling mode
-            if popup.active_field == PopupField::ChangeId {
-                popup.revision_index = None;
-            }
-            let pos = popup.cursor_pos;
-            popup.active_mut().insert(pos, c);
-            popup.cursor_pos += c.len_utf8();
+            popup.exit_revision_cycle();
+            popup.editor().insert_char(c);
         }
     }
 
     pub(crate) fn new_popup_delete_char(&mut self) {
         if let Some(popup) = &mut self.new_popup {
-            if popup.active_field == PopupField::ChangeId {
-                popup.revision_index = None;
-            }
-            if popup.cursor_pos > 0 {
-                let pos = popup.cursor_pos;
-                // Grapheme-aware backspace: matches create_dialog::delete_char.
-                let prev = crate::text_utils::prev_grapheme_boundary(popup.active_ref(), pos);
-                popup.active_mut().drain(prev..pos);
-                popup.cursor_pos = prev;
-            }
+            popup.exit_revision_cycle();
+            popup.editor().backspace();
         }
     }
 
     pub(crate) fn new_popup_delete_to_start(&mut self) {
         if let Some(popup) = &mut self.new_popup {
-            if popup.active_field == PopupField::ChangeId {
-                popup.revision_index = None;
-            }
-            let pos = popup.cursor_pos;
-            if pos > 0 {
-                popup.active_mut().drain(..pos);
-                popup.cursor_pos = 0;
-            }
+            popup.exit_revision_cycle();
+            popup.editor().delete_to_start();
         }
     }
 
     pub(crate) fn new_popup_delete_to_end(&mut self) {
         if let Some(popup) = &mut self.new_popup {
-            if popup.active_field == PopupField::ChangeId {
-                popup.revision_index = None;
-            }
-            let pos = popup.cursor_pos;
-            popup.active_mut().truncate(pos);
+            popup.exit_revision_cycle();
+            popup.editor().delete_to_end();
         }
     }
 
@@ -498,7 +554,7 @@ impl BookmarksDialog {
             Style::default().dim()
         };
         let name_line = if name_active {
-            self.render_field_with_cursor(
+            dialog_common::field_with_cursor(
                 "  Name:     ",
                 &popup.name,
                 popup.cursor_pos,
@@ -524,7 +580,7 @@ impl BookmarksDialog {
             Style::default().dim()
         };
         let rev_line = if rev_active {
-            self.render_field_with_cursor(
+            dialog_common::field_with_cursor(
                 "  Revision: ",
                 &popup.change_id,
                 popup.cursor_pos,
@@ -567,31 +623,6 @@ impl BookmarksDialog {
             ),
         );
     }
-
-    fn render_field_with_cursor<'a>(
-        &self,
-        label: &'a str,
-        value: &'a str,
-        cursor_pos: usize,
-        label_style: Style,
-        val_style: Style,
-    ) -> Line<'a> {
-        let (before, after) = value.split_at(cursor_pos);
-        // Grapheme-aware: peel one grapheme (not one char) for the
-        // inverse-video cursor cell so multi-codepoint graphemes display
-        // as a single cell.
-        let (cursor_display, after_cursor) =
-            crate::text_utils::peel_first_grapheme_for_cursor(after);
-        Line::from(vec![
-            Span::styled(label, label_style),
-            Span::styled(before, val_style),
-            Span::styled(
-                cursor_display,
-                Style::default().bg(Color::White).fg(Color::Black),
-            ),
-            Span::styled(after_cursor, val_style),
-        ])
-    }
 }
 
 impl NewBookmarkPopup {
@@ -602,10 +633,22 @@ impl NewBookmarkPopup {
         }
     }
 
-    fn active_mut(&mut self) -> &mut String {
-        match self.active_field {
+    /// Line-editor view over the active field and the shared cursor.
+    fn editor(&mut self) -> LineEditor<'_> {
+        let text = match self.active_field {
             PopupField::Name => &mut self.name,
             PopupField::ChangeId => &mut self.change_id,
+        };
+        LineEditor {
+            text,
+            cursor: &mut self.cursor_pos,
+        }
+    }
+
+    /// Typing in the ChangeId field exits revision-cycling mode.
+    fn exit_revision_cycle(&mut self) {
+        if self.active_field == PopupField::ChangeId {
+            self.revision_index = None;
         }
     }
 }

@@ -123,6 +123,7 @@ pub enum Commands {
     Init,
 
     /// Run configured hooks
+    #[command(hide = true)]
     Hook,
 
     /// Manage user & project configs
@@ -134,7 +135,7 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum ConfigCommands {
-    /// Generate project config template
+    /// Generate project config template (alias of `ji init`)
     Init,
 
     /// Shell integration
@@ -148,13 +149,13 @@ pub enum ConfigCommands {
 pub enum ShellCommands {
     /// Print shell integration code
     Init {
-        /// Shell to generate for (defaults to $SHELL)
+        /// Shell to generate for (defaults to the active shell, falls back to $SHELL)
         shell: Option<String>,
     },
 
     /// Add shell integration to shell config
     Install {
-        /// Shell to install for (defaults to $SHELL)
+        /// Shell to install for (defaults to the active shell, falls back to $SHELL)
         shell: Option<String>,
 
         /// Print the diff that would be applied, don't write
@@ -169,7 +170,7 @@ pub enum ShellCommands {
 
     /// Remove shell integration
     Uninstall {
-        /// Shell to uninstall for (defaults to $SHELL)
+        /// Shell to uninstall for (defaults to the active shell, falls back to $SHELL)
         shell: Option<String>,
 
         /// Print the diff that would be applied, don't write
@@ -183,7 +184,7 @@ pub enum ShellCommands {
 
     /// Report shell integration state
     Status {
-        /// Shell to inspect (defaults to $SHELL)
+        /// Shell to inspect (defaults to the active shell, falls back to $SHELL)
         shell: Option<String>,
     },
 }

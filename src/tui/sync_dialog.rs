@@ -26,6 +26,15 @@ pub(crate) struct SyncDialog {
     src_singular_bookmark: Option<String>,
     /// Cached singular bookmark for the current target workspace.
     tgt_singular_bookmark: Option<String>,
+    /// Transient notices rendered at the top of the dialog (stale-refresh
+    /// banner, snapshot failures). Cleared on target cycle.
+    pub(crate) notice: Vec<String>,
+    /// Op head at the last point the dialog's data was made fresh (open or an
+    /// in-place stale refresh, both preceded by a snapshot). The execute gate
+    /// compares the *current* op head against THIS, not `sync_info.op_head` —
+    /// `recompute()` re-stamps the latter to "now" on every target change,
+    /// which would otherwise mask external movement from the gate.
+    pub(crate) freshness_baseline: String,
 }
 
 impl SyncDialog {
@@ -50,9 +59,24 @@ impl SyncDialog {
             repo_name,
             src_singular_bookmark: None,
             tgt_singular_bookmark: None,
+            notice: Vec::new(),
+            freshness_baseline: String::new(),
         };
         dialog.recompute();
+        // Baseline = op head when this dialog's data was first made fresh
+        // (the open handler snapshotted via refresh() immediately before).
+        dialog.freshness_baseline = dialog
+            .sync_info
+            .as_ref()
+            .map(|i| i.op_head.clone())
+            .unwrap_or_default();
         dialog
+    }
+
+    /// Re-anchor the freshness baseline (call after an in-place refresh, whose
+    /// snapshot makes the data current again).
+    pub(crate) fn set_freshness_baseline(&mut self, op_head: String) {
+        self.freshness_baseline = op_head;
     }
 
     pub(crate) fn selected_target(&self) -> Option<&TargetWorkspace> {
@@ -64,13 +88,60 @@ impl SyncDialog {
         self.sync_info.as_ref()
     }
 
+    /// Replace the cached sync mode info (execute-gate Equivalent path:
+    /// identical plan, newer op head).
+    pub(crate) fn set_sync_info(&mut self, info: SyncModeInfo) {
+        self.sync_info = Some(info);
+    }
+
+    /// Re-resolve executable inputs from fresh workspace data after a stale
+    /// gate detection: replace the target list (preserving the selection by
+    /// name) and update the source path. Returns notices for anything that
+    /// could not be preserved. Caller runs `recompute()` afterwards.
+    pub(crate) fn refresh_entries(
+        &mut self,
+        source_path: Option<std::path::PathBuf>,
+        targets: Vec<TargetWorkspace>,
+    ) -> Vec<String> {
+        let mut notices = Vec::new();
+        let prev = self.selected_target().map(|t| t.name.clone());
+        self.targets = targets;
+        self.target_index = match prev
+            .as_deref()
+            .and_then(|name| self.targets.iter().position(|t| t.name == name))
+        {
+            Some(idx) => idx,
+            None => {
+                if prev.is_some() {
+                    notices.push("previous target no longer exists — selection reset".to_string());
+                }
+                0
+            }
+        };
+        match source_path {
+            Some(p) => self.source_path = p,
+            None => notices.push(format!(
+                "source workspace {} no longer exists",
+                self.source_name
+            )),
+        }
+        notices
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyCode) {
         let len = self.targets.len();
-        if len == 0 {
+        // With 0 or 1 target there is nothing to cycle — return before the
+        // cycle branches so a single-target dialog's stale-refresh banner is
+        // not cleared by a no-op Left/Right.
+        if len <= 1 {
             return;
         }
         match key {
             KeyCode::Char('k') | KeyCode::Left => {
+                // Clear the stale-refresh banner only when the target actually
+                // cycles (matches close/transfer's cycle_target behavior); a
+                // stray key must not erase the warning before re-confirmation.
+                self.notice.clear();
                 self.target_index = if self.target_index == 0 {
                     len - 1
                 } else {
@@ -78,6 +149,7 @@ impl SyncDialog {
                 };
             }
             KeyCode::Char('j') | KeyCode::Right => {
+                self.notice.clear();
                 self.target_index = if self.target_index >= len - 1 {
                     0
                 } else {
@@ -336,6 +408,20 @@ impl SyncDialog {
 
         // --- TOP SECTION ---
 
+        // Transient notices (stale-refresh banner, snapshot failures).
+        if !self.notice.is_empty() {
+            for n in &self.notice {
+                layout.draw_line(
+                    frame,
+                    &[Span::styled(
+                        format!(" \u{26a0} {n}"),
+                        Style::default().fg(Color::Yellow),
+                    )],
+                );
+            }
+            layout.skip(1);
+        }
+
         // Target workspace
         if let Some(target) = self.selected_target() {
             layout.draw_target_row(frame, target, self.targets.len() > 1, Some(NAME_W));
@@ -388,7 +474,7 @@ impl SyncDialog {
                     style: Style::default().bold(),
                 },
                 HelpBinding {
-                    key: "Enter",
+                    key: "y/Enter",
                     label: accept_label,
                     style: accept_style,
                 },

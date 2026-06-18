@@ -1,17 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Paragraph, Wrap};
 
-#[allow(dead_code)]
-pub(crate) struct DiagramMeta {
-    pub name: &'static str,
-    pub converge: bool,
-    pub squash: bool,
-    pub close: bool,
-}
-
-#[allow(dead_code)]
 pub(crate) struct DiagramInfo {
-    pub meta: DiagramMeta,
     pub diagram: &'static str,
     pub note: &'static str,
 }
@@ -58,7 +48,6 @@ impl DiagramInfo {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) enum Diagram {
     Merge,
     MergeSquash,
@@ -75,12 +64,6 @@ impl Diagram {
     pub(crate) fn info(&self) -> DiagramInfo {
         match self {
             Diagram::Merge => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "merge",
-                    converge: true,
-                    squash: false,
-                    close: false,
-                },
                 diagram: "\
 | INITIAL |  t@: A \u{2192} B \u{2192} C
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z
@@ -93,12 +76,6 @@ s@:      X \u{2192} Y \u{2192} Z \u{2197}   \u{2198} Ns
                 note: "merge (chiasma merge)",
             },
             Diagram::MergeSquash => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "merge",
-                    converge: true,
-                    squash: true,
-                    close: false,
-                },
                 diagram: "\
 | INITIAL |  t@: A \u{2192} B \u{2192} C
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z
@@ -111,12 +88,6 @@ s@:      X* ---\u{2197} \u{21B3} Ns
                 note: "squash merge",
             },
             Diagram::MergeClose => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "merge",
-                    converge: true,
-                    squash: false,
-                    close: true,
-                },
                 diagram: "\
 | INITIAL |  t@: A \u{2192} B \u{2192} C
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z
@@ -127,12 +98,6 @@ t@:  A \u{2192} B \u{2192} C  \u{2192}  M
                 note: "merge into target, close source",
             },
             Diagram::MergeSquashClose => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "merge",
-                    converge: true,
-                    squash: true,
-                    close: true,
-                },
                 diagram: "\
 | INITIAL |  t@: A \u{2192} B \u{2192} C
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z
@@ -143,12 +108,6 @@ t@:  A \u{2192} B \u{2192} C \u{2192} M
                 note: "squash merge into target, close source",
             },
             Diagram::FastForward => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "fast-forward",
-                    converge: true,
-                    squash: false,
-                    close: false,
-                },
                 diagram: "\
 | INITIAL |  t@: A \u{2192} B \u{2192} C
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z
@@ -160,12 +119,6 @@ s@:              \u{21B3} Ns
                 note: "fast-forward (linearized merge)",
             },
             Diagram::FastForwardTargetClose => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "fast-forward",
-                    converge: true,
-                    squash: false,
-                    close: true,
-                },
                 diagram: "\
 | INITIAL |  t@: A
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z
@@ -175,12 +128,6 @@ t@:  A \u{2192} X \u{2192} Y \u{2192} Z",
                 note: "fast-forward target to source, close source",
             },
             Diagram::Rebase => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "rebase",
-                    converge: true,
-                    squash: false,
-                    close: false,
-                },
                 diagram: "\
 | INITIAL |  t@: A \u{2192} B \u{2192} C
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z
@@ -192,12 +139,6 @@ s@:          \u{21B3} X' \u{2192} Y' \u{2192} Z'
                 note: "rebase source onto target; linear history (t@N, s@Z')",
             },
             Diagram::Detach => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "detach",
-                    converge: false,
-                    squash: false,
-                    close: true,
-                },
                 diagram: "\
 | INITIAL |  t@: A \u{2192} B \u{2192} C
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z
@@ -208,12 +149,6 @@ t@: A \u{2192} B \u{2192} C    (unchanged)
                 note: "workspace removed, revisions remain",
             },
             Diagram::Abandon => DiagramInfo {
-                meta: DiagramMeta {
-                    name: "abandon",
-                    converge: false,
-                    squash: false,
-                    close: true,
-                },
                 diagram: "\
 | INITIAL |  t@: A \u{2192} B \u{2192} C
 |  STATE  |  s@: \u{21B3} X \u{2192} Y \u{2192} Z

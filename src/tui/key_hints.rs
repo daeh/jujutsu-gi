@@ -76,16 +76,6 @@ pub(crate) fn marker(text: &'static str, style: Style) -> Hint {
     }
 }
 
-/// Escape hatch for callers that need fully-custom span sequences.
-#[allow(dead_code)]
-pub(crate) fn custom(spans: Vec<Span<'static>>, content_width: u16, separator_width: u16) -> Hint {
-    Hint {
-        spans,
-        content_w: content_width,
-        sep_w: separator_width,
-    }
-}
-
 /// Greedily pack hints into rows of at most `width` display columns. Each hint
 /// is atomic. The trailing separator of the right-most chunk on a row is not
 /// counted against `width`. Returns one `Line` per row.

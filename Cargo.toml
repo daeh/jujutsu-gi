@@ -3,7 +3,7 @@ members = [".", "xtask"]
 
 [package]
 name = "ji"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.96"
 description = "Jujutsu workspace manager TUI"
@@ -30,6 +30,7 @@ clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 crossterm = "0.29"
 humantime = "2"
+libproc = "0.14"
 ratatui = "0.30"
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }

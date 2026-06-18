@@ -44,16 +44,23 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install jj
-        run: brew install jj
+        # `brew update` first: the runner image ships a pinned Homebrew formula
+        # snapshot (auto-update off) that can predate the latest jj. Without the
+        # refresh, `brew install` pours a stale bottle below the required
+        # MIN_JJ_VERSION (src/jujutsu.rs) and the integration tests fail.
+        run: |
+          brew update
+          brew install jj
+          jj --version
 
       - name: Install go-task
         run: brew install go-task
 
       - name: Install cargo-deny
-        run: cargo install --locked cargo-deny
+        run: cargo install --locked --force cargo-deny
 
       - name: Install cargo-machete
-        run: cargo install --locked cargo-machete
+        run: cargo install --locked --force cargo-machete
 
       - name: Build
         run: cargo build --release --locked

@@ -734,3 +734,771 @@ fn squash_all_but_root_collapses_linear_chain() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Freshness gates: probe, conditional snapshot, check_freshness,
+// validate_head_info, abandon-set verification (plan: happy-mapping-hinton)
+// ---------------------------------------------------------------------------
+
+use ji::commands::types::{BookmarkAction, CloseMethod, SyncMode, SyncModeInfo, TransferMethod};
+use ji::{commands, jj_utils, jujutsu};
+
+/// Add a workspace at {tmp}/<name> branching from `rev`, returning its path.
+fn add_ws(repo: &TestRepo, name: &str, rev: &str) -> PathBuf {
+    let path = repo.tmp().join(name);
+    jj_r(
+        repo.root(),
+        &[
+            "workspace",
+            "add",
+            &path.to_string_lossy(),
+            "--name",
+            name,
+            "--revision",
+            rev,
+            "-m",
+            &format!("{name} start"),
+        ],
+    );
+    path
+}
+
+fn op_head(repo: &TestRepo) -> String {
+    jujutsu::current_op_head(repo.root()).unwrap_or_default()
+}
+
+/// The probe detects un-snapshotted edits without integrating any operation.
+#[test]
+fn probe_detects_edits_without_touching_op_log() {
+    let repo = TestRepo::new();
+    repo.commit_file("a.txt", "a", "initial");
+
+    // Clean working copy: not dirty.
+    assert!(
+        !jujutsu::has_unsnapshotted_changes(repo.root()).unwrap(),
+        "clean WC must probe false"
+    );
+
+    // Un-snapshotted edit: dirty, and the probe leaves no trace.
+    std::fs::write(repo.root().join("b.txt"), "pending").unwrap();
+    let before_head = op_head(&repo);
+    // Compare op IDs only: the default op-log template renders RELATIVE
+    // timestamps ("now" -> "1 second ago"), which the probe's own elapsed
+    // time can flip between the two captures (flaky). The guarantee under
+    // test is "no operation integrated" — that is exactly the op-ID set/order.
+    let before_log = jj_r(
+        repo.root(),
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "--template",
+            r#"id ++ "\n""#,
+            "--limit",
+            "5",
+        ],
+    );
+    assert!(
+        jujutsu::has_unsnapshotted_changes(repo.root()).unwrap(),
+        "pending edit must probe true"
+    );
+    let after_head = op_head(&repo);
+    let after_log = jj_r(
+        repo.root(),
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "--template",
+            r#"id ++ "\n""#,
+            "--limit",
+            "5",
+        ],
+    );
+    assert_eq!(before_head, after_head, "probe must not move the op head");
+    assert_eq!(
+        before_log, after_log,
+        "probe must not change the visible op log"
+    );
+}
+
+/// Content-only change to an already-modified file (identical file set):
+/// the commit-id comparison catches what a file-list comparison cannot.
+#[test]
+fn probe_detects_content_only_change() {
+    let repo = TestRepo::new();
+    repo.commit_file("a.txt", "v1", "initial");
+    // a.txt is part of @'s snapshot. Change its content again: the file
+    // LIST of @ is unchanged, only content differs.
+    std::fs::write(repo.root().join("a.txt"), "v2").unwrap();
+    assert!(
+        jujutsu::has_unsnapshotted_changes(repo.root()).unwrap(),
+        "content-only change must probe true"
+    );
+}
+
+/// `jj util snapshot` (via `snapshot_ws`) is conditional: a clean working
+/// copy — including an mtime-only touch — creates no operation; only a
+/// content change moves the op head and folds the edit into `@`.
+#[test]
+fn snapshot_ws_is_conditional() {
+    let repo = TestRepo::new();
+    repo.commit_file("a.txt", "a", "initial");
+
+    let h0 = op_head(&repo);
+    jujutsu::snapshot_ws(repo.root()).unwrap();
+    assert_eq!(op_head(&repo), h0, "clean WC: op head untouched");
+
+    // mtime-only change: still no operation.
+    let f = std::fs::File::options()
+        .write(true)
+        .open(repo.root().join("a.txt"))
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now()).unwrap();
+    drop(f);
+    jujutsu::snapshot_ws(repo.root()).unwrap();
+    assert_eq!(op_head(&repo), h0, "mtime-only touch: op head untouched");
+
+    std::fs::write(repo.root().join("b.txt"), "pending").unwrap();
+    jujutsu::snapshot_ws(repo.root()).unwrap();
+    assert_ne!(op_head(&repo), h0, "dirty WC: op head moved");
+    // The edit is folded into @.
+    let shown = jj(repo.root(), &["file", "show", "-r", "@", "b.txt"]);
+    assert_eq!(shown, "pending");
+}
+
+/// `snapshot_ws` FAILS on a jj-stale working copy — the premise of both
+/// `workspace_forget`'s contract and the protection phase's stale-skip
+/// classifier (`commands::prepare_execution_freshness`).
+#[test]
+fn snapshot_ws_fails_on_stale_workspace() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "M0");
+    let m0 = repo.change_id("@");
+    let feat = add_ws(&repo, "feat", &m0);
+
+    make_stale(&repo, "feat", "extra.txt");
+    assert!(jujutsu::is_workspace_stale(&feat), "setup: feat is stale");
+    assert!(
+        jujutsu::snapshot_ws(&feat).is_err(),
+        "snapshot of a stale WC must fail"
+    );
+}
+
+/// Make workspace `ws` jj-stale by rewriting its `@` TREE from the default
+/// workspace: write `filename` in default and squash it into `<ws>@`. The
+/// workspace's on-disk WC now lags the operation that rewrote its commit.
+/// (A description-only rewrite is NOT enough on jj 0.42 — it reconciles
+/// automatically; only a tree change leaves the workspace stale.)
+fn make_stale(repo: &TestRepo, ws: &str, filename: &str) {
+    std::fs::write(repo.root().join(filename), "stale-maker").unwrap();
+    // cwd-based invocation: the fileset resolves relative to the repo root.
+    jj(
+        repo.root(),
+        &[
+            "squash",
+            "--from",
+            "default@",
+            "--into",
+            &format!("{ws}@"),
+            "-m",
+            "external tree rewrite",
+            "--",
+            filename,
+        ],
+    );
+}
+
+/// Regression for the motivating incident: un-snapshotted edits in the
+/// target workspace must not end up stranded on an orphaned non-empty
+/// `(ji::…)` placeholder head when syncing.
+#[test]
+fn sync_entry_snapshot_prevents_orphaned_placeholder() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "M0");
+    let m0 = repo.change_id("@");
+
+    // feat: ahead of default by one real commit.
+    let feat = add_ws(&repo, "feat", &m0);
+    jj(&feat, &["new", "-m", "F1"]);
+    std::fs::write(feat.join("feat.txt"), "feat-work").unwrap();
+    jj(&feat, &["describe", "-m", "F1: feature work"]);
+
+    // default @: an empty ji placeholder (the incident's resting state)…
+    jj(
+        repo.root(),
+        &[
+            "new",
+            &m0,
+            "-m",
+            "(ji::fast-forward) default@ to feat@deadbeef",
+        ],
+    );
+    // …with a pending on-disk edit that nothing has snapshotted yet.
+    std::fs::write(repo.root().join("stray.txt"), "reflow").unwrap();
+
+    // CLI entry path: conditional snapshot, then sync.
+    commands::snapshot_workspaces(&[("feat", &feat), ("default", repo.root())])
+        .expect("entry snapshot");
+    let outcome = commands::sync::sync(
+        repo.root(),
+        "feat",
+        &feat,
+        "default",
+        repo.root(),
+        "",
+        "repo",
+        None,
+    )
+    .expect("sync must succeed");
+    match outcome {
+        ji::operations::SyncOutcome::Done { warnings } => {
+            assert!(warnings.is_empty(), "sync must not warn (got {warnings:?})");
+        }
+        ji::operations::SyncOutcome::AlreadyInSync => panic!("workspaces were not in sync"),
+    }
+
+    // The stray edit must be reachable from default@…
+    let shown = jj(
+        repo.root(),
+        &["file", "show", "-r", "default@", "stray.txt"],
+    );
+    assert_eq!(
+        shown, "reflow",
+        "pending edit must ride along into default@"
+    );
+    // …and no anonymous non-empty ji-placeholder head may remain.
+    assert!(
+        !repo.rev_exists(r#"heads(all()) & description(glob:"(ji::*") ~ empty()"#),
+        "no orphaned non-empty (ji::…) head may exist after sync"
+    );
+}
+
+/// check_freshness: Unchanged / Equivalent (sync) / Changed / strict-Changed.
+#[test]
+fn check_freshness_variants() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "M0");
+    let m0 = repo.change_id("@");
+    let feat = add_ws(&repo, "feat", &m0);
+    jj(&feat, &["new", "-m", "F1"]);
+    std::fs::write(feat.join("feat.txt"), "feat-work").unwrap();
+    jj(&feat, &["describe", "-m", "F1: feature work"]);
+    // default @: empty trivial head on M0 (undescribed) so a folded edit
+    // flips its effective head.
+    jj(repo.root(), &["new", &m0]);
+
+    let required: [(&str, &Path); 2] = [("feat", &feat), ("default", repo.root())];
+
+    // Unchanged: no activity since detection.
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    assert!(matches!(
+        commands::check_freshness(repo.root(), &info, "feat", "default", &required, true).unwrap(),
+        commands::Freshness::Unchanged
+    ));
+
+    // Equivalent (sync flavor): an unrelated third workspace's snapshot moves
+    // the op head without touching the plan.
+    let side = add_ws(&repo, "side", &m0);
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    std::fs::write(side.join("side.txt"), "side-edit").unwrap();
+    jujutsu::snapshot_ws(&side).unwrap();
+    match commands::check_freshness(repo.root(), &info, "feat", "default", &required, true).unwrap()
+    {
+        commands::Freshness::Equivalent(fresh) => {
+            assert!(commands::plan_equivalent(&info, &fresh));
+            assert_ne!(
+                fresh.op_head, info.op_head,
+                "fresh info carries new op head"
+            );
+        }
+        _ => panic!("unrelated movement with identical plan must be Equivalent"),
+    }
+
+    // Strict flavor: the same unrelated movement is Changed.
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    std::fs::write(side.join("side2.txt"), "side-edit-2").unwrap();
+    jujutsu::snapshot_ws(&side).unwrap();
+    assert!(matches!(
+        commands::check_freshness(repo.root(), &info, "feat", "default", &required, false).unwrap(),
+        commands::Freshness::Changed
+    ));
+
+    // Changed (sync flavor): a pending edit in the TARGET flips its trivial
+    // head to non-empty — the gate's own snapshot folds it, the plan differs.
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    assert!(info.tgt_trivial_id.is_some(), "setup: default @ is trivial");
+    std::fs::write(repo.root().join("pending.txt"), "pending").unwrap();
+    assert!(matches!(
+        commands::check_freshness(repo.root(), &info, "feat", "default", &required, true).unwrap(),
+        commands::Freshness::Changed
+    ));
+
+    // Required workspace with a missing path: hard error, no silent skip.
+    let ghost = repo.tmp().join("ghost");
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    assert!(
+        commands::check_freshness(
+            repo.root(),
+            &info,
+            "feat",
+            "default",
+            &[("ghost", &ghost)],
+            true,
+        )
+        .is_err(),
+        "missing required path must be an error"
+    );
+}
+
+/// plan_equivalent: op_head excluded; head/trivial flips detected.
+#[test]
+fn plan_equivalent_semantics() {
+    let base = SyncModeInfo {
+        mode: SyncMode::SourceOnly,
+        src_effective_head: "s-eff".into(),
+        tgt_effective_head: "t-eff".into(),
+        src_actual_head: "s-act".into(),
+        tgt_actual_head: "t-act".into(),
+        src_trivial_id: None,
+        tgt_trivial_id: Some("t-act".into()),
+        lca: "t-eff".into(),
+        op_head: "op-1".into(),
+    };
+
+    // op_head differs: still equivalent (it is the trigger, not the plan).
+    let mut other = base.clone();
+    other.op_head = "op-2".into();
+    assert!(commands::plan_equivalent(&base, &other));
+
+    // Trivial-id flip (e.g. a description change): not equivalent.
+    let mut other = base.clone();
+    other.tgt_trivial_id = None;
+    assert!(!commands::plan_equivalent(&base, &other));
+
+    // Effective-head flip (placeholder gained content): not equivalent.
+    let mut other = base.clone();
+    other.tgt_effective_head = "t-act".into();
+    assert!(!commands::plan_equivalent(&base, &other));
+
+    // Mode discriminant change: not equivalent.
+    let mut other = base.clone();
+    other.mode = SyncMode::Diverged;
+    assert!(!commands::plan_equivalent(&base, &other));
+}
+
+/// validate_head_info: lenient (sync) proceeds with fresh lca on equivalent
+/// movement and bails on plan change; strict bails on ANY movement.
+#[test]
+fn validate_head_info_flavors() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "M0");
+    let m0 = repo.change_id("@");
+    let feat = add_ws(&repo, "feat", &m0);
+    jj(&feat, &["new", "-m", "F1"]);
+    std::fs::write(feat.join("feat.txt"), "feat-work").unwrap();
+    jj(&feat, &["describe", "-m", "F1: feature work"]);
+    let side = add_ws(&repo, "side", &m0);
+
+    // No movement: both flavors pass and return the cached info.
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    let v = commands::validate_head_info(repo.root(), &info, "feat", "default", false).unwrap();
+    assert_eq!(v.op_head, info.op_head);
+
+    // Unrelated movement: lenient passes with the FRESH info (new op head,
+    // same lca); strict bails.
+    std::fs::write(side.join("side.txt"), "side-edit").unwrap();
+    jujutsu::snapshot_ws(&side).unwrap();
+    let v = commands::validate_head_info(repo.root(), &info, "feat", "default", true)
+        .expect("lenient must pass on equivalent plan");
+    assert_eq!(v.lca, info.lca);
+    assert_ne!(v.op_head, info.op_head);
+    assert!(
+        commands::validate_head_info(repo.root(), &info, "feat", "default", false).is_err(),
+        "strict must bail on any movement"
+    );
+
+    // Plan-changing movement: lenient bails too.
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    jj(&feat, &["new", "-m", "F2"]);
+    assert!(
+        commands::validate_head_info(repo.root(), &info, "feat", "default", true).is_err(),
+        "lenient must bail when the plan changed"
+    );
+}
+
+/// Abandon-set verification: a frozen revisions list that no longer matches
+/// the live default-relative chain must bail before anything is destroyed.
+#[test]
+fn abandon_verifies_live_revision_set() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "M0");
+    let m0 = repo.change_id("@");
+    let feat = add_ws(&repo, "feat", &m0);
+    jj(&feat, &["new", "-m", "F1"]);
+    std::fs::write(feat.join("f1.txt"), "f1").unwrap();
+    jj(&feat, &["describe", "-m", "F1"]);
+    jj(&feat, &["new", "-m", "F2"]);
+    std::fs::write(feat.join("f2.txt"), "f2").unwrap();
+    jj(&feat, &["describe", "-m", "F2"]);
+
+    let live = jj_utils::workspace_unique_change_ids(repo.root(), "feat").unwrap();
+    assert!(live.len() >= 2, "setup: feat has a unique chain");
+
+    // Frozen list deliberately missing one revision (stale capture).
+    let stale_revisions: Vec<jujutsu::RevisionInfo> = live[1..]
+        .iter()
+        .map(|id| jujutsu::RevisionInfo {
+            change_id: id.clone(),
+            description: String::new(),
+        })
+        .collect();
+
+    let params = commands::close::CloseParams {
+        repo_root: repo.root(),
+        source_name: "feat",
+        source_path: &feat,
+        target_name: "default",
+        target_path: repo.root(),
+        target_change_id: "",
+        method: CloseMethod::Abandon,
+        delete_files: false,
+        bookmark_action: BookmarkAction::NoAction,
+        bookmarks: Vec::new(),
+        revisions: &stale_revisions,
+        workspace_path_template: "",
+        repo_name: "repo",
+        author: None,
+    };
+    let err = match commands::close::close(&params) {
+        Ok(_) => panic!("stale set must bail"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err:#}").contains("source revisions changed"),
+        "unexpected error: {err:#}"
+    );
+    // Nothing was destroyed.
+    assert!(repo.rev_exists("feat@"), "feat workspace untouched");
+
+    // Correct frozen list against a NON-default target: the live re-query is
+    // default-relative (the producer definition), not LCA-relative, so this
+    // must pass and abandon the chain.
+    let other = add_ws(&repo, "other", &m0);
+    let live = jj_utils::workspace_unique_change_ids(repo.root(), "feat").unwrap();
+    let revisions: Vec<jujutsu::RevisionInfo> = live
+        .iter()
+        .map(|id| jujutsu::RevisionInfo {
+            change_id: id.clone(),
+            description: String::new(),
+        })
+        .collect();
+    let params = commands::close::CloseParams {
+        repo_root: repo.root(),
+        source_name: "feat",
+        source_path: &feat,
+        target_name: "other",
+        target_path: &other,
+        target_change_id: "",
+        method: CloseMethod::Abandon,
+        delete_files: false,
+        bookmark_action: BookmarkAction::NoAction,
+        bookmarks: Vec::new(),
+        revisions: &revisions,
+        workspace_path_template: "",
+        repo_name: "repo",
+        author: None,
+    };
+    commands::close::close(&params).expect("correct frozen set must pass");
+    for id in &live {
+        assert!(!repo.rev_exists(id), "revision {id} must be abandoned");
+    }
+}
+
+/// Dialog-open invariant: the live staleness probe (`is_workspace_stale`)
+/// snapshots pending edits, so post-probe list reads see them. Pins the
+/// load-bearing behavior `refresh()` depends on (probe before list rebuild).
+#[test]
+fn staleness_probe_snapshots_pending_edits() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "M0");
+
+    std::fs::write(repo.root().join("pending.txt"), "pending").unwrap();
+    let h0 = op_head(&repo);
+    assert!(
+        !jujutsu::is_workspace_stale(repo.root()),
+        "workspace is not jj-stale"
+    );
+    assert_ne!(
+        op_head(&repo),
+        h0,
+        "live probe must snapshot (op head moves)"
+    );
+    let shown = jj(repo.root(), &["file", "show", "-r", "@", "pending.txt"]);
+    assert_eq!(shown, "pending", "edit folded into @ by the probe");
+    // The post-probe workspace list reflects the folded edit.
+    let wss = jujutsu::list_workspaces(repo.root()).unwrap();
+    assert!(
+        wss.iter().any(|w| w.name == "default"),
+        "default workspace listed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Execution-time freshness + protection phase
+// (commands::prepare_execution_freshness)
+// ---------------------------------------------------------------------------
+
+/// Topology shared by the protection tests:
+///   M0 (default@ stays here unless noted) ← feat-start ← F1 (feat@)
+/// Returns (m0_change_id, feat_path).
+fn protection_setup(repo: &TestRepo) -> (String, PathBuf) {
+    repo.commit_file("base.txt", "base", "M0");
+    let m0 = repo.change_id("@");
+    let feat = add_ws(repo, "feat", &m0);
+    jj(&feat, &["new", "-m", "F1"]);
+    std::fs::write(feat.join("feat.txt"), "feat-work").unwrap();
+    jj(&feat, &["describe", "-m", "F1: feature work"]);
+    (m0, feat)
+}
+
+/// Edit-survival: a third-party workspace whose `@` descends from the
+/// rewrite range and holds a pending un-snapshotted edit gets that edit
+/// captured by the broad protection snapshot BEFORE the rebase-method
+/// transfer rewrites its ancestry — reachable afterwards, not stranded.
+#[test]
+fn protection_snapshot_preserves_third_party_edits() {
+    let repo = TestRepo::new();
+    let (_m0, feat) = protection_setup(&repo);
+    // Diverge default so the rebase has somewhere to go.
+    repo.jj_new("D1");
+    repo.commit_file("d1.txt", "d1", "D1");
+
+    // obs: third-party workspace branching from feat's head (at-risk: its
+    // ancestry is inside the rebase range), with a pending edit.
+    let f1 = repo.change_id("feat@");
+    let obs = add_ws(&repo, "obs", &f1);
+    std::fs::write(obs.join("obs-pending.txt"), "obs-pending").unwrap();
+
+    let params = commands::transfer::TransferParams {
+        repo_root: repo.root(),
+        source_name: "feat",
+        source_path: &feat,
+        target_name: "default",
+        target_path: repo.root(),
+        method: TransferMethod::Rebase,
+        workspace_path_template: "",
+        repo_name: "repo",
+        author: None,
+    };
+    let result = commands::transfer::transfer(&params).expect("transfer must succeed");
+
+    // The pending edit was captured into obs@ and survived the rebase.
+    let shown = jj(
+        repo.root(),
+        &["file", "show", "-r", "obs@", "obs-pending.txt"],
+    );
+    assert_eq!(shown, "obs-pending", "third-party edit must survive");
+    // obs was predicted stale (descendant of the rebased roots) and resolved.
+    assert!(
+        result.predicted_stale.iter().any(|n| n == "obs"),
+        "obs must be in the predicted-stale set: {:?}",
+        result.predicted_stale
+    );
+    assert!(
+        result.stale_warnings.is_empty(),
+        "obs staleness must be auto-resolved (got {:?})",
+        result.stale_warnings
+    );
+}
+
+/// jj-stale skip: a stale third-party workspace does not abort the
+/// operation; the protection phase skips it and the post-op report tags it
+/// as already stale (its edits belong to the update-stale workflow).
+#[test]
+fn protection_skips_stale_third_party_and_reports() {
+    let repo = TestRepo::new();
+    let (_m0, feat) = protection_setup(&repo);
+    let f1 = repo.change_id("feat@");
+    let _obs = add_ws(&repo, "obs", &f1);
+    make_stale(&repo, "obs", "stale-maker.txt");
+
+    let params = commands::close::CloseParams {
+        repo_root: repo.root(),
+        source_name: "feat",
+        source_path: &feat,
+        target_name: "default",
+        target_path: repo.root(),
+        target_change_id: "",
+        method: CloseMethod::Merge,
+        delete_files: false,
+        bookmark_action: BookmarkAction::NoAction,
+        bookmarks: Vec::new(),
+        revisions: &[],
+        workspace_path_template: "",
+        repo_name: "repo",
+        author: None,
+    };
+    let result = commands::close::close(&params).expect("close must proceed despite stale obs");
+    assert!(
+        result
+            .stale_warnings
+            .iter()
+            .any(|w| w.contains("obs (was already stale)")),
+        "stale obs must be reported as pre-existing: {:?}",
+        result.stale_warnings
+    );
+}
+
+/// Sync's broad protection: a dirty third-party workspace whose `@` descends
+/// from a DIRTY involved (source) workspace is captured descendant-first —
+/// its edit is folded before the source's own snapshot rebases it — and the
+/// source's post-gate edit rides into the fast-forwarded target.
+#[test]
+fn sync_protection_preserves_third_party_edits() {
+    let repo = TestRepo::new();
+    let (_m0, feat) = protection_setup(&repo);
+    let f1 = repo.change_id("feat@");
+    let obs = add_ws(&repo, "obs", &f1);
+
+    // Both dirty: obs (third-party descendant) and feat (involved source,
+    // non-trivial described head — a content fold keeps its change id).
+    std::fs::write(obs.join("obs-pending.txt"), "obs-pending").unwrap();
+    std::fs::write(feat.join("feat-pending.txt"), "feat-pending").unwrap();
+
+    let outcome = commands::sync::sync(
+        repo.root(),
+        "feat",
+        &feat,
+        "default",
+        repo.root(),
+        "",
+        "repo",
+        None,
+    )
+    .expect("sync must succeed");
+    let warnings = match outcome {
+        ji::operations::SyncOutcome::Done { warnings } => warnings,
+        ji::operations::SyncOutcome::AlreadyInSync => panic!("workspaces were not in sync"),
+    };
+    // Only obs-related staleness may be reported (it descends from feat@,
+    // whose involved snapshot rebased it after obs was captured).
+    assert!(
+        warnings.iter().all(|w| w.contains("obs")),
+        "unexpected warnings: {warnings:?}"
+    );
+
+    // The third-party edit was captured into obs@ before the rebase.
+    let shown = jj(
+        repo.root(),
+        &["file", "show", "-r", "obs@", "obs-pending.txt"],
+    );
+    assert_eq!(shown, "obs-pending", "third-party edit must survive");
+    // The source's pending edit rode into the fast-forwarded target.
+    let shown = jj(
+        repo.root(),
+        &["file", "show", "-r", "default@", "feat-pending.txt"],
+    );
+    assert_eq!(shown, "feat-pending", "involved edit must reach the target");
+}
+
+/// Required-tier capture + post-snapshot revalidation: a post-gate edit to
+/// the sync TARGET is folded by the phase's required snapshot; the fold
+/// flips the target's trivial placeholder head, the re-detected plan is no
+/// longer equivalent, and the operation aborts — with the edit safely
+/// captured (the `ssuouwov` class, now for sync).
+#[test]
+fn sync_required_snapshot_captures_post_gate_edit_and_aborts() {
+    let repo = TestRepo::new();
+    let (m0, feat) = protection_setup(&repo);
+    // default @: empty trivial placeholder on M0 (undescribed).
+    jj(repo.root(), &["new", &m0]);
+    let tgt_id_before = repo.change_id("default@");
+
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    assert!(info.tgt_trivial_id.is_some(), "setup: default @ is trivial");
+
+    // Post-gate edit to the target, un-snapshotted at detection time.
+    std::fs::write(repo.root().join("post-gate.txt"), "post-gate").unwrap();
+
+    let err = commands::sync::sync_with_info(
+        repo.root(),
+        &info,
+        "feat",
+        &feat,
+        "default",
+        repo.root(),
+        "",
+        "repo",
+        None,
+    )
+    .expect_err("flipped target head must abort");
+    assert!(
+        format!("{err:#}").contains("repo changed"),
+        "unexpected error: {err:#}"
+    );
+    // The edit was captured (folded into default@), not stranded…
+    let shown = jj(repo.root(), &["file", "show", "-r", "@", "post-gate.txt"]);
+    assert_eq!(shown, "post-gate", "edit must be folded into default@");
+    // …and nothing executed: default@ is still the same change.
+    assert_eq!(
+        repo.change_id("default@"),
+        tgt_id_before,
+        "no sync structure may have been created"
+    );
+}
+
+/// Involved path check: executable params carrying a stale (relocated)
+/// workspace path abort decisively — never a silent rebind to the new
+/// location, never execution against the old directory.
+#[test]
+fn sync_aborts_on_relocated_involved_path() {
+    let repo = TestRepo::new();
+    let (_m0, feat_old) = protection_setup(&repo);
+    let f1 = repo.change_id("feat@");
+
+    // Relocate: forget feat, re-add under the same name at a new path.
+    jj_r(repo.root(), &["workspace", "forget", "feat"]);
+    let feat_new = repo.tmp().join("feat-relocated");
+    jj_r(
+        repo.root(),
+        &[
+            "workspace",
+            "add",
+            &feat_new.to_string_lossy(),
+            "--name",
+            "feat",
+            "--revision",
+            &f1,
+            "-m",
+            "feat re-added",
+        ],
+    );
+    let tgt_id_before = repo.change_id("default@");
+
+    // Fresh info (validate_head_info passes) but params hold the OLD path.
+    let info = commands::detect_sync_mode(repo.root(), "feat", "default");
+    let err = commands::sync::sync_with_info(
+        repo.root(),
+        &info,
+        "feat",
+        &feat_old,
+        "default",
+        repo.root(),
+        "",
+        "repo",
+        None,
+    )
+    .expect_err("stale involved path must abort");
+    assert!(
+        format!("{err:#}").contains("repo changed"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        repo.change_id("default@"),
+        tgt_id_before,
+        "nothing may have executed"
+    );
+}

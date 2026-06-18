@@ -272,32 +272,6 @@ fn check_trivial_head_none_for_interior() {
 }
 
 // ---------------------------------------------------------------------------
-// resolve_workspace_head
-// ---------------------------------------------------------------------------
-
-#[test]
-fn resolve_workspace_head_returns_default_at() {
-    let repo = TestRepo::new();
-    repo.commit_file("a.txt", "a", "initial");
-    let expected = repo.change_id("default@");
-
-    let result = jj_utils::resolve_workspace_head(repo.root(), "default").unwrap();
-    assert_eq!(result, expected);
-}
-
-#[test]
-fn resolve_workspace_head_named_workspace() {
-    let repo = TestRepo::new();
-    repo.commit_file("a.txt", "a", "initial");
-    let ws_path = repo.add_workspace("feature", "@");
-    jj(&ws_path, &["new", "-m", "feature work"]);
-
-    let expected = repo.change_id("feature@");
-    let result = jj_utils::resolve_workspace_head(repo.root(), "feature").unwrap();
-    assert_eq!(result, expected);
-}
-
-// ---------------------------------------------------------------------------
 // find_effective_head
 // ---------------------------------------------------------------------------
 
@@ -338,47 +312,6 @@ fn find_effective_head_returns_at_when_not_trivial() {
     assert_eq!(
         effective, expected,
         "effective head should be @ when it's not trivial"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// trim_trivial_head
-// ---------------------------------------------------------------------------
-
-#[test]
-fn trim_trivial_head_abandons_wip() {
-    let repo = TestRepo::new();
-    repo.commit_file("a.txt", "a", "initial");
-    let ws_path = repo.add_workspace("feature", "@");
-
-    jj(&ws_path, &["new", "-m", "real work"]);
-    std::fs::write(ws_path.join("f.txt"), "f").unwrap();
-    jj(&ws_path, &["describe", "-m", "real work"]);
-    let real_id = repo.change_id("feature@");
-
-    jj(&ws_path, &["new", "-m", "wip"]);
-    let wip_id = repo.change_id("feature@");
-    assert_ne!(wip_id, real_id);
-
-    let result = jj_utils::trim_trivial_head(repo.root(), "feature").unwrap();
-    assert_eq!(result, real_id, "should return the parent after trimming");
-}
-
-#[test]
-fn trim_trivial_head_noop_when_not_trivial() {
-    let repo = TestRepo::new();
-    repo.commit_file("a.txt", "a", "initial");
-    let ws_path = repo.add_workspace("feature", "@");
-
-    jj(&ws_path, &["new", "-m", "real work"]);
-    std::fs::write(ws_path.join("f.txt"), "f").unwrap();
-    jj(&ws_path, &["describe", "-m", "real work"]);
-    let current = repo.change_id("feature@");
-
-    let result = jj_utils::trim_trivial_head(repo.root(), "feature").unwrap();
-    assert_eq!(
-        result, current,
-        "should return current @ unchanged when not trivial"
     );
 }
 

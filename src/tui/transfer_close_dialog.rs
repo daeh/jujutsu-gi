@@ -4,6 +4,7 @@ use super::dialog_common::{
 use super::dialog_info::Diagram;
 pub(crate) use crate::commands::types::{BookmarkAction, DialogIntent, Operation};
 use crate::{commands, graph, jj_utils, jujutsu, jujutsu::RevisionInfo};
+use crossterm::event::KeyCode;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear};
 use std::collections::HashMap;
@@ -42,6 +43,24 @@ pub(crate) struct CloseDialog {
     squashable: bool,
     /// Resolved change ID of the squash target (set when squashable is true).
     squash_target: Option<String>,
+    /// Transient notices rendered at the top of the dialog (stale-refresh
+    /// banner, restored-selection notes). Cleared on target cycle.
+    pub notice: Vec<String>,
+    /// Set when the selected target cannot back a target-consuming operation
+    /// (e.g. it vanished during a stale refresh). While set, only disposal
+    /// operations (Detach/Abandon) are offered. Cleared on target cycle.
+    pub target_unavailable: Option<String>,
+    /// Set when the source workspace vanished during a stale refresh: every
+    /// close/transfer operation consumes the source, so no operations are
+    /// offered while this is set (Enter inert).
+    pub source_missing: bool,
+    /// Op head at the last point the dialog's data was made fresh (open or an
+    /// in-place stale refresh). The execute gate compares the current op head
+    /// against THIS, not `close_info.op_head` — `recompute_close_mode()`
+    /// re-stamps the latter to "now" on every target cycle, which would
+    /// otherwise mask external movement (stale revisions/bookmarks/target ids)
+    /// from the gate.
+    pub freshness_baseline: String,
 }
 
 impl CloseDialog {
@@ -79,9 +98,25 @@ impl CloseDialog {
             shortest_ids: HashMap::new(),
             squashable: false,
             squash_target: None,
+            notice: Vec::new(),
+            target_unavailable: None,
+            source_missing: false,
+            freshness_baseline: String::new(),
         };
         dialog.recompute_close_mode();
+        // Baseline = op head when this dialog's data was first made fresh
+        // (the open handler snapshotted via refresh() immediately before).
+        dialog.freshness_baseline = dialog
+            .close_info
+            .as_ref()
+            .map(|i| i.op_head.clone())
+            .unwrap_or_default();
         dialog
+    }
+
+    /// Re-anchor the freshness baseline (call after an in-place refresh).
+    pub(crate) fn set_freshness_baseline(&mut self, op_head: String) {
+        self.freshness_baseline = op_head;
     }
 
     pub(crate) fn toggle_delete_files(&mut self) {
@@ -101,6 +136,8 @@ impl CloseDialog {
             self.target_index = (self.target_index + 1) % self.targets.len();
         }
         self.selected_index = 0;
+        self.notice.clear();
+        self.target_unavailable = None;
     }
 
     pub(crate) fn cycle_target_back(&mut self) {
@@ -108,6 +145,8 @@ impl CloseDialog {
             self.target_index = (self.target_index + self.targets.len() - 1) % self.targets.len();
         }
         self.selected_index = 0;
+        self.notice.clear();
+        self.target_unavailable = None;
     }
 
     /// Recompute close-mode info for the current target.
@@ -195,6 +234,58 @@ impl CloseDialog {
         commands::detect_sync_mode(repo, src_name, tgt_name)
     }
 
+    /// Dialog-internal key handling: operation navigation, target cycling,
+    /// and toggles. Returns true if the target selection changed (the caller
+    /// resyncs the graph). Confirm/copy/Esc — and the freshness gate and
+    /// deferred execution they trigger — stay with the App.
+    pub(crate) fn handle_key(&mut self, key: KeyCode) -> bool {
+        match key {
+            // Navigate operations
+            KeyCode::Up => {
+                self.move_up();
+            }
+            KeyCode::Down => {
+                self.move_down();
+            }
+            // Cycle target workspace
+            KeyCode::Left if self.targets.len() > 1 => {
+                self.cycle_target_back();
+                self.recompute_close_mode();
+                return true;
+            }
+            KeyCode::Right if self.targets.len() > 1 => {
+                self.cycle_target();
+                self.recompute_close_mode();
+                return true;
+            }
+            // Key shortcuts to jump to operation
+            KeyCode::Char('a') => {
+                let op = match self.intent {
+                    DialogIntent::Transfer => Operation::AdaptiveMerge,
+                    DialogIntent::Close => Operation::AdaptiveClose,
+                };
+                self.jump_to(op);
+            }
+            KeyCode::Char(c @ '1'..='4') => {
+                self.jump_to_key(c);
+            }
+            KeyCode::Char('d') if self.intent == DialogIntent::Close => {
+                self.jump_to(Operation::Detach);
+            }
+            // Toggles
+            KeyCode::Char('b')
+                if self.intent == DialogIntent::Close && !self.bookmarks.is_empty() =>
+            {
+                self.cycle_bookmark_action();
+            }
+            KeyCode::Char('k') if self.intent == DialogIntent::Close => {
+                self.toggle_delete_files();
+            }
+            _ => {}
+        }
+        false
+    }
+
     pub(crate) fn move_up(&mut self) {
         self.selected_index = self.selected_index.saturating_sub(1);
     }
@@ -246,7 +337,17 @@ impl CloseDialog {
 
     /// All navigable operations for the current direction and intent.
     pub(crate) fn all_operations(&self) -> Vec<Operation> {
-        let mut ops = self.available_operations();
+        // Every operation consumes the source workspace.
+        if self.source_missing {
+            return Vec::new();
+        }
+        // Target-consuming operations need a usable target; disposal ops
+        // (Detach/Abandon) never consume one and stay offered.
+        let mut ops = if self.target_unavailable.is_some() {
+            Vec::new()
+        } else {
+            self.available_operations()
+        };
         if self.intent == DialogIntent::Close {
             ops.push(Operation::Detach);
             if !self.revisions.is_empty() {
@@ -927,6 +1028,20 @@ impl CloseDialog {
         let mut layout = DialogLayout::new(inner, top_h);
 
         // --- TOP SECTION ---
+
+        // Transient notices (stale-refresh banner, snapshot failures).
+        if !self.notice.is_empty() {
+            for n in &self.notice {
+                layout.draw_line(
+                    frame,
+                    &[Span::styled(
+                        format!(" \u{26a0} {n}"),
+                        Style::default().fg(Color::Yellow),
+                    )],
+                );
+            }
+            layout.skip(1);
+        }
 
         // Revision list
         if self.revisions.is_empty() {

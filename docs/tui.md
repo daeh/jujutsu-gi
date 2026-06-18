@@ -95,7 +95,7 @@ Orphaned workspaces (blue) are simply forgotten by `x` — no dialog.
 | `Z` | Undo the last ji action by running `jj op restore` to the pre-action op |
 | `Y` | Redo the most recently undone action |
 
-ji records its own actions in an in-memory history so that `Z`/`Y` only traverse ji-initiated operations, not every jj operation in the repo.
+ji records its own actions in a persisted history (`.ji/action-history.json`) so that `Z`/`Y` only traverse ji-initiated operations, not every jj operation in the repo.
 
 ### Status line
 
@@ -138,7 +138,7 @@ Line-editing keys (inside any text field): `Ctrl+a` (start), `Ctrl+e` (end), `Ct
 
 ### Close and Transfer
 
-Both open the same dialog. `x` opens it in close mode (the source workspace is forgotten after the operation); `t` opens it in transfer mode (both workspaces stay open). The dialog lists the operations available for the current sync state between source and target, along with a live preview of the exact jj commands that will run.
+Both open the same dialog. `x` opens it in close mode (the source workspace is forgotten after the operation); `t` opens it in transfer mode (both workspaces stay open). The dialog lists the operations available for the current sync state between source and target, along with a live preview of the jj command sequence that will run.
 
 This command preview is worth highlighting: it is ji's honest statement of what the operation will do. If you are learning jj, reading (and `c`-copying) the preview is a reliable way to see how fast-forward / merge / rebase / squash map to sequences of `jj new`, `jj rebase`, and friends.
 

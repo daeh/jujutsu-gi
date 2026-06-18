@@ -8,7 +8,7 @@ Every ji subcommand, its flags, and its behavior.
 
 A few terms appear throughout. Full definitions live in [operations.md](operations.md#terminology); brief versions:
 
-- **Default workspace** — the workspace at the repository root, referred to as `default@`. It serves the role of the `main`/`master` branch in git. ji uses it as the default target for `close`/`transfer`/`sync` when no target is given.
+- **Default workspace** — the workspace at the repository root, referred to as `default@`. It serves the role of the `main`/`master` branch in git. ji uses it as the default target for `transfer`/`sync` (and for `close` only when `--source` is given) when no positional target is supplied. A bare non-disposal `ji close` requires an explicit target.
 - **Effective head** — the tip of a workspace's line of work, skipping over ji-inserted empty "trivial" commits used to keep workspaces from sharing `@`.
 - **Adaptive** — a meta-method for close/transfer that inspects the graph relationship between source and target and picks a concrete method (fast-forward, merge, etc.).
 - **Disposal methods** — close methods that do not require a target: `detach` and `abandon`.
@@ -105,13 +105,13 @@ If `ji-author` is set in the config, the new revision's author is rewritten via 
 ji close [target] [--source <NAME>] [--method <METHOD>] [--delete-files]
 ```
 
-Close a workspace by merging its work into a target and then forgetting it.
+Close a workspace — integrating its work into a target, or (for the `detach`/`abandon` disposal methods) discarding it — and then forgetting it.
 
 ### Arguments and flags
 
 | Argument / Flag | Required | Default | Description |
 |---|---|---|---|
-| `[target]` | yes, for non-disposal methods | `default@` (the repository root workspace) | Target workspace name (positional) |
+| `[target]` | yes, for non-disposal methods (unless `--source` is given) | `default@`, only with `--source` | Target workspace name (positional) |
 | `--source <NAME>` | no | current workspace (by cwd) | Workspace to close |
 | `--method <METHOD>` | no | `adaptive` | Close method (see table below) |
 | `--delete-files` | no | off | Remove the source workspace directory after close |
@@ -127,7 +127,7 @@ Close a workspace by merging its work into a target and then forgetting it.
 | `detach` | no | Forgets the workspace without touching its revisions (disposal method) |
 | `abandon` | no | Forgets the workspace and abandons all its revisions (disposal method) |
 
-For full diagrams and the exact jj commands ji runs for each method, see [operations.md](operations.md).
+For full diagrams and the jj command sequences ji runs for each method, see [operations.md](operations.md).
 
 > **Bookmark handling.** When you close a workspace from the CLI, bookmarks on the source workspace are left alone — ji does not advance or delete them. The singular bookmark (the one whose name matches the workspace's `{{ bookmark }}` value) is still managed automatically. If you want to advance or delete the other bookmarks as part of a close, use the TUI close dialog (`x`), which exposes a per-close bookmark-action toggle. See [operations.md](operations.md#bookmark-actions-on-close).
 
@@ -135,7 +135,7 @@ For full diagrams and the exact jj commands ji runs for each method, see [operat
 
 ```sh
 # Close the current workspace into the default workspace with adaptive merge
-ji close
+ji close default
 
 # Squash-merge a specific workspace into another, deleting its files
 ji close main --source feature-login --method squash-merge --delete-files
@@ -239,7 +239,7 @@ ji config shell uninstall [SHELL]    # remove shell integration
 ji config shell status [SHELL]       # report integration state
 ```
 
-`[SHELL]` is one of `zsh`, `bash`, `fish`; it defaults to the basename of `$SHELL`.
+`[SHELL]` is one of `zsh`, `bash`, `fish`; it defaults to the active shell — the one that invoked `ji`, found by walking the process tree — falling back to `$SHELL` when no shell can be identified.
 
 ### `ji config init`
 
@@ -272,7 +272,7 @@ Reports install state, drift, and any cross-file integration hits.
    - Without `--source`: the workspace whose path matches the current working directory. Errors if cwd is not inside a workspace.
 2. **Target**
    - With a positional `target`: looked up by exact workspace name.
-   - Without a positional `target`: the default workspace (`default@`) — the workspace at the repository root, which serves the role of the `main`/`master` branch in git. Errors if it can't be found.
+   - Without a positional `target`: the default workspace (`default@`) — the workspace at the repository root, which serves the role of the `main`/`master` branch in git. Errors if it can't be found. **Exception:** for `close`, this fallback applies only when `--source` is given; a bare non-disposal `ji close` (no `target`, no `--source`) errors and asks for a target.
 
 ## Stale working copy detection
 

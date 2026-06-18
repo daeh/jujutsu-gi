@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+use libproc::bsd_info::BSDInfo;
+use libproc::proc_pid::{pidinfo, pidpath};
 use std::ops::Range;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -116,15 +118,174 @@ pub fn print_init(shell: &str, cmd: &mut clap::Command) -> Result<()> {
     Ok(())
 }
 
-/// Detect the current shell from the SHELL environment variable.
+// =====================================================================
+// Active-shell detection
+//
+// `$SHELL` is the *login* shell, not the shell the user is actively running.
+// We instead walk up the process tree (via libproc) and stop at the nearest
+// ancestor that is a recognized shell — that is the shell that invoked `ji`.
+// `$SHELL` is consulted only as a fallback, and only when no shell is found.
+// =====================================================================
+
+/// Shells `ji` can install integration for. Single source of truth; the
+/// human-readable [`SUPPORTED_SHELLS`] string is kept in sync by a test.
+const SUPPORTED: &[&str] = &["zsh", "bash", "fish"];
+
+/// Recognized shells `ji` does *not* support integration for. Enumerated
+/// exhaustively on purpose: a shell missing from this set is classified as a
+/// non-shell and walked past, which could let an outer supported shell win and
+/// violate "nearest recognized shell ancestor wins".
+const UNSUPPORTED_SHELLS: &[&str] = &[
+    "sh",
+    "dash",
+    "ash",
+    "busybox",
+    "ksh",
+    "mksh",
+    "pdksh",
+    "loksh",
+    "oksh",
+    "rksh",
+    "csh",
+    "tcsh",
+    "nu",
+    "nushell",
+    "pwsh",
+    "powershell",
+    "xonsh",
+    "elvish",
+    "ion",
+    "oil",
+    "osh",
+    "rc",
+    "es",
+    "yash",
+    "scsh",
+    "tclsh",
+    "murex",
+];
+
+/// Bound on the process-tree walk — guards against cycles / pathological trees.
+const MAX_WALK_DEPTH: usize = 24;
+
+/// Classification of a process executable's basename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Class {
+    /// A shell `ji` supports (zsh/bash/fish).
+    Supported(String),
+    /// A recognized shell `ji` does not support.
+    Unsupported(String),
+    /// Not a recognized shell — keep walking up the process tree.
+    NotAShell,
+}
+
+/// Outcome of walking the process tree for the active shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Detection {
+    Supported(String),
+    Unsupported(String),
+    /// No recognized shell found in the ancestry.
+    Unknown,
+}
+
+/// Reduce an executable path or `$SHELL` value to a bare shell name: take the
+/// file name, strip a leading `-` (login shells exec as `-zsh`), lowercase.
+fn shell_basename(path: &str) -> Option<String> {
+    let name = Path::new(path).file_name()?.to_str()?;
+    let name = name.strip_prefix('-').unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+fn classify(name: &str) -> Class {
+    if SUPPORTED.contains(&name) {
+        Class::Supported(name.to_string())
+    } else if UNSUPPORTED_SHELLS.contains(&name) {
+        Class::Unsupported(name.to_string())
+    } else {
+        Class::NotAShell
+    }
+}
+
+/// Walk up from `start_pid`'s parent and return the first recognized shell
+/// ancestor (and its executable path, for display). Pure over the injected
+/// `parent_of` / `name_of` lookups so it is unit-testable with synthetic trees.
+/// `name_of` returns a process's full executable path.
+fn resolve_in_tree(
+    start_pid: i32,
+    parent_of: impl Fn(i32) -> Option<i32>,
+    name_of: impl Fn(i32) -> Option<String>,
+    max_depth: usize,
+) -> (Detection, Option<String>) {
+    let mut cur = parent_of(start_pid);
+    let mut depth = 0;
+    while let Some(pid) = cur {
+        if depth >= max_depth {
+            break;
+        }
+        depth += 1;
+        if let Some(path) = name_of(pid)
+            && let Some(base) = shell_basename(&path)
+        {
+            match classify(&base) {
+                Class::Supported(s) => return (Detection::Supported(s), Some(path)),
+                Class::Unsupported(s) => return (Detection::Unsupported(s), Some(path)),
+                // Not a shell (sudo/env/make/login/…) — keep walking.
+                Class::NotAShell => {}
+            }
+        }
+        cur = parent_of(pid);
+    }
+    (Detection::Unknown, None)
+}
+
+/// The full fallback contract, pure over the injected raw `$SHELL` value so it
+/// (including basename normalization) is unit-testable without the environment.
+/// `$SHELL` is consulted **only** when no shell was found in the process tree.
+fn decide(active: Detection, env_shell_raw: Option<&str>) -> Result<String> {
+    match active {
+        Detection::Supported(s) => Ok(s),
+        Detection::Unsupported(name) => bail!(
+            "detected active shell '{name}', which ji doesn't support (supported: {SUPPORTED_SHELLS}); \
+             pass the shell explicitly, e.g. `ji config shell install zsh`"
+        ),
+        Detection::Unknown => {
+            let Some(raw) = env_shell_raw.filter(|s| !s.is_empty()) else {
+                bail!("SHELL not set — pass the shell explicitly");
+            };
+            match shell_basename(raw).map(|b| classify(&b)) {
+                Some(Class::Supported(s)) => Ok(s),
+                Some(Class::Unsupported(name)) => bail!(
+                    "could not identify your active shell; $SHELL names an unsupported login shell \
+                     '{name}' (supported: {SUPPORTED_SHELLS}); pass the shell explicitly"
+                ),
+                _ => bail!("could not determine your shell; pass it explicitly (zsh|bash|fish)"),
+            }
+        }
+    }
+}
+
+/// `parent_of` over the live process tree. `ppid <= 1` (launchd / reparented)
+/// stops the walk.
+fn live_parent(pid: i32) -> Option<i32> {
+    pidinfo::<BSDInfo>(pid, 0)
+        .ok()
+        .map(|info| info.pbi_ppid as i32)
+        .filter(|&ppid| ppid > 1)
+}
+
+/// `name_of` over the live process tree: the full executable path, or `None`
+/// if it can't be resolved (e.g. the process exited) — the walk then skips it.
+fn live_exe_path(pid: i32) -> Option<String> {
+    pidpath(pid).ok()
+}
+
+/// Detect the shell that invoked `ji`: the nearest recognized shell ancestor,
+/// falling back to `$SHELL` only when none is found. Errors clearly when the
+/// active shell is a recognized-but-unsupported shell.
 pub fn detect_shell() -> Result<String> {
-    let shell_path = std::env::var("SHELL").context("SHELL not set — pass the shell explicitly")?;
-    let shell_name = Path::new(&shell_path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .context("could not parse SHELL")?
-        .to_string();
-    Ok(shell_name)
+    let me = std::process::id() as i32;
+    let (active, _) = resolve_in_tree(me, live_parent, live_exe_path, MAX_WALK_DEPTH);
+    decide(active, std::env::var("SHELL").ok().as_deref())
 }
 
 pub fn write_directive_cd(path: &Path) -> Result<()> {
@@ -556,7 +717,6 @@ struct Hit {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum HitKind {
     /// A complete `# >>> … <<<` marker block; byte range covers both marker lines.
     MarkerBlock {
@@ -1453,9 +1613,97 @@ fn uninstall_fish(env: &ShellEnv, opts: UninstallOpts) -> Result<()> {
 // Status
 // =====================================================================
 
-pub fn status(env: &ShellEnv, shell: &str, cmd: &mut clap::Command) -> Result<()> {
-    match shell {
-        "zsh" | "bash" => status_posix(env, shell, cmd),
+/// Non-fatal snapshot of the active shell for the `status` diagnostic. Built
+/// from the same process-tree walk as [`detect_shell`]; never errors.
+#[derive(Debug, Clone)]
+struct ActiveReport {
+    detected: Detection,
+    /// Executable path of the nearest shell ancestor (for display).
+    active_exe: Option<PathBuf>,
+    /// Raw `$SHELL` value (full path), if set and non-empty.
+    shell_env_raw: Option<String>,
+}
+
+fn detect_active_report() -> ActiveReport {
+    let me = std::process::id() as i32;
+    let (detected, exe) = resolve_in_tree(me, live_parent, live_exe_path, MAX_WALK_DEPTH);
+    ActiveReport {
+        detected,
+        active_exe: exe.map(PathBuf::from),
+        shell_env_raw: std::env::var("SHELL").ok().filter(|s| !s.is_empty()),
+    }
+}
+
+/// Which shell's integration `status` should inspect. `$SHELL` is only a
+/// candidate when the tree walk found no shell at all — mirroring the
+/// detection rule so we never inspect `$SHELL` after seeing a real shell.
+/// Pure over [`ActiveReport`] so it is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum StatusAction {
+    Inspect(String),
+    ReportOnly,
+}
+
+fn status_action(r: &ActiveReport) -> StatusAction {
+    match &r.detected {
+        Detection::Supported(s) => StatusAction::Inspect(s.clone()),
+        // A shell was identified but isn't supported — report it, don't fall back to $SHELL.
+        Detection::Unsupported(_) => StatusAction::ReportOnly,
+        Detection::Unknown => {
+            match r
+                .shell_env_raw
+                .as_deref()
+                .and_then(shell_basename)
+                .map(|b| classify(&b))
+            {
+                Some(Class::Supported(s)) => StatusAction::Inspect(s),
+                _ => StatusAction::ReportOnly,
+            }
+        }
+    }
+}
+
+fn print_active_report(r: &ActiveReport) {
+    let active = match &r.detected {
+        Detection::Supported(s) => s.clone(),
+        Detection::Unsupported(name) => format!("{name} (unsupported)"),
+        Detection::Unknown => "unknown".to_string(),
+    };
+    let exe = r
+        .active_exe
+        .as_ref()
+        .map(|p| format!("   [{}]", p.display()))
+        .unwrap_or_default();
+    println!("  active shell (detected): {active}{exe}");
+    println!(
+        "  login shell ($SHELL):    {}",
+        r.shell_env_raw.as_deref().unwrap_or("<unset>")
+    );
+}
+
+/// Report shell-integration state. The detection step is **non-fatal**: an
+/// unsupported/unknown active shell is reported, not an error (only the
+/// mutating commands error on that). Genuine I/O errors from the underlying
+/// inspectors still propagate.
+pub fn status(env: &ShellEnv, target: Option<&str>, cmd: &mut clap::Command) -> Result<()> {
+    let report = detect_active_report();
+    print_active_report(&report);
+
+    let shell = match target {
+        Some(t) => t.to_string(),
+        None => match status_action(&report) {
+            StatusAction::Inspect(s) => s,
+            StatusAction::ReportOnly => {
+                println!(
+                    "  no supported active shell to inspect; pass one explicitly (zsh|bash|fish)"
+                );
+                return Ok(());
+            }
+        },
+    };
+
+    match shell.as_str() {
+        "zsh" | "bash" => status_posix(env, &shell, cmd),
         "fish" => status_fish(env, cmd),
         other => bail!("unsupported shell: {other} (supported: {SUPPORTED_SHELLS})"),
     }
@@ -1532,10 +1780,6 @@ fn status_posix(env: &ShellEnv, shell: &str, cmd: &mut clap::Command) -> Result<
             println!("    {}:{} — {}", h.path.display(), h.line_no, h.line_text);
         }
     }
-    println!(
-        "  detected $SHELL: {}",
-        std::env::var("SHELL").unwrap_or_else(|_| "<unset>".to_string())
-    );
 
     Ok(())
 }
@@ -1624,5 +1868,278 @@ fn display_canonical(p: &Path) -> String {
     match p.canonicalize() {
         Ok(c) if c != p => format!("{} -> {}", p.display(), c.display()),
         _ => p.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ---- classify / registry ----
+
+    #[test]
+    fn classify_supported_unsupported_and_non_shells() {
+        for s in ["zsh", "bash", "fish"] {
+            assert_eq!(classify(s), Class::Supported(s.to_string()));
+        }
+        for s in ["sh", "dash", "nu", "nushell", "tcsh", "pwsh", "xonsh"] {
+            assert_eq!(classify(s), Class::Unsupported(s.to_string()));
+        }
+        for s in ["make", "python", "login", "ji", "code"] {
+            assert_eq!(classify(s), Class::NotAShell);
+        }
+    }
+
+    #[test]
+    fn every_unsupported_registry_entry_classifies_unsupported() {
+        for &s in UNSUPPORTED_SHELLS {
+            assert_eq!(
+                classify(s),
+                Class::Unsupported(s.to_string()),
+                "registry entry {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_display_string_stays_in_sync() {
+        assert_eq!(SUPPORTED.join(", "), SUPPORTED_SHELLS);
+    }
+
+    // ---- basename normalization ----
+
+    #[test]
+    fn basename_strips_path_dash_and_lowercases() {
+        assert_eq!(shell_basename("/bin/zsh").as_deref(), Some("zsh"));
+        assert_eq!(shell_basename("-zsh").as_deref(), Some("zsh"));
+        assert_eq!(
+            shell_basename("/opt/homebrew/bin/fish").as_deref(),
+            Some("fish")
+        );
+        assert_eq!(shell_basename("/usr/bin/ZSH").as_deref(), Some("zsh"));
+        assert_eq!(shell_basename(""), None);
+        assert_eq!(shell_basename("-"), None);
+    }
+
+    // ---- tree walk ----
+
+    /// Walk a synthetic process tree described as `(pid, ppid, exe_path)` rows.
+    /// A node with an empty exe string models a `name_of` lookup failure.
+    fn walk(start: i32, rows: &[(i32, i32, &str)]) -> (Detection, Option<String>) {
+        let parents: HashMap<i32, i32> = rows.iter().map(|&(p, pp, _)| (p, pp)).collect();
+        let names: HashMap<i32, String> = rows
+            .iter()
+            .filter(|&&(_, _, n)| !n.is_empty())
+            .map(|&(p, _, n)| (p, n.to_string()))
+            .collect();
+        resolve_in_tree(
+            start,
+            |p| parents.get(&p).copied().filter(|&pp| pp > 1),
+            |p| names.get(&p).cloned(),
+            MAX_WALK_DEPTH,
+        )
+    }
+
+    #[test]
+    fn direct_parent_supported_shell() {
+        let (d, exe) = walk(100, &[(100, 50, "ji"), (50, 40, "/bin/zsh")]);
+        assert_eq!(d, Detection::Supported("zsh".into()));
+        assert_eq!(exe.as_deref(), Some("/bin/zsh"));
+    }
+
+    #[test]
+    fn walks_through_non_shell_intermediaries() {
+        // make, then bash.
+        let (d, _) = walk(
+            100,
+            &[(100, 50, "ji"), (50, 40, "make"), (40, 30, "/bin/bash")],
+        );
+        assert_eq!(d, Detection::Supported("bash".into()));
+        // sudo -> env -> fish.
+        let (d, _) = walk(
+            10,
+            &[(10, 9, "ji"), (9, 8, "sudo"), (8, 7, "env"), (7, 6, "fish")],
+        );
+        assert_eq!(d, Detection::Supported("fish".into()));
+    }
+
+    #[test]
+    fn nearest_shell_wins_sh_below_fish() {
+        // sh is the nearest shell ancestor; fish is above it. sh wins (unsupported),
+        // and $SHELL is never consulted by the walk.
+        let (d, _) = walk(100, &[(100, 50, "ji"), (50, 40, "sh"), (40, 30, "fish")]);
+        assert_eq!(d, Detection::Unsupported("sh".into()));
+    }
+
+    #[test]
+    fn direct_parent_unsupported_shell() {
+        let (d, _) = walk(100, &[(100, 50, "ji"), (50, 40, "nu")]);
+        assert_eq!(d, Detection::Unsupported("nu".into()));
+    }
+
+    #[test]
+    fn no_shell_chain_terminating_at_init_is_unknown() {
+        // ppid 1 stops the walk; no recognized shell seen.
+        let (d, exe) = walk(100, &[(100, 50, "ji"), (50, 40, "make"), (40, 1, "login")]);
+        assert_eq!(d, Detection::Unknown);
+        assert_eq!(exe, None);
+    }
+
+    #[test]
+    fn name_lookup_failure_is_skipped() {
+        // pid 40 has no name (lookup failure) but a real shell sits above it.
+        let (d, _) = walk(
+            100,
+            &[
+                (100, 50, "ji"),
+                (50, 40, "make"),
+                (40, 30, ""),
+                (30, 20, "/bin/zsh"),
+            ],
+        );
+        assert_eq!(d, Detection::Supported("zsh".into()));
+    }
+
+    #[test]
+    fn depth_cap_bounds_the_walk() {
+        // A non-shell chain longer than the cap, with a shell only beyond it → Unknown.
+        let deep = 101 + MAX_WALK_DEPTH as i32 + 5;
+        let mut rows: Vec<(i32, i32, &str)> = vec![(100, 101, "ji")];
+        for pid in 101..deep {
+            rows.push((pid, pid + 1, "make"));
+        }
+        rows.push((deep, deep + 1, "zsh")); // beyond MAX_WALK_DEPTH from the start
+        let (d, _) = walk(100, &rows);
+        assert_eq!(d, Detection::Unknown);
+    }
+
+    #[test]
+    fn cycle_is_bounded() {
+        // 50 <-> 60 cycle, all non-shells: the depth cap terminates the walk.
+        let (d, _) = walk(100, &[(100, 50, "ji"), (50, 60, "make"), (60, 50, "make")]);
+        assert_eq!(d, Detection::Unknown);
+    }
+
+    // ---- decide (full fallback contract, raw $SHELL) ----
+
+    #[test]
+    fn decide_active_supported_wins() {
+        assert_eq!(
+            decide(Detection::Supported("zsh".into()), Some("/bin/bash")).unwrap(),
+            "zsh"
+        );
+    }
+
+    #[test]
+    fn decide_active_unsupported_errors_and_ignores_shell_env() {
+        let err = decide(Detection::Unsupported("nu".into()), Some("/bin/zsh")).unwrap_err();
+        let m = format!("{err}");
+        assert!(m.contains("detected active shell 'nu'"), "{m}");
+        // It is an error, so it can never have returned the $SHELL-derived "zsh".
+    }
+
+    #[test]
+    fn decide_unknown_uses_supported_shell_env() {
+        assert_eq!(
+            decide(Detection::Unknown, Some("/usr/bin/zsh")).unwrap(),
+            "zsh"
+        );
+        assert_eq!(decide(Detection::Unknown, Some("-bash")).unwrap(), "bash");
+    }
+
+    #[test]
+    fn decide_unknown_unsupported_shell_env_has_distinct_message() {
+        let err = decide(Detection::Unknown, Some("/bin/tcsh")).unwrap_err();
+        let m = format!("{err}");
+        assert!(m.contains("tcsh"), "{m}");
+        assert!(
+            m.contains("login shell"),
+            "should name $SHELL as the source: {m}"
+        );
+    }
+
+    #[test]
+    fn decide_unknown_nonshell_shell_env() {
+        let err = decide(Detection::Unknown, Some("/usr/bin/whatever")).unwrap_err();
+        assert!(format!("{err}").contains("could not determine"));
+    }
+
+    #[test]
+    fn decide_unknown_unset_shell_env() {
+        assert!(
+            format!("{}", decide(Detection::Unknown, None).unwrap_err()).contains("SHELL not set")
+        );
+        assert!(
+            format!("{}", decide(Detection::Unknown, Some("")).unwrap_err())
+                .contains("SHELL not set")
+        );
+    }
+
+    // ---- status_action (pure status selection) ----
+
+    fn report(detected: Detection, shell_env: Option<&str>) -> ActiveReport {
+        ActiveReport {
+            detected,
+            active_exe: None,
+            shell_env_raw: shell_env.map(String::from),
+        }
+    }
+
+    #[test]
+    fn status_inspects_supported_active() {
+        assert_eq!(
+            status_action(&report(
+                Detection::Supported("zsh".into()),
+                Some("/bin/bash")
+            )),
+            StatusAction::Inspect("zsh".into())
+        );
+    }
+
+    #[test]
+    fn status_unsupported_active_reports_only_never_shell_env() {
+        assert_eq!(
+            status_action(&report(
+                Detection::Unsupported("nu".into()),
+                Some("/bin/zsh")
+            )),
+            StatusAction::ReportOnly
+        );
+    }
+
+    #[test]
+    fn status_unknown_active_may_use_supported_shell_env() {
+        assert_eq!(
+            status_action(&report(Detection::Unknown, Some("/usr/bin/fish"))),
+            StatusAction::Inspect("fish".into())
+        );
+        assert_eq!(
+            status_action(&report(Detection::Unknown, Some("/bin/tcsh"))),
+            StatusAction::ReportOnly
+        );
+        assert_eq!(
+            status_action(&report(Detection::Unknown, None)),
+            StatusAction::ReportOnly
+        );
+    }
+
+    // ---- live smoke test (environment-dependent) ----
+
+    #[test]
+    fn detect_shell_live_is_ok_or_clear_error() {
+        match detect_shell() {
+            Ok(s) => assert!(
+                SUPPORTED.contains(&s.as_str()),
+                "returned unsupported shell {s}"
+            ),
+            Err(e) => {
+                let m = format!("{e}");
+                assert!(
+                    m.contains("shell") || m.contains("SHELL"),
+                    "unexpected error: {m}"
+                );
+            }
+        }
     }
 }

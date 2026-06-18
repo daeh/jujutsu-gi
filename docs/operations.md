@@ -1,6 +1,6 @@
 # Operations
 
-`ji sync`, `ji transfer`, and `ji close` are the three commands that combine two workspaces. This page documents the mode detection, the concrete methods, and the exact jj commands each method runs.
+`ji sync`, `ji transfer`, and `ji close` are the three commands that combine two workspaces. This page documents the mode detection, the concrete methods, and the jj command sequences each method runs.
 
 - [Terminology](#terminology)
 - [Sync mode detection](#sync-mode-detection)
@@ -13,8 +13,8 @@
 
 ## Terminology
 
-- **Default workspace** — the workspace at the repository root, addressable as `default@`. It serves the role of the `main`/`master` branch in git. `close`, `transfer`, and `sync` default their `target` argument to this workspace.
-- **Source** / **target** — in `ji close`, `ji transfer`, and `ji sync`, the source is the workspace the operation is run *from* (the current working directory unless `--source` overrides), and the target is the workspace the operation is run *against* (`default@` unless a positional `target` is given). By convention, source is a feature workspace and target is `default@`.
+- **Default workspace** — the workspace at the repository root, addressable as `default@`. It serves the role of the `main`/`master` branch in git. `transfer` and `sync` default their `target` argument to this workspace when none is given; `close` does so only with `--source` (a bare non-disposal `ji close` requires an explicit target).
+- **Source** / **target** — in `ji close`, `ji transfer`, and `ji sync`, the source is the workspace the operation is run *from* (the current working directory unless `--source` overrides), and the target is the workspace the operation is run *against* (`default@` when no positional `target` is given — though a bare non-disposal `ji close` requires an explicit target). By convention, source is a feature workspace and target is `default@`.
 - **Step-forward commit** — an empty commit ji inserts on a workspace's `@` to keep two workspaces from sharing the same working-copy revision. Description: `(ji::step-forward)`. Two workspaces must never have the same `@`, so ji adds these after any operation that would otherwise produce a shared `@`.
 - **Trivial head** — a graph head that is empty (no file changes), single-parent (not a merge), and has a "trivial" description. A description counts as trivial if it is empty, is a single word with no whitespace, starts with `(ji::` (on a single line), or matches jj's configured `templates.new_description` exactly. Step-forward commits and `(ji::fast-forward)` commits are both trivial by this definition.
 - **Effective head** — a workspace's line-of-work tip, with a trivial `@` skipped. If `@` is a trivial head, the effective head is `@-`; otherwise it is `@`. ji compares effective heads when deciding whether two workspaces are in sync.
@@ -27,7 +27,16 @@ In diagrams below, `src_eff` / `tgt_eff` are the effective heads, `src_at` / `tg
 
 ### A note on `--ignore-working-copy`
 
-Every `jj` command ji runs as part of these operations — `jj new`, `jj squash`, `jj rebase`, `jj abandon`, `jj bookmark set`, `jj workspace forget`, `jj log` — passes `--ignore-working-copy`, so jj neither snapshots the working copy nor writes it out on each call. The only exception is an explicit `jj util snapshot` ji runs before `jj workspace forget` (to capture pending edits in the workspace being closed). The command sequences below omit the `--ignore-working-copy` flag for readability, but it is present on every non-snapshot call.
+Most `jj` commands ji runs as part of these operations — `jj squash`, `jj rebase`, `jj abandon`, `jj bookmark set`, `jj workspace forget`, `jj log` reads — pass `--ignore-working-copy`, so jj neither snapshots the working copy nor writes it out on each call. The deliberate exceptions are:
+
+- **Explicit `jj util snapshot` calls** that capture pending edits at defined points: the entry/gate snapshot of the involved workspaces, the [pre-execution protection snapshot](#pre-execution-protection-snapshot) of every workspace, the snapshot before `jj workspace forget`, and the target snapshot before each merge variant.
+- **Commands that must read or write the working copy live** (auto-snapshot inherent): the merge-commit creation in the source/target workspace, `jj workspace add`, `jj workspace update-stale`, and the live `jj status`/`jj log` staleness and safety probes.
+
+The command sequences below omit the `--ignore-working-copy` flag for readability; the authoritative classification of every call is the snapshot-policy census in `src/jujutsu.rs`.
+
+### Pre-execution protection snapshot
+
+Immediately before executing, every mutating operation (sync, close, transfer) re-lists the workspaces, verifies the involved source/target still resolve to the paths the plan was built against (aborting with "repo changed, please retry" on mismatch), and snapshots **every existing workspace** — third parties first in descendant-first order, the involved source/target last — so pending working-copy edits anywhere in the repo are captured before the operation can rebase (and thereby stale) them. A jj-stale third-party workspace is skipped (its edits belong to the `jj workspace update-stale` workflow); any other snapshot failure aborts the operation. Afterwards ji re-verifies that nothing but snapshots moved the operation log and that the re-detected plan is equivalent to the validated one; otherwise it aborts before mutating anything.
 
 ## Sync mode detection
 
@@ -62,7 +71,7 @@ The `SyncModeInfo` captures the repo's operation head at detection time. When th
 | `Diverged` | `merge` |
 | `InSync` | errors: `adaptive merge unavailable for current sync state` |
 
-**Adaptive close** (`ji close --method adaptive`):
+**Adaptive close** (`ji close <target> --method adaptive`):
 
 | Sync mode | Concrete method |
 |---|---|
@@ -88,7 +97,7 @@ ji sync [target] [--source <NAME>]
 | `TargetOnly` | fast-forward source to target's effective head, then step target forward |
 | `Diverged` | create a merge commit in the source workspace with both effective heads as parents, then step both workspaces forward past the merge |
 
-For the exact command sequences and diagrams, see the corresponding transfer methods ([fast-forward-target](#transfer-fast-forward-target), [fast-forward-source](#transfer-fast-forward-source), [merge](#transfer-merge)). `ji sync`'s fast-forward steps the *ahead* side forward after the behind side catches up, so neither workspace is left sitting on the other's `@`.
+For the command sequences and diagrams, see the corresponding transfer methods ([fast-forward-target](#transfer-fast-forward-target), [fast-forward-source](#transfer-fast-forward-source), [merge](#transfer-merge)). `ji sync`'s fast-forward steps the *ahead* side forward after the behind side catches up, so neither workspace is left sitting on the other's `@`.
 
 ---
 
@@ -288,12 +297,12 @@ See [adaptive resolution](#adaptive-resolution). Resolves to `fast-forward-targe
 
 ## Close methods
 
-`ji close` merges the source's work into the target and then forgets the source workspace.
+`ji close` integrates the source's work into the target (or, for `detach`/`abandon`, discards it) and then forgets the source workspace.
 
 ### Close: merge
 
 ```
-ji close [target] --method merge
+ji close <target> --method merge
 ```
 
 Forget the source, then create a merge commit in the target workspace whose parents are the two effective heads. Unlike `transfer --method merge`, there is no step-forward after the merge — the target's `@` is exactly the merge commit.
@@ -327,7 +336,7 @@ t@:  A → B → C  →  M
 ### Close: squash-merge
 
 ```
-ji close [target] --method squash-merge
+ji close <target> --method squash-merge
 ```
 
 Forget the source, squash its unique chain, then merge the squashed commit with the target. The target's `@` is the merge commit.
@@ -360,7 +369,7 @@ t@:  A → B → C → M
 ### Close: fast-forward
 
 ```
-ji close [target] --method fast-forward
+ji close <target> --method fast-forward
 ```
 
 Forget the source, then fast-forward the target to the source's effective head.
@@ -454,7 +463,7 @@ t@: A → B → C    (unchanged)
 ### Close: adaptive
 
 ```
-ji close [target] --method adaptive     # default
+ji close <target> --method adaptive     # default
 ```
 
 See [adaptive resolution](#adaptive-resolution). Resolves to `fast-forward` or `merge` based on the sync mode. `InSync` and `TargetOnly` are unavailable.
@@ -498,10 +507,10 @@ The **CLI** (`ji close`) always uses `NoAction` for non-singular bookmarks — t
 
 ### Staleness resolution
 
-Because ji runs most jj calls with `--ignore-working-copy` (see [the note above](#a-note-on---ignore-working-copy)), workspaces in the repository can end up stale when ji rewrites shared state without snapshotting them. Each operation does two things about this:
+Because ji runs most jj calls with `--ignore-working-copy` (see [the note above](#a-note-on---ignore-working-copy)), workspaces in the repository can end up stale when ji rewrites shared state. Pending edits are protected by the [pre-execution protection snapshot](#pre-execution-protection-snapshot); for the staleness itself, each operation does two things:
 
-1. **Update the workspaces it directly touched.** Transfer and sync call `jj workspace update-stale` on both source and target after the operation. Close variants that keep the target (`merge`, `squash-merge`, `fast-forward`) call it on the target only. Disposal variants (`detach`, `abandon`) don't call it — the source is being forgotten, and the target is unchanged.
-2. **Report workspaces that remain stale.** ji snapshots which workspaces were stale *before* the operation, then re-checks all workspaces *after*. Any workspace still stale at the end is reported:
+1. **Update the workspaces it directly touched.** Transfer and sync call `jj workspace update-stale` on both source and target after the operation. Close variants that keep the target (`merge`, `squash-merge`, `fast-forward`) call it on the target only. Disposal variants (`detach`, `abandon`) don't call it — the source is being forgotten, and the target is unchanged. Close and transfer additionally resolve third-party workspaces that the rewrite was predicted to stale — except workspaces that were already stale before the operation (those are left to the user's `update-stale` workflow).
+2. **Report workspaces that remain stale.** The pre-operation baseline is the set of workspaces the protection snapshot skipped as already stale; after the operation, all workspaces are re-checked. Any workspace still stale at the end is reported:
    - `(was already stale)` if it was stale before the operation started.
    - `(unexpected)` if it became stale as a side effect of this operation.
 

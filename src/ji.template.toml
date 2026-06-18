@@ -77,11 +77,6 @@
 #
 # [pre-start]
 # deps = "uv sync"
-# mcp = """
-# if [ -f .mcp.json ]; then
-#   sed -i '' "s|{{ default_workspace_path }}|{{ workspace_path }}|g" .mcp.json
-# fi
-# """
 #
 # [post-start]
 # server = "npm run dev"

@@ -10,13 +10,7 @@ includes:
     flatten: true
 
 vars:
-  # CARGO_HOME: '{{.HOME}}/.local/share/cargo'
   BIN_NAME: ji
-
-# env:
-#   CARGO_HOME: '{{.CARGO_HOME}}'
-#   RUSTUP_HOME: '{{.HOME}}/.local/share/rustup'
-#   PATH: '{{.CARGO_HOME}}/bin:{{.PATH}}'
 
 tasks:
 
@@ -67,8 +61,10 @@ tasks:
       - codesign -f -s - '{{.HOME}}/.local/bin/{{.BIN_NAME}}'
       - mkdir -p '{{.HOME}}/.local/share/man/man1'
       - cp target/man/{{.BIN_NAME}}.1 '{{.HOME}}/.local/share/man/man1/'
-      - '{{.HOME}}/.local/bin/{{.BIN_NAME}} config shell install fish'
-      - '{{.HOME}}/.local/bin/{{.BIN_NAME}} config shell install zsh'
+      # Shell integration for the active shell only — the install subcommand
+      # detects the shell that invoked it (falling back to $SHELL) when no shell
+      # is named. Install another shell manually with `ji config shell install <shell>`.
+      - '{{.HOME}}/.local/bin/{{.BIN_NAME}} config shell install'
 
   gen-man:
     desc: Generate the ji(1) man page (target/man/ji.1)
@@ -166,10 +162,10 @@ tasks:
       - ./target/debug/{{.BIN_NAME}} {{.CLI_ARGS}}
 
   ws:
-    desc: Run ji ws (workspace switcher)
+    desc: Launch the ji TUI workspace switcher
     deps: [build]
     cmds:
-      - ./target/debug/{{.BIN_NAME}} ws
+      - ./target/debug/{{.BIN_NAME}}
 
   # === DEVELOPMENT ===
 

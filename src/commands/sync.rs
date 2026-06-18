@@ -61,11 +61,34 @@ pub fn sync_with_info(
     repo_name: &str,
     author: Option<&str>,
 ) -> Result<operations::SyncOutcome> {
-    let (src_hi, tgt_hi) = super::validate_head_info(repo, info, src_name, tgt_name)?;
+    // Lenient validation: SyncModeInfo IS the complete sync plan, so an
+    // op-head move with a plan-equivalent re-detection may proceed (with the
+    // fresh info). Anything else bails.
+    let validated = super::validate_head_info(repo, info, src_name, tgt_name, true)?;
 
-    let outcome = operations::sync(
-        repo, src_name, src_path, &src_hi, tgt_name, tgt_path, &tgt_hi, author,
+    // Execution-time freshness + protection (all workspaces, fail-loud).
+    // Sync rewrites no interior revisions, but its required src/tgt
+    // snapshots and its own fast-forward/merge can rebase a third-party
+    // workspace whose `@` descends from src/tgt — the broad descendant-first
+    // snapshot captures those edits before they could be staled.
+    let fresh = super::prepare_execution_freshness(
+        repo, &validated, src_name, src_path, tgt_name, tgt_path, true, true, None,
     )?;
+    let validated = fresh.info;
+    let src_hi = validated.src_head_info();
+    let tgt_hi = validated.tgt_head_info();
+    let src = operations::WsRef {
+        name: src_name,
+        path: src_path,
+        info: &src_hi,
+    };
+    let tgt = operations::WsRef {
+        name: tgt_name,
+        path: tgt_path,
+        info: &tgt_hi,
+    };
+
+    let outcome = operations::sync(repo, src, tgt, author)?;
 
     if let operations::SyncOutcome::Done { mut warnings } = outcome {
         // Resolve the legitimate stale state created when each workspace's `@`
@@ -84,6 +107,9 @@ pub fn sync_with_info(
                 warnings.push(format!("{e:#}"));
             }
         }
+        // WC-behind report: third-party workspaces staled by the sync (no
+        // predicted-stale resolution — sync rewrites no interior revisions).
+        warnings.extend(super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped));
         return Ok(operations::SyncOutcome::Done { warnings });
     }
 

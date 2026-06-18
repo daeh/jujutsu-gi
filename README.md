@@ -1,27 +1,32 @@
 # ji — Jujutsu workspace manager
 
-`ji` is a convenience utility for managing [Jujutsu (`jj`)](https://jj-vcs.github.io) workspaces on macOS.
+`ji` is a convenience utility for managing [Jujutsu (jj)](https://jj-vcs.github.io) workspaces. (_Workspaces_ are the jj equivalent of git _worktrees_.)
 
-_Workspaces_ are the `jj` equivalent of `git` _worktrees_. `ji` creates, switches, syncs, merges, and cleans up workspaces.
-
+`ji` creates, switches, syncs, merges, and cleans up workspaces. It includes:
 - An interactive TUI workspace switcher with a live commit graph and one-key workspace operations
-- A non-interactive CLI exposing the same operations for scripts and agentic workflows
+- A non-interactive CLI exposing the same core workspace operations for scripts and agentic workflows
 - Per-project configuration: workspace-path templates, pre/post-start hooks, and file templates
-- Graph-aware sync that picks a strategy — fast-forward, merge, rebase, or squash — to fit how the workspaces relate
+- Graph-aware operations that adapt to how the workspaces relate — auto-selecting fast-forward or merge, with rebase, squash, and other methods available explicitly
 - One-shot undo/redo of `ji` actions, via `ji`-managed bulk operations in the `jj op log`
 
+Currently, only macOS is fully supported, but cross-platform support is on the roadmap.
+
 > [!NOTE]
-> Jujutsu Gi — **j**(j-g)**i** — a lightweight wrapper (gi) for jj.
+> `ji` is a lightweight wrapper (a *gi*) for jujutsu. `ji` is a contraction of ***j***(j-g)***i***.
+
 
 ## A handrail for learning jj
 
-Every `ji` operation is a short sequence of `jj` commands. The TUI close/transfer dialog shows the exact commands it will run *before* you confirm (and the dialog's `c` key copies them to the clipboard). If you are still building intuition for `jj`'s primitives, `ji` is a useful way to watch what fast-forward, merge, rebase, and squash look like as `jj` command sequences on real repository state.
+Every `ji` operation is a short sequence of jj commands. The TUI close/transfer dialog shows the jj command sequence it will run *before* you confirm (and the dialog's `c` key copies them to the clipboard). If you are still building intuition for jj's primitives, `ji` is a useful way to watch what fast-forward, merge, rebase, and squash look like as jj command sequences on real repository state.
 
 ## Requirements
 
-- [`jj`](https://jj-vcs.github.io) v0.40.0 or later
+- [jj](https://jj-vcs.github.io) v0.42.0 or later
 
 ## Install
+
+> [!NOTE]
+> Homebrew installation is planned for a future release
 
 ```sh
 cargo build --release && cp target/release/ji ~/.local/bin/ && codesign -f -s - ~/.local/bin/ji
@@ -45,16 +50,16 @@ ji --version
 ji config shell install
 ```
 
-This installs a wrapper function for zsh, bash, or fish (depending on `$SHELL`) and wires it into your shell startup. The wrapper lets `ji` change the current shell's working directory when you switch workspaces — a child process cannot do that on its own.
+This installs a wrapper function for zsh, bash, or fish (detected from the shell you ran it in). For zsh and bash it adds a sourcing line to your shell startup; for fish it installs an autoloaded function (no startup-file edit). The wrapper lets `ji` change the current shell's working directory when you switch workspaces — a child process cannot do that on its own.
 
-See [`docs/shell-integration.md`](docs/shell-integration.md) for the exact files touched, the mechanism, and manual installation.
+See [`docs/shell-integration.md`](docs/shell-integration.md) for the files it touches, the mechanism, and manual installation.
 
 ## First use
 
 ```sh
-cd /path/to/your/jj-repo
-ji init        # generate .config/ji.toml
-ji             # launch the TUI
+cd /path/to/your/jj-repo/
+ji init                    # generate .config/ji.toml
+ji                         # launch the TUI
 ```
 
 The TUI shows a workspace list on the left and the commit graph on the right. Press `Enter` to switch to a workspace, `n` to create a new one, `?` for the in-app help, and `q` to quit.
@@ -62,16 +67,16 @@ The TUI shows a workspace list on the left and the commit graph on the right. Pr
 ## CLI
 
 ```
-ji                              launch the TUI
-ji switch <target>              switch to a workspace (by name, bookmark, or change ID)
-ji new <bookmark>               create a new workspace
-ji close [target]               close a workspace into a target
-ji transfer [target]            transfer changes between workspaces (both stay open)
-ji sync [target]                sync two workspaces
-ji ls                           list workspaces
-ji init                         generate .config/ji.toml
-ji config shell install [SHELL] install shell integration
-ji config shell init    [SHELL] print shell integration to stdout
+ji                               # launch the TUI
+ji switch <target>               # switch to a workspace (by name, bookmark, or change ID)
+ji new <bookmark>                # create a new workspace
+ji close [target]                # close a workspace into a target
+ji transfer [target]             # transfer changes between workspaces (both stay open)
+ji sync [target]                 # sync two workspaces
+ji ls                            # list workspaces
+ji init                          # generate .config/ji.toml
+ji config shell install [SHELL]  # install shell integration
+ji config shell init    [SHELL]  # print shell integration to stdout
 ```
 
 Every command accepts `--help`. Full flag reference and behavior: [`docs/cli.md`](docs/cli.md).
@@ -92,6 +97,8 @@ ji sync [target] [--source <NAME>]
 ```
 
 `ji sync` has no `--method` flag — it always resolves the two workspaces with whichever strategy fits the sync state (fast-forward if one side is behind, merge if diverged).
+
+`ji close` needs a target for the non-disposal methods (`adaptive`, `merge`, `squash-merge`, `fast-forward`): pass a positional `target`, or use `--source <NAME>` (which closes that source into `default@`). A bare `ji close` errors. The disposal methods `detach` and `abandon` take no target.
 
 Operations, diagrams, and when to use each method: [`docs/operations.md`](docs/operations.md).
 
@@ -158,7 +165,3 @@ Full field reference, template variables, and hook semantics: [`docs/configurati
 ## License
 
 MIT
-
-## Acknowledgements
-
-Inspired by [worktrunk](https://github.com/max-sixty/worktrunk), a utility for managing git worktrees.

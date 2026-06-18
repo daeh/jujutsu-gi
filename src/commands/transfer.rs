@@ -16,8 +16,6 @@ pub struct TransferParams<'a> {
     pub workspace_path_template: &'a str,
     pub repo_name: &'a str,
     pub author: Option<&'a str>,
-    /// All workspace (name, path) pairs for staleness tracking.
-    pub all_ws_paths: &'a [(String, PathBuf)],
 }
 
 /// Owned-data mirror of `TransferParams` for the deferred-handoff path
@@ -32,7 +30,6 @@ pub struct TransferParamsOwned {
     pub workspace_path_template: String,
     pub repo_name: String,
     pub author: Option<String>,
-    pub all_ws_paths: Vec<(String, PathBuf)>,
 }
 
 /// Execute transfer, computing sync info fresh.
@@ -59,22 +56,50 @@ pub fn transfer_with_info(
         TransferMethod::MergeSquash => Operation::MergeSquash,
     };
 
-    let (src_hi, tgt_hi) =
-        super::validate_head_info(repo, info, params.source_name, params.target_name)?;
+    // Strict validation: the transfer plan spans more than SyncModeInfo
+    // (target entries, selected method semantics), so any op-head movement
+    // since `info` was computed bails. Heads AND lca come from the
+    // validated info — never from the possibly stale `info`.
+    let validated =
+        super::validate_head_info(repo, info, params.source_name, params.target_name, false)?;
 
-    // Predict which third-party workspaces will become stale (pre-op query).
+    // Execution-time freshness + protection (all workspaces, fail-loud):
+    // broad descendant-first snapshot + snapshot-only revalidation.
+    let fresh = super::prepare_execution_freshness(
+        repo,
+        &validated,
+        params.source_name,
+        params.source_path,
+        params.target_name,
+        params.target_path,
+        true,
+        true,
+        None,
+    )?;
+    let validated = fresh.info;
+    let src_hi = validated.src_head_info();
+    let tgt_hi = validated.tgt_head_info();
+    let src = operations::WsRef {
+        name: params.source_name,
+        path: params.source_path,
+        info: &src_hi,
+    };
+    let tgt = operations::WsRef {
+        name: params.target_name,
+        path: params.target_path,
+        info: &tgt_hi,
+    };
+
+    // Predict which third-party workspaces will become stale (post-phase,
+    // pre-op query; reporting/resolution only — edit survival is already
+    // covered by the protection snapshot above).
     let predicted_stale = super::predict_stale_workspaces(
         repo,
         operation,
-        info,
+        &validated,
         &[],
-        params.source_name,
-        params.target_name,
+        &[params.source_name, params.target_name],
     );
-    super::snapshot_predicted_stale(&predicted_stale, params.all_ws_paths);
-
-    // Staleness snapshot.
-    let pre_stale: Vec<String> = jujutsu::stale_workspace_names(params.all_ws_paths);
 
     // Warnings from non-critical cleanup during operations.
     let mut op_warnings: Vec<String> = Vec::new();
@@ -99,11 +124,9 @@ pub fn transfer_with_info(
             }
             op_warnings = operations::fast_forward(
                 repo,
-                params.target_name,
-                params.target_path,
-                tgt_hi.trivial_id.as_deref(),
-                params.source_name,
-                &src_hi.effective_head,
+                tgt,
+                src.name,
+                &src.info.effective_head,
                 params.author,
             )?;
             // Step source forward so both have fresh @.
@@ -131,11 +154,9 @@ pub fn transfer_with_info(
             }
             op_warnings = operations::fast_forward(
                 repo,
-                params.source_name,
-                params.source_path,
-                src_hi.trivial_id.as_deref(),
-                params.target_name,
-                &tgt_hi.effective_head,
+                src,
+                tgt.name,
+                &tgt.info.effective_head,
                 params.author,
             )?;
             // Step target forward so both have fresh @.
@@ -148,52 +169,16 @@ pub fn transfer_with_info(
             );
         }
         Operation::Merge => {
-            op_warnings = operations::merge(
-                repo,
-                params.source_name,
-                params.source_path,
-                &src_hi,
-                params.target_name,
-                params.target_path,
-                &tgt_hi,
-                params.author,
-            )?;
+            op_warnings = operations::merge(repo, src, tgt, params.author)?;
         }
         Operation::MergeAbandonOld => {
-            op_warnings = operations::merge_abandon_parents_old(
-                repo,
-                params.source_name,
-                params.source_path,
-                &src_hi,
-                params.target_name,
-                params.target_path,
-                &tgt_hi,
-                params.author,
-            )?;
+            op_warnings = operations::merge_abandon_parents_old(repo, src, tgt, params.author)?;
         }
         Operation::Rebase => {
-            operations::rebase(
-                repo,
-                &src_hi,
-                params.target_name,
-                params.target_path,
-                &tgt_hi,
-                &info.lca,
-                params.author,
-            )?;
+            operations::rebase(repo, src.info, tgt, &validated.lca, params.author)?;
         }
         Operation::MergeSquash => {
-            op_warnings = operations::merge_squash(
-                repo,
-                params.source_name,
-                params.source_path,
-                &src_hi,
-                params.target_name,
-                params.target_path,
-                &tgt_hi,
-                &info.lca,
-                params.author,
-            )?;
+            op_warnings = operations::merge_squash(repo, src, tgt, &validated.lca, params.author)?;
         }
         _ => bail!("unexpected operation for transfer: {operation:?}"),
     }
@@ -203,10 +188,17 @@ pub fn transfer_with_info(
     // against jj 0.41's reduced sibling-op false positives (#9314).
     let _ = jujutsu::update_workspace_stale(params.source_path);
     let _ = jujutsu::update_workspace_stale(params.target_path);
-    super::resolve_predicted_stale(&predicted_stale, params.all_ws_paths);
+    // Resolve predicted third-party stale workspaces — excluding any that
+    // were already stale pre-op (the protection phase's skip-set).
+    let to_resolve: Vec<String> = predicted_stale
+        .iter()
+        .filter(|n| !fresh.stale_skipped.contains(n))
+        .cloned()
+        .collect();
+    super::resolve_predicted_stale(&to_resolve, &fresh.ws_paths);
 
     // Post-op: staleness warnings + operation warnings.
-    let mut stale_warnings = super::post_op_stale(params.all_ws_paths, &pre_stale);
+    let mut stale_warnings = super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped);
     stale_warnings.extend(op_warnings);
 
     // Post-op: singular bookmarks (both survive → advance both to effective head).
@@ -215,7 +207,7 @@ pub fn transfer_with_info(
         operation,
         params.source_name,
         params.target_name,
-        Some(info),
+        Some(&validated),
         params.workspace_path_template,
         params.repo_name,
         Vec::new(),
@@ -224,10 +216,8 @@ pub fn transfer_with_info(
     stale_warnings.extend(bm_result.warnings);
 
     Ok(CloseTransferResult {
-        operation_used: operation,
         stale_warnings,
         predicted_stale,
-        source_forgotten: false,
         pending_remove_path: None,
     })
 }
