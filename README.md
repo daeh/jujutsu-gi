@@ -25,24 +25,34 @@ Every `ji` operation is a short sequence of jj commands. The TUI close/transfer 
 
 ## Install
 
-> [!NOTE]
-> Homebrew installation is planned for a future release
+```sh
+brew tap daeh/jujutsu-gi
+brew install ji
+```
+
+This builds `ji` from source (via Homebrew's `rust`) and installs `jj` as a dependency. macOS only. Enable the optional shell integration (see below), then verify in a new terminal:
+
+```sh
+ji --version
+```
+
+<details>
+<summary>Install without Homebrew</summary>
+
+Build and install the release binary directly:
 
 ```sh
 cargo build --release && cp target/release/ji ~/.local/bin/ && codesign -f -s - ~/.local/bin/ji
 ```
 
-This builds the release binary, copies it to `~/.local/bin/ji`, and codesigns it. Or install with cargo directly from the repository:
+Or install with cargo from the repository:
 
 ```sh
 cargo install --git https://github.com/daeh/jujutsu-gi ji
 ```
 
-Make sure `~/.local/bin` (or `~/.cargo/bin`) is on your `PATH`, then verify the installation in a new terminal:
-
-```sh
-ji --version
-```
+Make sure `~/.local/bin` (or `~/.cargo/bin`) is on your `PATH`.
+</details>
 
 ## Shell integration
 

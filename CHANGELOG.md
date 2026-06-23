@@ -1,6 +1,11 @@
 # Changelog
 
 
+## 0.1.2
+
+### Added
+
+- Homebrew installation path.
 
 ## 0.1.1
 
@@ -16,6 +21,14 @@
 ## 0.1.0
 
 Initial public release.
+
+## [0.1.2] - 2026-06-23
+
+### Changed
+
+- publish: harden Homebrew release flow (adversarial-review fixes)
+- publish: add Homebrew tap install path (daeh/jujutsu-gi/ji)
+- update publish pipeline
 
 ## [0.1.1] - 2026-06-12
 

@@ -10,6 +10,23 @@ macOS only. ji uses macOS-specific behavior (codesigning on install, clipboard a
 - **Rust toolchain** (edition 2024). The repository's `rust-toolchain.toml` selects the stable channel (with `clippy` and `rustfmt`); `rustup` installs it automatically on first build.
 - **[Task](https://taskfile.dev)** (recommended). Every build and maintenance command in this project is a Task target.
 
+The prerequisites above are for a from-source build. **Homebrew** (below) installs `ji` and its `jj` dependency for you and needs none of them.
+
+## Install with Homebrew (recommended)
+
+```sh
+brew tap daeh/jujutsu-gi
+brew install ji
+```
+
+Homebrew builds `ji` from source (using its own `rust`) and installs `jj` as a runtime dependency. After installing, enable the shell integration (see below) and verify:
+
+```sh
+ji --version
+```
+
+To upgrade later: `brew update && brew upgrade ji`.
+
 ## Build and install
 
 ```sh
@@ -48,7 +65,17 @@ Pull the latest source and re-run `task release`. The build is incremental. To f
 
 ## Uninstall
 
-Remove the shell integration first, then the binary:
+Remove the shell integration first, then the binary.
+
+If you installed with Homebrew:
+
+```sh
+ji config shell uninstall   # only if you enabled it
+brew uninstall ji
+brew untap daeh/jujutsu-gi
+```
+
+If you built from source:
 
 ```sh
 ji config shell uninstall
