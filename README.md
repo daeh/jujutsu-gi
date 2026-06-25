@@ -27,10 +27,11 @@ Every `ji` operation is a short sequence of jj commands. The TUI close/transfer 
 
 ```sh
 brew tap daeh/jujutsu-gi
-brew install ji
+brew trust --formula daeh/jujutsu-gi/ji
+brew install ji && ji config shell install
 ```
 
-This builds `ji` from source (via Homebrew's `rust`) and installs `jj` as a dependency. macOS only. Enable the optional shell integration (see below), then verify in a new terminal:
+This builds `ji` from source (via Homebrew's `rust`) and installs `jj` as a dependency. macOS only. `ji config shell install` adds the wrapper that lets `ji` change your shell's directory on switch (see below). Verify in a new terminal:
 
 ```sh
 ji --version
@@ -60,7 +61,7 @@ Make sure `~/.local/bin` (or `~/.cargo/bin`) is on your `PATH`.
 ji config shell install
 ```
 
-This installs a wrapper function for zsh, bash, or fish (detected from the shell you ran it in). For zsh and bash it adds a sourcing line to your shell startup; for fish it installs an autoloaded function (no startup-file edit). The wrapper lets `ji` change the current shell's working directory when you switch workspaces — a child process cannot do that on its own.
+This installs a wrapper function for zsh, bash, or fish (detected from the shell you ran it in). For zsh and bash it adds a sourcing line to your shell startup; for fish it installs an autoloaded function (no startup-file edit). The wrapper lets `ji` change the current shell's working directory when you switch workspaces. It previews what it will change and prompts before writing (`--yes` skips the prompt).
 
 See [`docs/shell-integration.md`](docs/shell-integration.md) for the files it touches, the mechanism, and manual installation.
 

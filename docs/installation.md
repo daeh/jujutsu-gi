@@ -16,10 +16,10 @@ The prerequisites above are for a from-source build. **Homebrew** (below) instal
 
 ```sh
 brew tap daeh/jujutsu-gi
-brew install ji
+brew install ji && ji config shell install
 ```
 
-Homebrew builds `ji` from source (using its own `rust`) and installs `jj` as a runtime dependency. After installing, enable the shell integration (see below) and verify:
+Homebrew builds `ji` from source (using its own `rust`) and installs `jj` as a runtime dependency. `ji config shell install` adds the wrapper that lets `ji` change your shell's directory on switch (see below). Verify:
 
 ```sh
 ji --version

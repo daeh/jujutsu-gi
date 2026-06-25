@@ -288,17 +288,364 @@ pub fn detect_shell() -> Result<String> {
     decide(active, std::env::var("SHELL").ok().as_deref())
 }
 
-pub fn write_directive_cd(path: &Path) -> Result<()> {
-    let directive_file = std::env::var("JI_DIRECTIVE_FILE")
-        .context("JI_DIRECTIVE_FILE not set — did you run `ji config shell install`?")?;
-    if directive_file.is_empty() {
-        return Ok(());
+// =====================================================================
+// Parent-shell cd directive + reason-aware diagnosis
+//
+// `ji` changes the parent shell's directory only when its wrapper is active
+// (the wrapper exports `JI_DIRECTIVE_FILE` and sources what we write). When the
+// wrapper is NOT active we can't cd, so instead of crashing we diagnose WHY and
+// print a terse, reason-specific note. Diagnosis (process-tree walk + filesystem
+// probes) runs ONLY on the cd-unavailable path — never on the wrapped happy path.
+// =====================================================================
+
+/// Why `ji` could not change the parent shell's directory.
+#[derive(Debug, Clone)]
+enum CdUnavailable {
+    /// Nothing on disk for the active shell → install.
+    NotInstalled,
+    /// Present but the on-disk wrapper isn't exactly what ji ships (drift /
+    /// cross-file / shadow / unresolved) → reinstall or remove the conflict.
+    NeedsRefresh,
+    /// Exact working wrapper on disk, just not active for this invocation.
+    InstalledInactive,
+    /// Invoked via an explicit path; the wrapper only wraps bare `ji`.
+    RanByPath,
+    /// The active shell isn't one ji supports.
+    UnsupportedShell(String),
+}
+
+enum CdRequest {
+    /// Wrapper active; directive written, parent shell will cd.
+    Directed,
+    /// Wrapper not active; carries the diagnosed reason.
+    Unavailable(CdUnavailable),
+}
+
+/// Marker error: a *switch*/rescue did its repo-side work but couldn't cd the
+/// parent shell. The caller already printed guidance, so `main` maps this to a
+/// quiet non-zero exit (no `Error:` line). Empty `Display` on purpose.
+#[derive(Debug)]
+struct CdNotApplied;
+
+impl std::fmt::Display for CdNotApplied {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
     }
-    let escaped = path.display().to_string().replace('\'', "'\\''");
-    let cmd = format!("cd '{escaped}'\n");
-    std::fs::write(&directive_file, cmd)
-        .with_context(|| format!("failed to write directive to {directive_file}"))?;
-    Ok(())
+}
+impl std::error::Error for CdNotApplied {}
+
+/// True when `e` is the [`CdNotApplied`] marker — used by `main` to exit non-zero
+/// quietly (the human-readable note was already printed to stderr).
+pub fn is_cd_not_applied(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<CdNotApplied>().is_some()
+}
+
+/// POSIX single-quote a path for a `cd` command line (safe for spaces/quotes).
+/// Shared by the directive writer and the rescue/unavailable notes.
+fn sq(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// Write a `cd` directive for the parent-shell wrapper, or diagnose why we can't.
+/// `Err` is reserved for a genuine directive-file write failure (wrapper active
+/// but the write fails) — distinct from `Unavailable` (wrapper not active).
+fn request_cd(path: &Path) -> Result<CdRequest> {
+    match std::env::var("JI_DIRECTIVE_FILE") {
+        Ok(f) if !f.is_empty() => {
+            std::fs::write(&f, format!("cd {}\n", sq(path)))
+                .with_context(|| format!("failed to write directive to {f}"))?;
+            Ok(CdRequest::Directed)
+        }
+        // Unset OR empty → can't cd. (Empty is an abnormal/broken directive; diagnose
+        // it like the unset case rather than silently exiting 0.)
+        _ => Ok(CdRequest::Unavailable(diagnose_cd_unavailable())),
+    }
+}
+
+/// How close the on-disk wrapper is to what `ji` would install right now.
+/// Only `Working` (byte-exact + nothing shadowing/conflicting) justifies a
+/// "restart" hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperState {
+    Working,
+    Drift,
+    Absent,
+}
+
+fn diagnose_cd_unavailable() -> CdUnavailable {
+    let report = detect_active_report();
+    let action = status_action(&report);
+    let state = match (&action, ShellEnv::from_process_env().ok()) {
+        (StatusAction::Inspect(sh), Some(env)) => wrapper_state(&env, sh),
+        _ => WrapperState::Absent,
+    };
+    cd_reason(
+        &action,
+        &report.detected,
+        report.shell_env_raw.as_deref(),
+        state,
+        invoked_by_path(),
+    )
+}
+
+/// Pure decision core (mirrors the `decide`/`status_action` test pattern).
+fn cd_reason(
+    action: &StatusAction,
+    detected: &Detection,
+    env_shell: Option<&str>,
+    state: WrapperState,
+    by_path: bool,
+) -> CdUnavailable {
+    match action {
+        StatusAction::ReportOnly => {
+            // Mirror detect_shell/decide's $SHELL fallback: prefer the process-tree
+            // unsupported name, else an unsupported $SHELL.
+            let unsupported = match detected {
+                Detection::Unsupported(name) => Some(name.clone()),
+                _ => env_shell
+                    .and_then(shell_basename)
+                    .and_then(|b| match classify(&b) {
+                        Class::Unsupported(n) => Some(n),
+                        _ => None,
+                    }),
+            };
+            unsupported.map_or(CdUnavailable::NotInstalled, CdUnavailable::UnsupportedShell)
+        }
+        StatusAction::Inspect(_) => match state {
+            WrapperState::Absent => CdUnavailable::NotInstalled,
+            WrapperState::Drift => CdUnavailable::NeedsRefresh,
+            WrapperState::Working if by_path => CdUnavailable::RanByPath,
+            WrapperState::Working => CdUnavailable::InstalledInactive,
+        },
+    }
+}
+
+/// Pure core: argv[0] contains '/'. Bare `ji` (PATH lookup or `command ji`)
+/// yields just `ji`; `./ji` or `/usr/local/bin/ji` contain '/'.
+fn invoked_by_path_arg(arg0: &std::ffi::OsStr) -> bool {
+    arg0.to_string_lossy().contains('/')
+}
+fn invoked_by_path() -> bool {
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .map(invoked_by_path_arg)
+        .unwrap_or(false)
+}
+
+/// Is a *working* wrapper installed for `shell`? Only an exact canonical install
+/// with nothing shadowing/conflicting counts as `Working`; a scan failure is
+/// indeterminate → `Drift` (never falsely "restart"). Reuses the same
+/// comparators (`state_for`, `rc_stanza_status`, `find_hits`) that `status` uses.
+fn wrapper_state(env: &ShellEnv, shell: &str) -> WrapperState {
+    match shell {
+        "fish" => {
+            let exact = matches!(
+                state_for(&fish_primary(env), &render_fish_wrapper_body()),
+                "present"
+            );
+            let shadow = fish_shadow_path(env).exists();
+            let Ok(hits) = find_hits(&scan_locations(env, "fish", &fish_primary(env)), env) else {
+                return WrapperState::Drift;
+            };
+            let any_hit = hits.iter().any(|h| {
+                matches!(
+                    h.kind,
+                    HitKind::MarkerBlock { .. }
+                        | HitKind::Legacy
+                        | HitKind::MalformedMarker
+                        | HitKind::UnresolvedSource(_)
+                )
+            });
+            if exact && !shadow && !any_hit {
+                WrapperState::Working
+            } else if fish_primary(env).exists() || shadow || any_hit {
+                WrapperState::Drift
+            } else {
+                WrapperState::Absent
+            }
+        }
+        "zsh" | "bash" => {
+            use clap::CommandFactory;
+            let mut cmd = crate::cli::Cli::command();
+            let primary = if shell == "zsh" {
+                zsh_primary(env)
+            } else {
+                bash_primary(env)
+            };
+            let Ok(body) = render_managed_body(shell, &mut cmd) else {
+                return WrapperState::Drift;
+            };
+            let Ok(stanza) = render_rc_stanza(shell) else {
+                return WrapperState::Drift;
+            };
+            let managed_exact = matches!(
+                state_for(&env.managed_file(shell).unwrap_or_default(), &body),
+                "present"
+            );
+            let stanza_exact = rc_stanza_status(&primary, &stanza) == TriState::Present;
+            let Ok(hits) = find_hits(&scan_locations(env, shell, &primary), env) else {
+                return WrapperState::Drift;
+            };
+            // Working requires EXACTLY the canonical install and nothing else: a single hit
+            // that is the primary rc's marker block. Duplicate primary blocks, or any
+            // cross-file/legacy/malformed/unresolved hit ⇒ not canonical (review fix).
+            let canonical_only = hits.len() == 1
+                && hits[0].path == primary
+                && matches!(hits[0].kind, HitKind::MarkerBlock { .. });
+            let any_integration = hits.iter().any(|h| {
+                matches!(
+                    h.kind,
+                    HitKind::MarkerBlock { .. }
+                        | HitKind::Legacy
+                        | HitKind::MalformedMarker
+                        | HitKind::UnresolvedSource(_)
+                )
+            });
+            if managed_exact && stanza_exact && canonical_only {
+                WrapperState::Working
+            } else if env.managed_file(shell).map(|m| m.exists()).unwrap_or(false)
+                || any_integration
+            {
+                WrapperState::Drift
+            } else {
+                WrapperState::Absent
+            }
+        }
+        _ => WrapperState::Absent,
+    }
+}
+
+/// Per-reason "how to make auto-cd work" line. Shared by the switch/follow-up
+/// note and the rescue message's subordinate secondary line.
+fn cd_reason_advice(reason: &CdUnavailable) -> String {
+    match reason {
+        CdUnavailable::NotInstalled => "enable auto-cd with: ji config shell install".into(),
+        CdUnavailable::NeedsRefresh => {
+            "shell integration on disk doesn't match ji — inspect with: ji config shell status, \
+             then reinstall or remove the conflicting entry"
+                .into()
+        }
+        CdUnavailable::InstalledInactive => {
+            "shell integration is installed but wasn't active for this command — open a new shell, \
+             or run `ji` directly (not via `command ji`/a path)"
+                .into()
+        }
+        CdUnavailable::RanByPath => {
+            "invoke `ji` as a bare command — the shell wrapper only wraps `ji`".into()
+        }
+        CdUnavailable::UnsupportedShell(n) => {
+            format!("auto-cd isn't supported for {n} (supported: {SUPPORTED_SHELLS})")
+        }
+    }
+}
+
+fn warn_cd_unavailable(reason: &CdUnavailable, target: &Path) {
+    eprintln!("(ji)::cd did not change directory to {}", sq(target));
+    eprintln!("(ji)::cd {}", cd_reason_advice(reason));
+}
+
+/// The cd policy for a call site, and the outcome the policy maps a request to.
+enum Policy {
+    /// cd is the operation (switch) → non-zero on unavailable.
+    Switch,
+    /// cd is incidental to a succeeded op (`new`) → exit 0.
+    Followup,
+    /// post-close: rescue iff the cwd no longer exists.
+    Close { origin_exists: bool },
+}
+enum CdAction {
+    Done,
+    Warn(CdUnavailable),
+    WarnNonzero(CdUnavailable),
+    Rescue(CdUnavailable),
+}
+
+/// PURE decision core: request + policy → outcome (no I/O). Unit-tested.
+fn decide_cd(req: &CdRequest, policy: Policy) -> CdAction {
+    match req {
+        CdRequest::Directed => CdAction::Done,
+        CdRequest::Unavailable(r) => match policy {
+            Policy::Switch => CdAction::WarnNonzero(r.clone()),
+            Policy::Followup => CdAction::Warn(r.clone()),
+            Policy::Close {
+                origin_exists: true,
+            } => CdAction::Warn(r.clone()),
+            Policy::Close {
+                origin_exists: false,
+            } => CdAction::Rescue(r.clone()),
+        },
+    }
+}
+
+/// Thin I/O wrapper: render the decided action (printing + exit marker).
+fn perform_cd(action: CdAction, safety: &Path) -> Result<()> {
+    match action {
+        CdAction::Done => Ok(()),
+        CdAction::Warn(r) => {
+            warn_cd_unavailable(&r, safety);
+            Ok(())
+        }
+        CdAction::WarnNonzero(r) => {
+            warn_cd_unavailable(&r, safety);
+            Err(CdNotApplied.into())
+        }
+        // Rescue NEVER uses the generic `warn_cd_unavailable`: it LEADS with the escape,
+        // and the reason-advice is a strictly subordinate secondary line.
+        CdAction::Rescue(r) => {
+            eprintln!(
+                "(ji)::cd current directory was removed — run: cd {}",
+                sq(safety)
+            );
+            eprintln!("(ji)::cd {}", cd_reason_advice(&r));
+            Err(CdNotApplied.into())
+        }
+    }
+}
+
+/// (1) Switch cd: cd *is* the op. Unavailable → reason note + quiet non-zero.
+pub fn apply_switch_cd(path: &Path) -> Result<()> {
+    perform_cd(decide_cd(&request_cd(path)?, Policy::Switch), path)
+}
+
+/// (2) Follow-up cd: op succeeded, shell dir still valid (CLI `ji new`). A
+/// wrapper-inactive cannot-cd prints the note and exits 0; a genuine directive
+/// I/O error still propagates (don't swallow disk/permission failures).
+pub fn apply_followup_cd(path: &Path) -> Result<()> {
+    perform_cd(decide_cd(&request_cd(path)?, Policy::Followup), path)
+}
+
+/// (3) Post-close cd: the user's workspace was closed; land them at `safety`
+/// (repo root). `origin` is the actual launch cwd (may be a subdirectory), so
+/// rescue is keyed to whether `origin` itself still exists. `origin` is probed
+/// ONLY when the cd didn't happen — no filesystem cost on the wrapped happy path.
+pub fn apply_close_cd(origin: &Path, safety: &Path) -> Result<()> {
+    match request_cd(safety) {
+        Ok(CdRequest::Directed) => Ok(()),
+        Ok(CdRequest::Unavailable(r)) => {
+            // `try_exists()` not `exists()`: the latter reports false on a metadata
+            // error; treat Err as "still here" (benign) so we never falsely shout.
+            let origin_exists = origin.try_exists().unwrap_or(true);
+            perform_cd(
+                decide_cd(&CdRequest::Unavailable(r), Policy::Close { origin_exists }),
+                safety,
+            )
+        }
+        Err(e) => {
+            // Rescue guarantee: if the cwd is gone AND the directive write failed, still
+            // LEAD with the loud escape — never a bare anyhow dump.
+            if origin.try_exists().unwrap_or(true) {
+                Err(e)
+            } else {
+                eprintln!(
+                    "(ji)::cd current directory was removed — run: cd {}",
+                    sq(safety)
+                );
+                eprintln!("(ji)::cd (could not write cd directive: {e})");
+                Err(CdNotApplied.into())
+            }
+        }
+    }
 }
 
 // =====================================================================
@@ -359,6 +706,10 @@ impl ShellEnv {
 pub struct InstallOpts {
     pub dry_run: bool,
     pub force: bool,
+    /// Show a preview and prompt `[y/N/?]` before writing. Decided at the CLI
+    /// boundary (`!yes && stdin().is_terminal()`); defaults false so the library
+    /// `install()` is non-interactive (never reads stdin).
+    pub interactive: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1203,6 +1554,65 @@ pub fn install(
     }
 }
 
+enum Confirm {
+    Yes,
+    No,
+    Reshow,
+}
+
+/// Pure: parse a `[y/N/?]` reply. `?` re-shows the preview; anything else
+/// (including empty / `n`) declines.
+fn parse_confirm(s: &str) -> Confirm {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Confirm::Yes,
+        "?" => Confirm::Reshow,
+        _ => Confirm::No,
+    }
+}
+
+/// Drives the confirm loop over injected IO (so it's unit-testable). `read_line`
+/// returns `None` on EOF. Only called when interactive — no TTY check here.
+fn confirm_core(
+    mut read_line: impl FnMut() -> std::io::Result<Option<String>>,
+    mut prompt: impl FnMut() -> std::io::Result<()>,
+    mut preview: impl FnMut(),
+) -> std::io::Result<bool> {
+    preview();
+    loop {
+        prompt()?;
+        match read_line()? {
+            None => return Ok(false), // EOF → decline
+            Some(s) => match parse_confirm(&s) {
+                Confirm::Yes => return Ok(true),
+                Confirm::No => return Ok(false),
+                Confirm::Reshow => preview(),
+            },
+        }
+    }
+}
+
+/// Live wrapper binding stdin/stderr into `confirm_core` (called only when
+/// `opts.interactive` and there's a change to confirm).
+fn confirm_install(preview: impl Fn()) -> Result<bool> {
+    use std::io::Write;
+    confirm_core(
+        || {
+            let mut l = String::new();
+            match std::io::stdin().read_line(&mut l)? {
+                0 => Ok(None),
+                _ => Ok(Some(l)),
+            }
+        },
+        || {
+            let mut e = std::io::stderr();
+            write!(e, "(ji)::shell apply these changes? [y/N/?] ")?;
+            e.flush()
+        },
+        preview,
+    )
+    .map_err(Into::into)
+}
+
 fn install_posix(
     env: &ShellEnv,
     shell: &str,
@@ -1341,13 +1751,32 @@ fn install_posix(
         append_block(&primary_contents, &stanza)
     };
 
+    // One diff-set, shared by dry-run and the interactive preview (no drift).
+    let diffs = [
+        (
+            managed_path.clone(),
+            existing_or_empty(&managed_path),
+            managed_body.clone(),
+        ),
+        (
+            primary.clone(),
+            primary_contents.clone(),
+            new_primary_contents.clone(),
+        ),
+    ];
+    let changed = diffs.iter().any(|(_, before, after)| before != after);
+    let show = || {
+        for (p, before, after) in &diffs {
+            print_dry_run_diff(p, before, after);
+        }
+    };
     if opts.dry_run {
-        print_dry_run_diff(
-            &managed_path,
-            &existing_or_empty(&managed_path),
-            &managed_body,
-        );
-        print_dry_run_diff(&primary, &primary_contents, &new_primary_contents);
+        show();
+        return Ok(());
+    }
+    // Skip the prompt when nothing would change (already up to date): no diff to confirm.
+    if opts.interactive && changed && !confirm_install(show)? {
+        eprintln!("(ji)::shell install cancelled");
         return Ok(());
     }
 
@@ -1472,13 +1901,30 @@ fn install_fish(env: &ShellEnv, cmd: &mut clap::Command, opts: InstallOpts) -> R
         }
     }
 
+    let diffs = [
+        (
+            primary.clone(),
+            existing_or_empty(&primary),
+            wrapper_body.clone(),
+        ),
+        (
+            completions.clone(),
+            existing_or_empty(&completions),
+            completion_body.clone(),
+        ),
+    ];
+    let changed = diffs.iter().any(|(_, before, after)| before != after);
+    let show = || {
+        for (p, before, after) in &diffs {
+            print_dry_run_diff(p, before, after);
+        }
+    };
     if opts.dry_run {
-        print_dry_run_diff(&primary, &existing_or_empty(&primary), &wrapper_body);
-        print_dry_run_diff(
-            &completions,
-            &existing_or_empty(&completions),
-            &completion_body,
-        );
+        show();
+        return Ok(());
+    }
+    if opts.interactive && changed && !confirm_install(show)? {
+        eprintln!("(ji)::shell install cancelled");
         return Ok(());
     }
 
@@ -1839,29 +2285,47 @@ fn state_for(path: &Path, desired: &str) -> &'static str {
     }
 }
 
-fn rc_stanza_state(rc: &Path, stanza: &str) -> String {
+/// Whether the rc's ji marker block exactly matches the canonical `stanza`.
+/// Shared comparator for `status` (formatted below) and cd diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriState {
+    Present,
+    Drift,
+    Absent,
+    Unreadable,
+}
+
+fn rc_stanza_status(rc: &Path, stanza: &str) -> TriState {
     if !rc.is_file() {
-        return format!("{} (absent)", rc.display());
+        return TriState::Absent;
     }
     let contents = match std::fs::read_to_string(rc) {
         Ok(s) => s,
-        Err(_) => return format!("{} (unreadable)", rc.display()),
+        Err(_) => return TriState::Unreadable,
     };
     let mut tmp = Vec::new();
     let ranges = find_marker_blocks(rc, &contents, &mut tmp, None);
     match ranges.first() {
-        None => format!("{} (absent)", rc.display()),
+        None => TriState::Absent,
         Some(range) => {
             let block = &contents[range.clone()];
-            let normalized_block = block.trim_end_matches('\n');
-            let normalized_stanza = stanza.trim_end_matches('\n');
-            if normalized_block == normalized_stanza {
-                format!("{} (present)", rc.display())
+            if block.trim_end_matches('\n') == stanza.trim_end_matches('\n') {
+                TriState::Present
             } else {
-                format!("{} (drift)", rc.display())
+                TriState::Drift
             }
         }
     }
+}
+
+fn rc_stanza_state(rc: &Path, stanza: &str) -> String {
+    let label = match rc_stanza_status(rc, stanza) {
+        TriState::Present => "present",
+        TriState::Drift => "drift",
+        TriState::Absent => "absent",
+        TriState::Unreadable => "unreadable",
+    };
+    format!("{} ({label})", rc.display())
 }
 
 fn display_canonical(p: &Path) -> String {
@@ -2141,5 +2605,320 @@ mod detection_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cd_tests {
+    use super::*;
+    use clap::CommandFactory;
+    use tempfile::TempDir;
+
+    fn env_for(tmp: &TempDir) -> ShellEnv {
+        let home = tmp.path().to_path_buf();
+        ShellEnv {
+            home: home.clone(),
+            xdg_config_home: home.join(".config"),
+            zdotdir: home,
+            zsh_custom: None,
+            omz_root: None,
+        }
+    }
+
+    // ---- sq quoting ----
+
+    #[test]
+    fn sq_quotes_spaces_and_single_quotes() {
+        assert_eq!(sq(Path::new("/a/b")), "'/a/b'");
+        assert_eq!(sq(Path::new("/a b/c")), "'/a b/c'");
+        assert_eq!(sq(Path::new("/a'b")), "'/a'\\''b'");
+    }
+
+    // ---- argv[0] explicit-path detection ----
+
+    #[test]
+    fn invoked_by_path_arg_detects_slash() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert!(!invoked_by_path_arg(OsStr::new("ji")));
+        assert!(invoked_by_path_arg(OsStr::new("./ji")));
+        assert!(invoked_by_path_arg(OsStr::new("/usr/local/bin/ji")));
+        assert!(invoked_by_path_arg(OsStr::from_bytes(b"/\xff/ji")));
+    }
+
+    // ---- [y/N/?] parsing + loop ----
+
+    #[test]
+    fn parse_confirm_cases() {
+        assert!(matches!(parse_confirm("y"), Confirm::Yes));
+        assert!(matches!(parse_confirm("Y\n"), Confirm::Yes));
+        assert!(matches!(parse_confirm("yes"), Confirm::Yes));
+        assert!(matches!(parse_confirm("?"), Confirm::Reshow));
+        assert!(matches!(parse_confirm(""), Confirm::No));
+        assert!(matches!(parse_confirm("n"), Confirm::No));
+        assert!(matches!(parse_confirm("garbage"), Confirm::No));
+    }
+
+    #[test]
+    fn confirm_core_eof_declines_after_one_prompt() {
+        let mut previews = 0;
+        let mut prompts = 0;
+        let r = confirm_core(
+            || Ok(None),
+            || {
+                prompts += 1;
+                Ok(())
+            },
+            || previews += 1,
+        )
+        .unwrap();
+        assert!(!r);
+        assert_eq!(previews, 1);
+        assert_eq!(prompts, 1);
+    }
+
+    #[test]
+    fn confirm_core_yes() {
+        let r = confirm_core(|| Ok(Some("y\n".into())), || Ok(()), || {}).unwrap();
+        assert!(r);
+    }
+
+    #[test]
+    fn confirm_core_reshow_then_no_previews_twice() {
+        let mut previews = 0;
+        let mut answers = ["?\n".to_string(), "n\n".to_string()].into_iter();
+        let r = confirm_core(|| Ok(answers.next()), || Ok(()), || previews += 1).unwrap();
+        assert!(!r);
+        assert_eq!(previews, 2); // initial + one reshow
+    }
+
+    // ---- cd_reason (pure) ----
+
+    #[test]
+    fn cd_reason_inspect_states() {
+        let inspect = StatusAction::Inspect("zsh".into());
+        let unknown = Detection::Unknown;
+        assert!(matches!(
+            cd_reason(&inspect, &unknown, None, WrapperState::Absent, false),
+            CdUnavailable::NotInstalled
+        ));
+        assert!(matches!(
+            cd_reason(&inspect, &unknown, None, WrapperState::Drift, false),
+            CdUnavailable::NeedsRefresh
+        ));
+        // "restart"-class advice is reachable ONLY from Working:
+        assert!(matches!(
+            cd_reason(&inspect, &unknown, None, WrapperState::Working, false),
+            CdUnavailable::InstalledInactive
+        ));
+        assert!(matches!(
+            cd_reason(&inspect, &unknown, None, WrapperState::Working, true),
+            CdUnavailable::RanByPath
+        ));
+    }
+
+    #[test]
+    fn cd_reason_unsupported_from_tree_or_env_shell() {
+        let report_only = StatusAction::ReportOnly;
+        assert!(matches!(
+            cd_reason(&report_only, &Detection::Unsupported("nu".into()), None, WrapperState::Absent, false),
+            CdUnavailable::UnsupportedShell(n) if n == "nu"
+        ));
+        // Unknown tree but $SHELL names an unsupported shell → UnsupportedShell.
+        assert!(matches!(
+            cd_reason(&report_only, &Detection::Unknown, Some("/usr/bin/nu"), WrapperState::Absent, false),
+            CdUnavailable::UnsupportedShell(n) if n == "nu"
+        ));
+        // Unknown tree, no usable $SHELL → NotInstalled.
+        assert!(matches!(
+            cd_reason(
+                &report_only,
+                &Detection::Unknown,
+                None,
+                WrapperState::Absent,
+                false
+            ),
+            CdUnavailable::NotInstalled
+        ));
+    }
+
+    // ---- decide_cd (pure exit-code/rescue policy) ----
+
+    #[test]
+    fn decide_cd_policies() {
+        let directed = CdRequest::Directed;
+        let unavail = CdRequest::Unavailable(CdUnavailable::NotInstalled);
+        assert!(matches!(
+            decide_cd(&directed, Policy::Switch),
+            CdAction::Done
+        ));
+        assert!(matches!(
+            decide_cd(&directed, Policy::Followup),
+            CdAction::Done
+        ));
+        assert!(matches!(
+            decide_cd(
+                &directed,
+                Policy::Close {
+                    origin_exists: false
+                }
+            ),
+            CdAction::Done
+        ));
+        assert!(matches!(
+            decide_cd(&unavail, Policy::Switch),
+            CdAction::WarnNonzero(_)
+        ));
+        assert!(matches!(
+            decide_cd(&unavail, Policy::Followup),
+            CdAction::Warn(_)
+        ));
+        assert!(matches!(
+            decide_cd(
+                &unavail,
+                Policy::Close {
+                    origin_exists: true
+                }
+            ),
+            CdAction::Warn(_)
+        ));
+        assert!(matches!(
+            decide_cd(
+                &unavail,
+                Policy::Close {
+                    origin_exists: false
+                }
+            ),
+            CdAction::Rescue(_)
+        ));
+    }
+
+    // ---- rc_stanza_status comparator + formatting ----
+
+    #[test]
+    fn rc_stanza_status_present_drift_absent() {
+        let tmp = TempDir::new().unwrap();
+        let rc = tmp.path().join(".zshrc");
+        assert_eq!(rc_stanza_status(&rc, "anything"), TriState::Absent);
+
+        let stanza = render_rc_stanza("zsh").unwrap();
+        std::fs::write(&rc, &stanza).unwrap();
+        assert_eq!(rc_stanza_status(&rc, &stanza), TriState::Present);
+        assert_eq!(
+            rc_stanza_status(&rc, "completely different"),
+            TriState::Drift
+        );
+
+        // `rc_stanza_state` still formats the same labels.
+        assert!(rc_stanza_state(&rc, &stanza).contains("(present)"));
+    }
+
+    // ---- wrapper_state (temp env; uses the real Cli command, matching install) ----
+
+    #[test]
+    fn wrapper_state_canonical_zsh_install_is_working() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp);
+        install(
+            &env,
+            "zsh",
+            &mut crate::cli::Cli::command(),
+            InstallOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Working);
+    }
+
+    #[test]
+    fn wrapper_state_absent_when_nothing_installed() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp);
+        assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Absent);
+    }
+
+    #[test]
+    fn wrapper_state_drift_when_managed_file_corrupted() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp);
+        install(
+            &env,
+            "zsh",
+            &mut crate::cli::Cli::command(),
+            InstallOpts::default(),
+        )
+        .unwrap();
+        std::fs::write(env.managed_file("zsh").unwrap(), "garbage\n").unwrap();
+        assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Drift);
+    }
+
+    #[test]
+    fn wrapper_state_fish_shadow_blocks_working() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp);
+        install(
+            &env,
+            "fish",
+            &mut crate::cli::Cli::command(),
+            InstallOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(wrapper_state(&env, "fish"), WrapperState::Working);
+        let shadow = fish_shadow_path(&env);
+        std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
+        std::fs::write(&shadow, "# shadow\n").unwrap();
+        assert_eq!(wrapper_state(&env, "fish"), WrapperState::Drift);
+    }
+
+    #[test]
+    fn wrapper_state_rc_stanza_drift_is_drift() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp);
+        install(
+            &env,
+            "zsh",
+            &mut crate::cli::Cli::command(),
+            InstallOpts::default(),
+        )
+        .unwrap();
+        // A valid marker block whose contents drifted from the canonical stanza.
+        std::fs::write(
+            env.home.join(".zshrc"),
+            format!("{MARKER_BEGIN}\nsource /somewhere/else\n{MARKER_END}\n"),
+        )
+        .unwrap();
+        assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Drift);
+    }
+
+    #[test]
+    fn wrapper_state_duplicate_marker_block_is_not_working() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp);
+        install(
+            &env,
+            "zsh",
+            &mut crate::cli::Cli::command(),
+            InstallOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Working);
+        // A SECOND primary marker block ⇒ not an exact single canonical install (review fix).
+        let rc = env.home.join(".zshrc");
+        let mut contents = std::fs::read_to_string(&rc).unwrap();
+        contents.push_str(&format!("\n{MARKER_BEGIN}\nsource /dup\n{MARKER_END}\n"));
+        std::fs::write(&rc, contents).unwrap();
+        assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Drift);
+    }
+
+    #[test]
+    fn wrapper_state_legacy_line_is_drift_not_working() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp);
+        // A legacy `eval "$(ji config shell init zsh)"` line, no canonical install.
+        std::fs::write(
+            env.home.join(".zshrc"),
+            "eval \"$(ji config shell init zsh)\"\n",
+        )
+        .unwrap();
+        assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Drift);
     }
 }

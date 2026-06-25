@@ -1,6 +1,20 @@
 # Changelog
 
 
+## [0.1.3] - 2026-06-25
+
+### Added
+
+- Reason-aware shell-integration notes: when `ji switch`/`new`/`close` can't change the shell's directory (the wrapper isn't active), `ji` prints why and how to enable auto-cd, replacing the raw `JI_DIRECTIVE_FILE not set` error.
+A `ji switch` that can't `cd` exits non-zero; `ji new` and a `close` that kept your directory exit zero.
+Closing the workspace you're standing in *and removing its files* prints a `current directory was removed — run: cd <root>` escape and exits non-zero.
+- `ji config shell install` previews its edits and prompts `[y/N/?]` before writing; `--yes`/`-y` skips it (a non-interactive run auto-proceeds).
+- `ji close` refuses to close the `default` workspace, matching the TUI.
+
+### Changed
+
+- Homebrew caveats and docs no longer use the "Homebrew won't edit your startup files" framing; the install one-liner now chains `ji config shell install`.
+
 ## 0.1.2
 
 ### Added

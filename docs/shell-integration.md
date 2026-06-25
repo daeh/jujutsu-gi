@@ -21,7 +21,7 @@ ji config shell install bash
 ji config shell install fish
 ```
 
-The installer is idempotent — re-running it leaves already-managed files and the rc stanza in place. `install` writes:
+The installer is idempotent — re-running it leaves already-managed files and the rc stanza in place. On a terminal it previews the changes and prompts `[y/N/?]` before writing (`?` re-shows the diff); pass `--yes` to skip the prompt, or `--dry-run` to preview without writing. A non-interactive run (piped/CI) writes directly. `install` writes:
 
 | Shell | What it writes |
 |---|---|

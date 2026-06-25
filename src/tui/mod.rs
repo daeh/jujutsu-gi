@@ -133,6 +133,10 @@ struct App {
     config: config::Config,
     repo_root: PathBuf,
     current_root: PathBuf,
+    /// The actual directory `ji` was launched from (may be a subdirectory of a
+    /// workspace). The post-close rescue check keys on whether THIS still exists,
+    /// not the workspace root.
+    launch_cwd: PathBuf,
     repo_name: String,
     action: Option<Action>,
     /// Whether the working copy is currently stale.
@@ -203,8 +207,26 @@ struct App {
 }
 
 enum Action {
+    /// A user-initiated switch — cd IS the operation (non-zero if it can't cd).
     SwitchTo(PathBuf),
+    /// cd to safety after closing the workspace the user was standing in. `origin`
+    /// is the launch cwd; on cd-unavailable it's a rescue (loud + non-zero) iff
+    /// `origin` no longer exists, else a benign hint (exit 0).
+    CloseCd {
+        origin: PathBuf,
+        safety: PathBuf,
+    },
     Quit,
+}
+
+/// Build the post-close cd action, keyed to the launch cwd (`origin`) rather than
+/// the workspace root (`ji` may run from a subdirectory). Factored out so the
+/// origin-is-cwd wiring is unit-testable.
+fn post_close_action(launch_cwd: &Path, repo_root: &Path) -> Action {
+    Action::CloseCd {
+        origin: launch_cwd.to_path_buf(),
+        safety: repo_root.to_path_buf(),
+    }
 }
 
 /// A jj subprocess (or file/clipboard side effect) deferred until
@@ -345,6 +367,9 @@ impl App {
             .iter()
             .find(|w| w.is_current)
             .map(|w| w.name.clone());
+        // Captured at startup, before any mutation; the TUI never cd's, so this stays
+        // the user's actual launch directory for the post-close rescue check.
+        let launch_cwd = std::env::current_dir().unwrap_or_else(|_| current_root.clone());
         Self {
             mode: Mode::List,
             focus: Focus::Workspaces,
@@ -367,6 +392,7 @@ impl App {
             config,
             repo_root,
             current_root,
+            launch_cwd,
             repo_name,
             action: None,
             stale: false,
@@ -2329,7 +2355,7 @@ impl App {
             KeyCode::Char('y') => {
                 if let Some(path) = self.pending_remove_path.take() {
                     if path == self.current_root {
-                        self.action = Some(Action::SwitchTo(self.repo_root.clone()));
+                        self.action = Some(post_close_action(&self.launch_cwd, &self.repo_root));
                     }
                     // Defer remove_dir_all to the drain block.
                     // Mode transition stays inline so the next render shows List
@@ -2342,7 +2368,7 @@ impl App {
                 if let Some(path) = &self.pending_remove_path
                     && *path == self.current_root
                 {
-                    self.action = Some(Action::SwitchTo(self.repo_root.clone()));
+                    self.action = Some(post_close_action(&self.launch_cwd, &self.repo_root));
                 }
                 self.pending_remove_path = None;
                 self.refresh();
@@ -3187,7 +3213,7 @@ impl App {
 pub fn switch(target: &str) -> Result<()> {
     let repo_root = jujutsu::workspace_root()?;
     let ws_path = commands::switch::switch(&repo_root, target)?;
-    shell::write_directive_cd(&ws_path)
+    shell::apply_switch_cd(&ws_path)
 }
 
 /// Non-interactive create-or-switch (used by `ji new <target> --create-if-necessary`).
@@ -3207,7 +3233,7 @@ pub fn create_or_switch(
     });
 
     if let Some(ws) = existing {
-        shell::write_directive_cd(&ws.path)
+        shell::apply_switch_cd(&ws.path)
     } else {
         create(target, revision, path, msg)
     }
@@ -3256,8 +3282,7 @@ pub fn create(
         false,
     )?;
 
-    shell::write_directive_cd(&result.workspace_path)?;
-    Ok(())
+    shell::apply_followup_cd(&result.workspace_path)
 }
 
 // ===========================================================================
@@ -3587,7 +3612,7 @@ fn drain_pending_handoff(
                         app.mode = Mode::ConfirmRemoveFiles;
                     } else {
                         if source_path_for_check == app.current_root {
-                            app.action = Some(Action::SwitchTo(app.repo_root.clone()));
+                            app.action = Some(post_close_action(&app.launch_cwd, &app.repo_root));
                         }
                         app.mode = Mode::List;
                     }
@@ -3800,9 +3825,13 @@ pub fn run() -> Result<()> {
     // explicit restore avoids relying solely on Drop ordering).
     guard.restore();
 
-    // Only SwitchTo needs post-TUI execution (for the shell cd directive)
-    if let Some(Action::SwitchTo(path)) = app.action {
-        shell::write_directive_cd(&path)?;
+    // Post-TUI cd execution (the shell cd directive). SwitchTo is a user switch
+    // (non-zero if it can't cd); CloseCd lands at safety after closing the cwd's
+    // workspace (rescue iff the launch cwd is gone).
+    match app.action {
+        Some(Action::SwitchTo(path)) => shell::apply_switch_cd(&path)?,
+        Some(Action::CloseCd { origin, safety }) => shell::apply_close_cd(&origin, &safety)?,
+        _ => {}
     }
 
     Ok(())
@@ -3813,6 +3842,19 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn post_close_action_origin_is_launch_cwd_not_repo_root() {
+        let launch_cwd = PathBuf::from("/repo/ws-feature/subdir");
+        let repo_root = PathBuf::from("/repo");
+        match post_close_action(&launch_cwd, &repo_root) {
+            Action::CloseCd { origin, safety } => {
+                assert_eq!(origin, launch_cwd); // the cwd, NOT the workspace root
+                assert_eq!(safety, repo_root);
+            }
+            _ => panic!("expected CloseCd"),
+        }
+    }
 
     #[test]
     fn handoff_terminal_classification_matches_interactivity() {

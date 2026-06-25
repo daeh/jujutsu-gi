@@ -4,6 +4,7 @@
 // bin-crate `Config` is not a lib-crate `Config`), so keep a single source.
 use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use ji::cli::{Cli, Commands, ConfigCommands, ShellCommands};
@@ -73,6 +74,18 @@ fn main() -> anyhow::Result<()> {
                 target.as_deref(),
             )?;
 
+            // Guard (mirrors the TUI's `ws.name == "default"` block): closing the default
+            // workspace would gut the repo AND remove the rescue target (repo_root).
+            if src_name == "default" {
+                bail!("refusing to close the default workspace");
+            }
+            // Capture the launch cwd and whether we're closing the current workspace
+            // BEFORE close()/removal: `close` runs `jj workspace forget`, after which the
+            // current workspace may be unresolvable, and the cwd may be deleted later.
+            let shell_cwd = std::env::current_dir().context("get current directory")?;
+            let current_root = jujutsu::current_workspace_root()?;
+            let closing_cwd = src_path == current_root;
+
             // Entry snapshot (conditional) of the workspaces this method
             // consumes, BEFORE gathering param state: `revisions` and
             // `target_change_id` below must reflect post-snapshot reality.
@@ -117,13 +130,15 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(remove_path) = result.pending_remove_path {
                 eprintln!("(ji)::removing {}", remove_path.display());
-                let _ = std::fs::remove_dir_all(&remove_path);
+                if let Err(e) = std::fs::remove_dir_all(&remove_path) {
+                    eprintln!("(ji)::removing failed: {e}");
+                }
             }
 
-            // If we closed the current workspace, switch to repo root.
-            let current_root = jujutsu::current_workspace_root()?;
-            if src_path == current_root {
-                shell::write_directive_cd(&repo_root)?;
+            // If we closed the current workspace, cd to the repo root — rescue (loud +
+            // non-zero) if the launch cwd no longer exists, benign hint otherwise.
+            if closing_cwd {
+                shell::apply_close_cd(&shell_cwd, &repo_root)?;
             }
 
             Ok(())
@@ -238,12 +253,20 @@ fn main() -> anyhow::Result<()> {
                         shell: sh,
                         dry_run,
                         force,
+                        yes,
                     },
             } => {
                 let sh = sh.map_or_else(shell::detect_shell, Ok)?;
                 let mut cmd = Cli::command();
                 let env = shell::ShellEnv::from_process_env()?;
-                let opts = shell::InstallOpts { dry_run, force };
+                // Interactivity is decided at the CLI boundary: prompt only on a TTY and
+                // when --yes wasn't passed. The library install() stays non-interactive.
+                let interactive = !yes && std::io::stdin().is_terminal();
+                let opts = shell::InstallOpts {
+                    dry_run,
+                    force,
+                    interactive,
+                };
                 shell::install(&env, &sh, &mut cmd, opts)
             }
             ConfigCommands::Shell {
@@ -269,14 +292,19 @@ fn main() -> anyhow::Result<()> {
         },
     };
 
-    if let Err(ref e) = result
-        && jujutsu::is_stale_error(e)
-    {
-        eprintln!(
-            "(ji)::stale working copy is stale — another tool modified the repo.\n\
-             Fix with: jj workspace update-stale"
-        );
-        std::process::exit(1);
+    if let Err(ref e) = result {
+        if jujutsu::is_stale_error(e) {
+            eprintln!(
+                "(ji)::stale working copy is stale — another tool modified the repo.\n\
+                 Fix with: jj workspace update-stale"
+            );
+            std::process::exit(1);
+        }
+        if shell::is_cd_not_applied(e) {
+            // The reason-aware note / rescue escape was already printed; exit non-zero
+            // quietly (no anyhow `Error:` dump).
+            std::process::exit(1);
+        }
     }
     result
 }

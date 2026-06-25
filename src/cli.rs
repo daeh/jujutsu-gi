@@ -166,6 +166,10 @@ pub enum ShellCommands {
         /// non-ji-managed files
         #[arg(long)]
         force: bool,
+
+        /// Skip the confirmation prompt (assume yes)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Remove shell integration

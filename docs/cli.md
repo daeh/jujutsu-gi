@@ -116,6 +116,8 @@ Close a workspace — integrating its work into a target, or (for the `detach`/`
 | `--method <METHOD>` | no | `adaptive` | Close method (see table below) |
 | `--delete-files` | no | off | Remove the source workspace directory after close |
 
+> **The `default` workspace can't be closed.** `ji close` refuses to close the default workspace (whether as the cwd source or via `--source default`), mirroring the TUI — closing it would remove the repo root.
+
 ### Methods
 
 | Method | Target required | Description |
@@ -251,7 +253,7 @@ Prints the shell wrapper function to stdout.
 
 ### `ji config shell install [SHELL]`
 
-Installs the shell wrapper. Idempotent. Flags: `--dry-run` (print the diff without writing), `--force` (install even if integration is detected elsewhere, or overwrite non-ji-managed files). See [shell-integration.md](shell-integration.md) for target locations and manual install.
+Installs the shell wrapper. Idempotent. On a terminal it previews the changes and prompts `[y/N/?]` before writing (`?` re-shows the diff); a non-interactive run (piped/CI) writes directly. Flags: `--dry-run` (print the diff without writing), `--force` (install even if integration is detected elsewhere, or overwrite non-ji-managed files), `--yes`/`-y` (skip the prompt). See [shell-integration.md](shell-integration.md) for target locations and manual install.
 
 ### `ji config shell uninstall [SHELL]`
 

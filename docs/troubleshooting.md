@@ -1,29 +1,19 @@
 # Troubleshooting
 
-## Shell integration isn't changing directory
+## A workspace operation didn't change my directory
 
-**Symptom:** `ji switch <name>` succeeds but the shell's `pwd` does not change.
+**Symptom:** `ji switch`/`new`/`close` did its work but the shell's `pwd` did not change; `ji` printed a `(ji)::cd …` note.
 
-**Cause:** The shell wrapper is not installed, or the current shell hasn't loaded it.
+**Cause:** `ji` can only change the parent shell's directory when its wrapper is active. The note says why it couldn't, and what to do:
 
-**Fix:**
+- *enable auto-cd with: `ji config shell install`* — the wrapper isn't installed.
+- *installed but wasn't active for this command — open a new shell, or run `ji` directly* — the session started before install, or you ran `command ji` / a full path, which bypasses the wrapper.
+- *on-disk integration doesn't match ji — inspect with `ji config shell status`, then reinstall or remove the conflicting entry* — the on-disk wrapper drifted, or a conflicting integration was found.
+- *auto-cd isn't supported for `<shell>`* — only zsh, bash, and fish are supported.
 
-```sh
-ji config shell install
-exec $SHELL   # or open a new terminal
-```
+A `ji switch` that can't change directory exits non-zero (you stay in a valid directory). If `ji close` removed the directory you were standing in and couldn't move you, it prints `current directory was removed — run: cd <root>` — run that to escape the deleted directory.
 
-See [shell-integration.md](shell-integration.md) for manual installation.
-
----
-
-## "JI_DIRECTIVE_FILE not set — did you run `ji config shell install`?"
-
-**Symptom:** `ji switch` prints this error.
-
-**Cause:** `ji` was invoked without the shell wrapper active — either because the wrapper is not installed, or because the invocation bypassed the wrapper (e.g., running `command ji switch ...` or calling the binary by full path).
-
-**Fix:** Install the wrapper and use `ji` (not `command ji`).
+See [shell-integration.md](shell-integration.md) for the mechanism and manual installation.
 
 ---
 
