@@ -253,7 +253,9 @@ Prints the shell wrapper function to stdout.
 
 ### `ji config shell install [SHELL]`
 
-Installs the shell wrapper. Idempotent. On a terminal it previews the changes and prompts `[y/N/?]` before writing (`?` re-shows the diff); a non-interactive run (piped/CI) writes directly. Flags: `--dry-run` (print the diff without writing), `--force` (install even if integration is detected elsewhere, or overwrite non-ji-managed files), `--yes`/`-y` (skip the prompt). See [shell-integration.md](shell-integration.md) for target locations and manual install.
+Installs the shell wrapper. Idempotent. On a terminal it previews the changes and prompts `[y/N/?]` before writing (`?` re-shows the diff); a non-interactive run (piped/CI) writes directly. With no `[SHELL]` it targets the active shell; `--all` instead installs for **every shell with an existing config** (skipping shells with none, reported per shell). Flags: `--all`, `--dry-run` (print the diff without writing), `--force` (install even if integration is detected elsewhere, or overwrite non-ji-managed files), `--yes`/`-y` (skip the prompt). `--all` and an explicit `[SHELL]` are mutually exclusive. See [shell-integration.md](shell-integration.md) for target locations and manual install.
+
+When `ji switch`/`new`/`close` can't change the directory because the wrapper isn't installed, on a terminal it offers to install integration right there (`[y/N/?]`); declining is remembered per shell.
 
 ### `ji config shell uninstall [SHELL]`
 
@@ -261,7 +263,7 @@ Removes the wrapper files and rc stanza that `install` added. Flags: `--dry-run`
 
 ### `ji config shell status [SHELL]`
 
-Reports install state, drift, and any cross-file integration hits.
+Reports install state, drift, any cross-file integration hits, and any bypass aliases — a `ji` alias (or fish `function ji`) that shadows the wrapper, or a differently-named alias that runs the `ji` binary directly.
 
 ---
 

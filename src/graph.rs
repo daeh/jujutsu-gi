@@ -12,7 +12,7 @@ use crate::jujutsu;
 /// Returns `true` when the range is squashable into a single commit.
 pub fn is_effectively_linear(repo: &Path, lca: &str, src_eff: &str) -> Result<bool> {
     // Non-empty children of chain members (excluding src_eff's children)
-    // that are NOT in the chain. Any such revision is a dangling fork.
+    // that are not in the chain. Any such revision is a dangling fork.
     let revset =
         format!("(children(({lca}..{src_eff}) ~ {src_eff}) ~ ({lca}..{src_eff})) ~ empty()");
     let output = jujutsu::run_jj(

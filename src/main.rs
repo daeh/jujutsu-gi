@@ -3,7 +3,7 @@
 // them in both crates would mint two distinct copies of each type (a
 // bin-crate `Config` is not a lib-crate `Config`), so keep a single source.
 use anyhow::{Context, bail};
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +11,20 @@ use ji::cli::{Cli, Commands, ConfigCommands, ShellCommands};
 use ji::{commands, config, jujutsu, operations, shell, subprocess_log, text_utils, tui};
 
 fn main() -> anyhow::Result<()> {
+    // Dynamic shell completion. Capture the shell name before `try_complete`
+    // strips $COMPLETE (clap removes it before invoking completers), then
+    // handle any completion request fail-soft and before any jj/logger/cd-
+    // directive work runs (so completion never snapshots or writes a directive).
+    // `try_complete` (not `complete()`) so an engine error can't `e.exit()`.
+    ji::completion::capture_shell(std::env::var("COMPLETE").ok());
+    match clap_complete::env::CompleteEnv::with_factory(ji::cli::completion_command)
+        .try_complete(std::env::args_os(), std::env::current_dir().ok().as_deref())
+    {
+        Ok(true) => return Ok(()), // completion handled
+        Ok(false) => {}            // not a completion request — continue
+        Err(_) => return Ok(()),   // swallow engine errors — clean no-op exit
+    }
+
     let cli = Cli::parse();
 
     if let Ok(root) = jujutsu::current_workspace_root() {
@@ -75,19 +89,19 @@ fn main() -> anyhow::Result<()> {
             )?;
 
             // Guard (mirrors the TUI's `ws.name == "default"` block): closing the default
-            // workspace would gut the repo AND remove the rescue target (repo_root).
+            // workspace would gut the repo and remove the rescue target (repo_root).
             if src_name == "default" {
                 bail!("refusing to close the default workspace");
             }
             // Capture the launch cwd and whether we're closing the current workspace
-            // BEFORE close()/removal: `close` runs `jj workspace forget`, after which the
+            // before close()/removal: `close` runs `jj workspace forget`, after which the
             // current workspace may be unresolvable, and the cwd may be deleted later.
             let shell_cwd = std::env::current_dir().context("get current directory")?;
             let current_root = jujutsu::current_workspace_root()?;
             let closing_cwd = src_path == current_root;
 
             // Entry snapshot (conditional) of the workspaces this method
-            // consumes, BEFORE gathering param state: `revisions` and
+            // consumes, before gathering param state: `revisions` and
             // `target_change_id` below must reflect post-snapshot reality.
             let mut required: Vec<(&str, &Path)> = vec![(&src_name, &src_path)];
             if needs_target {
@@ -244,20 +258,18 @@ fn main() -> anyhow::Result<()> {
                 command: ShellCommands::Init { shell: sh },
             } => {
                 let sh = sh.map_or_else(shell::detect_shell, Ok)?;
-                let mut cmd = Cli::command();
-                shell::print_init(&sh, &mut cmd)
+                shell::print_init(&sh)
             }
             ConfigCommands::Shell {
                 command:
                     ShellCommands::Install {
                         shell: sh,
+                        all,
                         dry_run,
                         force,
                         yes,
                     },
             } => {
-                let sh = sh.map_or_else(shell::detect_shell, Ok)?;
-                let mut cmd = Cli::command();
                 let env = shell::ShellEnv::from_process_env()?;
                 // Interactivity is decided at the CLI boundary: prompt only on a TTY and
                 // when --yes wasn't passed. The library install() stays non-interactive.
@@ -267,7 +279,12 @@ fn main() -> anyhow::Result<()> {
                     force,
                     interactive,
                 };
-                shell::install(&env, &sh, &mut cmd, opts)
+                if all {
+                    shell::install_all(&env, opts)
+                } else {
+                    let sh = sh.map_or_else(shell::detect_shell, Ok)?;
+                    shell::install(&env, &sh, opts)
+                }
             }
             ConfigCommands::Shell {
                 command:
@@ -285,9 +302,8 @@ fn main() -> anyhow::Result<()> {
             ConfigCommands::Shell {
                 command: ShellCommands::Status { shell: sh },
             } => {
-                let mut cmd = Cli::command();
                 let env = shell::ShellEnv::from_process_env()?;
-                shell::status(&env, sh.as_deref(), &mut cmd)
+                shell::status(&env, sh.as_deref())
             }
         },
     };

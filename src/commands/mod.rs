@@ -21,7 +21,7 @@ use types::{Operation, SyncMode, SyncModeInfo};
 /// determines the sync mode. Captures the current op head for later
 /// validation.
 pub fn detect_sync_mode(repo: &Path, src_name: &str, tgt_name: &str) -> SyncModeInfo {
-    // Capture the op head BEFORE the queries: the stored op head must be
+    // Capture the op head before the queries: the stored op head must be
     // <= the data's freshness, never >=. A mutation landing mid-detection
     // then makes the stored op head stale, so the next freshness check
     // re-detects instead of wrongly treating mixed old/new facts as current.
@@ -84,7 +84,7 @@ pub fn detect_sync_mode(repo: &Path, src_name: &str, tgt_name: &str) -> SyncMode
 // Freshness primitives
 // ---------------------------------------------------------------------------
 
-/// Snapshot the given REQUIRED (name, path) pairs (involved-workspace
+/// Snapshot the given required (name, path) pairs (involved-workspace
 /// freshness at the gate / CLI entry). `snapshot_ws` is itself conditional —
 /// a clean working copy creates no operation. An empty or missing path is an
 /// error — a required workspace that cannot be snapshotted means the plan
@@ -135,7 +135,7 @@ pub enum Freshness {
     Changed,
 }
 
-/// Conditionally snapshot the REQUIRED workspaces, then decide whether `info`
+/// Conditionally snapshot the required workspaces, then decide whether `info`
 /// still describes reality.
 ///
 /// `required` lists exactly the workspaces the pending operation consumes
@@ -179,7 +179,7 @@ pub fn check_freshness(
 /// If the repo's op head hasn't changed, returns the cached info (the only
 /// success path in strict mode). On movement:
 ///
-/// - `allow_equivalent == false` (close/transfer, ALL methods including
+/// - `allow_equivalent == false` (close/transfer, all methods including
 ///   Detach/Abandon): bail. Their executable plan spans revisions, bookmarks,
 ///   and target entries beyond `SyncModeInfo`; semantic identity is not
 ///   provable here, so silently executing is not acceptable. Normal flows
@@ -188,7 +188,7 @@ pub fn check_freshness(
 ///   re-read the op head after detection and retry once if the repo moved
 ///   *during* it — then return the fresh info iff `plan_equivalent`.
 ///
-/// Callers use the returned info's heads AND lca, so a recomputed plan never
+/// Callers use the returned info's heads and lca, so a recomputed plan never
 /// executes against a stale lca.
 pub fn validate_head_info(
     repo: &Path,
@@ -250,7 +250,7 @@ pub struct ExecutionFreshness {
     /// staleness scan, predicted-stale resolution).
     pub ws_paths: Vec<(String, PathBuf)>,
     /// Workspaces skipped by the protection snapshot because they are
-    /// jj-stale. This IS the pre-op stale baseline for `post_op_stale`
+    /// jj-stale. This is the pre-op stale baseline for `post_op_stale`
     /// (no separate detection pass), and is excluded from auto-resolution.
     pub stale_skipped: Vec<String>,
 }
@@ -260,14 +260,14 @@ pub struct ExecutionFreshness {
 ///
 /// 1. fail-closed op-head sanity (empty / divergent baseline);
 /// 2. fresh workspace re-list (never a caller-captured list);
-/// 3. involved path check by NAME (and target change-id when a manual
-///    bookmark Advance will execute against it) — abort on mismatch BEFORE
+/// 3. involved path check by name (and target change-id when a manual
+///    bookmark Advance will execute against it) — abort on mismatch before
 ///    any snapshot;
 /// 4. broad snapshot, descendant-first, third-party first and the involved
-///    src/tgt LAST: every existing, non-stale workspace's pending edits are
+///    src/tgt last: every existing, non-stale workspace's pending edits are
 ///    captured (fail-loud) before the rewrite can rebase them; jj-stale
 ///    third-party workspaces are skipped (their edits belong to the
-///    update-stale workflow); a failed REQUIRED (involved) snapshot aborts;
+///    update-stale workflow); a failed required (involved) snapshot aborts;
 /// 5. recheck: op-head movement since `validated` must be snapshot-only,
 ///    involved paths must still resolve, and (plan-consuming methods only)
 ///    a stable re-detection must be `plan_equivalent` to the validated plan.
@@ -299,7 +299,7 @@ pub fn prepare_execution_freshness(
     // 2. Fresh re-list (one jj call).
     let entries = jujutsu::list_workspace_entries(repo)?;
 
-    // 3. Involved path check — BEFORE any snapshot, so we never snapshot a
+    // 3. Involved path check — before any snapshot, so we never snapshot a
     // stale captured path and then discover the name resolved elsewhere.
     check_involved_paths(
         &entries,
@@ -330,7 +330,7 @@ pub fn prepare_execution_freshness(
         .collect();
 
     // 4. Broad snapshot. Descendant-first within each tier, third-party
-    // tier first, involved src/tgt LAST: a dirty workspace's snapshot
+    // tier first, involved src/tgt last: a dirty workspace's snapshot
     // amends its `@` and rebases (stales) descendants, so each descendant
     // is captured before any ancestor's snapshot can touch it. The
     // involved-last fail-loud snapshot doubles as the involved-staleness
@@ -349,7 +349,7 @@ pub fn prepare_execution_freshness(
             continue;
         }
         if let Err(err) = jujutsu::snapshot_ws(&e.path) {
-            // Classify ONLY after the failure — a pre-check via the live
+            // Classify only after the failure — a pre-check via the live
             // status probe would snapshot behind the fail-loud snapshot's
             // back. Stale edits are the update-stale workflow's to recover.
             if jujutsu::is_workspace_stale(&e.path) {
@@ -425,8 +425,8 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Post-snapshot revalidation. Deliberately NOT `validate_head_info` (which
-/// bails on ANY op-head movement): the snapshot phase legitimately moves the
+/// Post-snapshot revalidation. Deliberately not `validate_head_info` (which
+/// bails on any op-head movement): the snapshot phase legitimately moves the
 /// op head, so this tolerates snapshot-only movement and re-proves the plan.
 #[allow(clippy::too_many_arguments)]
 fn recheck_execution_freshness(
@@ -511,7 +511,7 @@ pub fn resolve_adaptive_transfer(mode: &SyncMode) -> Result<Operation> {
 /// WC-behind report (live status): scan all workspaces post-op and report
 /// any that are stale, tagged against the pre-op baseline (`pre_stale` — the
 /// protection phase's stale skip-set). The live scan's snapshot side effect
-/// is redundant for edit survival (the §C phase is the freshness mechanism)
+/// is redundant for edit survival (the protection phase is the freshness mechanism)
 /// but accepted as part of producing the report.
 pub fn post_op_stale(ws_paths: &[(String, PathBuf)], pre_stale: &[String]) -> Vec<String> {
     // Re-check all workspaces and report anything still stale.
@@ -529,14 +529,14 @@ pub fn post_op_stale(ws_paths: &[(String, PathBuf)], pre_stale: &[String]) -> Ve
 
 /// Predict which third-party workspaces will become stale from a rewrite operation.
 ///
-/// Must be called BEFORE the operation executes but AFTER the protection
+/// Must be called before the operation executes but after the protection
 /// snapshot phase (the phase can move heads / rebase descendants, so a
 /// pre-phase prediction would be stale). Used only for post-op resolution +
 /// reporting — edit survival never depends on it (the broad snapshot covers
 /// that). Best-effort: returns empty on query failure rather than blocking.
 ///
 /// `involved` lists the workspaces the operation consumes (Abandon: source
-/// only — its target is NOT involved, and a workspace descending from the
+/// only — its target is not involved, and a workspace descending from the
 /// abandoned revisions must not be dropped from resolution/reporting).
 pub fn predict_stale_workspaces(
     repo: &Path,
@@ -574,7 +574,7 @@ pub fn predict_stale_workspaces(
 ///
 /// Calls `update_workspace_stale` on each workspace that was predicted to
 /// become stale. Skips workspaces whose path is empty or missing. Callers
-/// must NOT pass workspaces that were already stale pre-op (the protection
+/// must not pass workspaces that were already stale pre-op (the protection
 /// phase's skip-set): those belong to the user's update-stale workflow and
 /// surface in the report as "was already stale".
 pub fn resolve_predicted_stale(predicted: &[String], ws_paths: &[(String, PathBuf)]) {

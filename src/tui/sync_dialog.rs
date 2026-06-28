@@ -31,7 +31,7 @@ pub(crate) struct SyncDialog {
     pub(crate) notice: Vec<String>,
     /// Op head at the last point the dialog's data was made fresh (open or an
     /// in-place stale refresh, both preceded by a snapshot). The execute gate
-    /// compares the *current* op head against THIS, not `sync_info.op_head` —
+    /// compares the *current* op head against this, not `sync_info.op_head` —
     /// `recompute()` re-stamps the latter to "now" on every target change,
     /// which would otherwise mask external movement from the gate.
     pub(crate) freshness_baseline: String,

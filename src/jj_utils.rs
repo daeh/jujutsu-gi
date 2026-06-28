@@ -79,7 +79,7 @@ fn ws_at_revset(ws_name: &str) -> String {
 /// (`"default"@.."<ws>"@`) — the same set definition `list_workspaces` uses
 /// to build per-workspace revision lists (`workspace_revisions_with_bookmarks`
 /// evaluates it with change-id endpoints; here the workspace refs resolve
-/// live). Deliberately NOT an LCA-relative range: the LCA is source-vs-target
+/// live). Deliberately not an LCA-relative range: the LCA is source-vs-target
 /// and diverges from this producer definition for non-default targets.
 pub fn workspace_unique_change_ids(repo: &Path, ws_name: &str) -> Result<Vec<String>> {
     let revset = format!("{}..{}", ws_head_revset("default"), ws_head_revset(ws_name));
@@ -279,9 +279,8 @@ pub struct WorkspaceHeadInfo {
 
 /// Resolve effective head, actual head, and triviality for a workspace in 1-2 jj calls.
 ///
-/// Replaces the pattern of calling `find_effective_head` + `check_trivial_head` +
-/// `resolve_workspace_head` separately (3-5 jj calls) with a single pass that
-/// reuses data from `check_trivial_head`'s internal query.
+/// Reuses data from `check_trivial_head`'s internal query, avoiding the 3-5 calls
+/// required when invoking `find_effective_head` and `check_trivial_head` separately.
 pub fn resolve_workspace_head_info(repo: &Path, ws_name: &str) -> Result<WorkspaceHeadInfo> {
     let ws = ws_at_revset(ws_name);
     let ws_at = format!("{ws}@");
@@ -329,7 +328,7 @@ pub fn resolve_workspace_head_info(repo: &Path, ws_name: &str) -> Result<Workspa
     let is_merge = parts[2] == "true";
     let desc = parts[3];
 
-    // @ IS a graph head. We have its change_id. Check triviality.
+    // @ is a graph head. We have its change_id. Check triviality.
     // Merge commits are never trivial — their @- resolves to multiple parents.
     let is_trivial = is_empty && !is_merge && is_trivial_description(repo, &ws_at, desc);
 
@@ -394,7 +393,7 @@ pub enum RevisionSafety {
 
 /// Check whether orphaning a **head** revision would risk losing work.
 ///
-/// Returns `AtRisk` only when ALL of:
+/// Returns `AtRisk` only when all of:
 /// 1. The revision is a graph head (no descendants)
 /// 2. It has no local bookmarks (not findable by name)
 /// 3. Its description is whitespace-only (user never described it)
@@ -592,7 +591,7 @@ pub fn check_chain_safety(
     Ok(at_risk)
 }
 
-/// Shared emptiness check for safety functions. Runs WITHOUT `--ignore-working-copy`
+/// Shared emptiness check for safety functions. Runs without `--ignore-working-copy`
 /// when `ws_path` is provided (triggering jj auto-snapshot), or with it when `None`.
 fn check_emptiness(
     repo: &Path,

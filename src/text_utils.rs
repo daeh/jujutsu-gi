@@ -169,6 +169,44 @@ pub fn peel_first_grapheme_for_cursor(s: &str) -> (&str, &str) {
     }
 }
 
+/// Format `epoch_secs` relative to `now_secs` as a compact age string
+/// (`17h`, `2w`, `4mo`, `1y`), matching worktrunk's `format_relative_time_short`:
+/// a future timestamp → `"future"`, under a minute → `"now"`, otherwise the
+/// largest whole unit by floor division through y/mo/w/d/h/m, with a 30-day
+/// month and 365-day year (so `360d` is `12mo`, not `1y`).
+pub fn relative_time_short(epoch_secs: i64, now_secs: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    const UNITS: &[(i64, &str)] = &[
+        (YEAR, "y"),
+        (MONTH, "mo"),
+        (WEEK, "w"),
+        (DAY, "d"),
+        (HOUR, "h"),
+        (MINUTE, "m"),
+    ];
+
+    let seconds_ago = now_secs - epoch_secs;
+    if seconds_ago < 0 {
+        return "future".to_string();
+    }
+    if seconds_ago < MINUTE {
+        return "now".to_string();
+    }
+    for &(unit, abbrev) in UNITS {
+        let value = seconds_ago / unit;
+        if value > 0 {
+            return format!("{value}{abbrev}");
+        }
+    }
+    // Unreachable: seconds_ago >= MINUTE guarantees the MINUTE arm matches.
+    "now".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +476,31 @@ mod tests {
         assert_eq!(col_to_byte_offset(s, 0), 0); // 'a'
         assert_eq!(col_to_byte_offset(s, 2), 2); // '世' at byte 2
         assert_eq!(col_to_byte_offset(s, 4), 5); // 'c' at byte 5 (after 3-byte 世)
+    }
+
+    // --- relative_time_short ---
+
+    #[test]
+    fn relative_time_short_boundaries() {
+        // epoch=0, now=secs_ago → seconds_ago == secs_ago.
+        let ago = |secs: i64| relative_time_short(0, secs);
+        const DAY: i64 = 86_400;
+
+        assert_eq!(relative_time_short(10, 0), "future"); // epoch after now
+        assert_eq!(ago(0), "now");
+        assert_eq!(ago(59), "now");
+        assert_eq!(ago(60), "1m");
+        assert_eq!(ago(59 * 60), "59m");
+        assert_eq!(ago(60 * 60), "1h");
+        assert_eq!(ago(17 * 3600), "17h");
+        assert_eq!(ago(23 * 3600), "23h");
+        assert_eq!(ago(DAY), "1d");
+        assert_eq!(ago(6 * DAY), "6d");
+        assert_eq!(ago(7 * DAY), "1w");
+        assert_eq!(ago(29 * DAY), "4w"); // 29/30 month floors to 0 → weeks
+        assert_eq!(ago(30 * DAY), "1mo");
+        assert_eq!(ago(120 * DAY), "4mo");
+        assert_eq!(ago(360 * DAY), "12mo"); // 30-day month, 365-day year
+        assert_eq!(ago(365 * DAY), "1y");
     }
 }

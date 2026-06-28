@@ -3,7 +3,7 @@
 #
 # Under the current model (src/operations.rs::create_workspace) the source
 # workspace steps forward — a new "(ji::step-forward)" revision becomes @ —
-# only when the new workspace branches from a NON-TRIVIAL head. Branching from
+# only when the new workspace branches from a non-trivial head. Branching from
 # a trivial head (empty WIP with a trivial description) or from an interior
 # (non-head) revision does not step the source.
 #
@@ -32,7 +32,7 @@ jj bookmark create main -r @-
 JI_DIRECTIVE_FILE="$DIRECTIVE" command ji init
 
 # ===================================================================
-# Test 1: branching from a NON-TRIVIAL @ steps the source forward
+# Test 1: branching from a non-trivial @ steps the source forward
 # ===================================================================
 echo ""
 echo "=== Test 1: advance from a non-trivial head ==="
@@ -76,7 +76,7 @@ fi
 jj workspace forget eg.feature-alpha
 
 # ===================================================================
-# Test 2: branching from a TRIVIAL head does NOT advance
+# Test 2: branching from a trivial head does not advance
 # ===================================================================
 echo ""
 echo "=== Test 2: no advance from a trivial head ==="
@@ -113,7 +113,7 @@ fi
 jj workspace forget eg.feature-beta
 
 # ===================================================================
-# Test 3: branching from an interior bookmark does NOT advance
+# Test 3: branching from an interior bookmark does not advance
 # ===================================================================
 echo ""
 echo "=== Test 3: branch from bookmark (no advance) ==="

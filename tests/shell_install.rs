@@ -4,14 +4,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use ji::shell::{InstallOpts, ShellEnv, UninstallOpts, install, status, uninstall};
+use ji::shell::{InstallOpts, ShellEnv, UninstallOpts, install, install_all, status, uninstall};
 use tempfile::TempDir;
-
-fn fake_cmd() -> clap::Command {
-    clap::Command::new("ji")
-        .subcommand(clap::Command::new("switch").arg(clap::Arg::new("target")))
-        .subcommand(clap::Command::new("ls"))
-}
 
 fn env_for(tmp: &TempDir) -> ShellEnv {
     let home = tmp.path().to_path_buf();
@@ -37,11 +31,17 @@ fn read(path: &Path) -> String {
 }
 
 fn install_zsh(env: &ShellEnv, opts: InstallOpts) -> anyhow::Result<()> {
-    install(env, "zsh", &mut fake_cmd(), opts)
+    install(env, "zsh", opts)
 }
 
 fn uninstall_zsh(env: &ShellEnv, opts: UninstallOpts) -> anyhow::Result<()> {
     uninstall(env, "zsh", opts)
+}
+
+fn declined_marker_path(env: &ShellEnv, shell: &str) -> std::path::PathBuf {
+    env.xdg_config_home
+        .join("ji")
+        .join(format!("install-prompt-declined-{shell}"))
 }
 
 #[test]
@@ -311,6 +311,85 @@ fn dry_run_makes_no_filesystem_changes() {
 }
 
 #[test]
+fn install_all_configures_present_skips_absent() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    write(&env.home.join(".zshrc"), "");
+
+    install_all(&env, InstallOpts::default()).unwrap();
+
+    let rc = read(&env.home.join(".zshrc"));
+    assert!(rc.contains("# >>> ji shell integration >>>"));
+    assert!(rc.contains("# <<< ji shell integration <<<"));
+    assert!(env.xdg_config_home.join("ji/init.zsh").exists());
+    assert!(!env.home.join(".bash_profile").exists());
+}
+
+#[test]
+fn install_all_all_unchanged_is_idempotent_noop() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    write(&env.home.join(".zshrc"), "");
+
+    install_all(&env, InstallOpts::default()).unwrap();
+    let rc1 = fs::read(env.home.join(".zshrc")).unwrap();
+    let mgr1 = fs::read(env.xdg_config_home.join("ji/init.zsh")).unwrap();
+
+    install_all(&env, InstallOpts::default()).unwrap();
+    let rc2 = fs::read(env.home.join(".zshrc")).unwrap();
+    let mgr2 = fs::read(env.xdg_config_home.join("ji/init.zsh")).unwrap();
+
+    assert_eq!(rc1, rc2);
+    assert_eq!(mgr1, mgr2);
+}
+
+#[test]
+fn install_all_no_present_shells_creates_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+
+    install_all(&env, InstallOpts::default()).unwrap();
+
+    assert_eq!(fs::read_dir(&env.home).unwrap().count(), 0);
+    assert!(!env.xdg_config_home.join("ji/init.zsh").exists());
+    assert!(!env.home.join(".bash_profile").exists());
+    assert!(!env.home.join(".zshrc").exists());
+}
+
+#[test]
+fn install_all_bashrc_only_skips_bash() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    let bashrc = env.home.join(".bashrc");
+    write(&bashrc, "");
+
+    install_all(&env, InstallOpts::default()).unwrap();
+
+    assert!(!env.home.join(".bash_profile").exists());
+    assert!(!env.xdg_config_home.join("ji/init.bash").exists());
+    assert_eq!(read(&bashrc), "");
+}
+
+#[test]
+fn install_all_dry_run_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    write(&env.home.join(".zshrc"), "");
+
+    install_all(
+        &env,
+        InstallOpts {
+            dry_run: true,
+            ..InstallOpts::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(read(&env.home.join(".zshrc")), "");
+    assert!(!env.xdg_config_home.join("ji/init.zsh").exists());
+}
+
+#[test]
 fn uninstall_removes_managed_block_and_managed_file() {
     let tmp = TempDir::new().unwrap();
     let env = env_for(&tmp);
@@ -325,11 +404,80 @@ fn uninstall_removes_managed_block_and_managed_file() {
 }
 
 #[test]
+fn install_marker_cleared_only_for_installed_shell() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    let zsh_marker = declined_marker_path(&env, "zsh");
+    let bash_marker = declined_marker_path(&env, "bash");
+    write(&zsh_marker, "");
+    write(&bash_marker, "");
+    write(&env.home.join(".zshrc"), "");
+
+    install(&env, "zsh", InstallOpts::default()).unwrap();
+
+    assert!(!zsh_marker.exists());
+    assert!(bash_marker.exists());
+}
+
+#[test]
+fn install_all_clears_declined_marker_for_each_configured_shell() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    let zsh_marker = declined_marker_path(&env, "zsh");
+    let bash_marker = declined_marker_path(&env, "bash");
+    let fish_marker = declined_marker_path(&env, "fish");
+    write(&zsh_marker, "");
+    write(&bash_marker, "");
+    write(&fish_marker, "");
+    // zsh + bash present (have a config); fish absent (no ~/.config/fish dir).
+    write(&env.home.join(".zshrc"), "");
+    write(&env.home.join(".bash_profile"), "");
+
+    install_all(&env, InstallOpts::default()).unwrap();
+
+    // Markers for the configured shells are cleared; the absent shell's stays.
+    assert!(!zsh_marker.exists());
+    assert!(!bash_marker.exists());
+    assert!(fish_marker.exists());
+}
+
+#[test]
+fn uninstall_clears_declined_marker() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    let marker = declined_marker_path(&env, "zsh");
+    install_zsh(&env, InstallOpts::default()).unwrap();
+    write(&marker, "");
+
+    uninstall(&env, "zsh", UninstallOpts::default()).unwrap();
+
+    assert!(!marker.exists());
+
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    let marker = declined_marker_path(&env, "zsh");
+    install_zsh(&env, InstallOpts::default()).unwrap();
+    write(&marker, "");
+
+    uninstall(
+        &env,
+        "zsh",
+        UninstallOpts {
+            dry_run: true,
+            ..UninstallOpts::default()
+        },
+    )
+    .unwrap();
+
+    assert!(marker.exists());
+}
+
+#[test]
 fn bash_login_precedence_picks_bash_login_when_present() {
     let tmp = TempDir::new().unwrap();
     let env = env_for(&tmp);
     write(&env.home.join(".bash_login"), "");
-    install(&env, "bash", &mut fake_cmd(), InstallOpts::default()).unwrap();
+    install(&env, "bash", InstallOpts::default()).unwrap();
     assert!(read(&env.home.join(".bash_login")).contains("# >>> ji shell integration >>>"));
     assert!(!env.home.join(".bash_profile").exists());
 }
@@ -338,7 +486,7 @@ fn bash_login_precedence_picks_bash_login_when_present() {
 fn bash_all_absent_creates_bash_profile() {
     let tmp = TempDir::new().unwrap();
     let env = env_for(&tmp);
-    install(&env, "bash", &mut fake_cmd(), InstallOpts::default()).unwrap();
+    install(&env, "bash", InstallOpts::default()).unwrap();
     let bp = env.home.join(".bash_profile");
     assert!(bp.exists());
     assert!(read(&bp).contains("# >>> ji shell integration >>>"));
@@ -423,14 +571,37 @@ fn status_does_not_panic() {
     let tmp = TempDir::new().unwrap();
     let env = env_for(&tmp);
     install_zsh(&env, InstallOpts::default()).unwrap();
-    status(&env, Some("zsh"), &mut fake_cmd()).unwrap();
+    status(&env, Some("zsh")).unwrap();
+}
+
+#[test]
+fn status_with_bypass_alias_does_not_panic() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    write(&env.home.join(".zshrc"), "alias ji=/opt/bin/ji\n");
+
+    install_zsh(&env, InstallOpts::default()).unwrap();
+
+    status(&env, Some("zsh")).unwrap();
+}
+
+#[test]
+fn benign_alias_still_installs() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp);
+    write(
+        &env.home.join(".zshrc"),
+        "alias jcsi='ji config shell init zsh'\n",
+    );
+
+    install_zsh(&env, InstallOpts::default()).unwrap();
 }
 
 #[test]
 fn fish_install_writes_functions_wrapper_and_completions() {
     let tmp = TempDir::new().unwrap();
     let env = env_for(&tmp);
-    install(&env, "fish", &mut fake_cmd(), InstallOpts::default()).unwrap();
+    install(&env, "fish", InstallOpts::default()).unwrap();
     assert!(env.xdg_config_home.join("fish/functions/ji.fish").exists());
     assert!(
         env.xdg_config_home
@@ -448,7 +619,7 @@ fn fish_user_authored_completions_refused_without_force() {
     let env = env_for(&tmp);
     let comp = env.xdg_config_home.join("fish/completions/ji.fish");
     write(&comp, "# user authored, NOT ji-managed\n");
-    let err = install(&env, "fish", &mut fake_cmd(), InstallOpts::default()).unwrap_err();
+    let err = install(&env, "fish", InstallOpts::default()).unwrap_err();
     assert!(format!("{err}").contains("not ji-managed"));
 }
 
@@ -461,7 +632,6 @@ fn fish_user_authored_completions_overwritten_with_force() {
     install(
         &env,
         "fish",
-        &mut fake_cmd(),
         InstallOpts {
             force: true,
             ..InstallOpts::default()
@@ -477,7 +647,7 @@ fn fish_shadow_file_in_conf_d_refused() {
     let env = env_for(&tmp);
     let shadow = env.xdg_config_home.join("fish/conf.d/ji.fish");
     write(&shadow, "function ji; echo other; end\n");
-    let err = install(&env, "fish", &mut fake_cmd(), InstallOpts::default()).unwrap_err();
+    let err = install(&env, "fish", InstallOpts::default()).unwrap_err();
     assert!(format!("{err}").contains("shadow"));
 }
 
@@ -487,7 +657,7 @@ fn fish_user_authored_functions_ji_refused_without_force() {
     let env = env_for(&tmp);
     let p = env.xdg_config_home.join("fish/functions/ji.fish");
     write(&p, "function ji; echo custom; end\n");
-    let err = install(&env, "fish", &mut fake_cmd(), InstallOpts::default()).unwrap_err();
+    let err = install(&env, "fish", InstallOpts::default()).unwrap_err();
     assert!(format!("{err}").contains("not ji-managed"));
 }
 
@@ -500,7 +670,6 @@ fn fish_shadow_file_overridden_with_force_then_cleaned_by_uninstall() {
     install(
         &env,
         "fish",
-        &mut fake_cmd(),
         InstallOpts {
             force: true,
             ..InstallOpts::default()

@@ -140,7 +140,7 @@ Line-editing keys (inside any text field): `Ctrl+a` (start), `Ctrl+e` (end), `Ct
 
 Both open the same dialog. `x` opens it in close mode (the source workspace is forgotten after the operation); `t` opens it in transfer mode (both workspaces stay open). The dialog lists the operations available for the current sync state between source and target, along with a live preview of the jj command sequence that will run.
 
-This command preview is worth highlighting: it is ji's honest statement of what the operation will do. If you are learning jj, reading (and `c`-copying) the preview is a reliable way to see how fast-forward / merge / rebase / squash map to sequences of `jj new`, `jj rebase`, and friends.
+The command preview is ji's honest statement of what the operation will do. If you are learning jj, reading (and `c`-copying) the preview is a reliable way to see how fast-forward / merge / rebase / squash map to sequences of `jj new`, `jj rebase`, and friends.
 
 | Key | Action |
 |---|---|

@@ -134,7 +134,7 @@ struct App {
     repo_root: PathBuf,
     current_root: PathBuf,
     /// The actual directory `ji` was launched from (may be a subdirectory of a
-    /// workspace). The post-close rescue check keys on whether THIS still exists,
+    /// workspace). The post-close rescue check keys on whether this still exists,
     /// not the workspace root.
     launch_cwd: PathBuf,
     repo_name: String,
@@ -154,7 +154,7 @@ struct App {
     /// window is detected by the gate, never masked).
     fresh_op_head: String,
     /// Op head at the last staleness probe (the `refresh()` loop or
-    /// `refresh_staleness`). `refresh_staleness` skips its LIVE (snapshotting)
+    /// `refresh_staleness`). `refresh_staleness` skips its live (snapshotting)
     /// probe when the head has not moved since: a workspace can only become
     /// jj-stale via an operation, and every operation moves the op head, so an
     /// unchanged head means no new staleness is possible. Keeps the periodic /
@@ -207,7 +207,7 @@ struct App {
 }
 
 enum Action {
-    /// A user-initiated switch — cd IS the operation (non-zero if it can't cd).
+    /// A user-initiated switch — cd is the operation (non-zero if it can't cd).
     SwitchTo(PathBuf),
     /// cd to safety after closing the workspace the user was standing in. `origin`
     /// is the launch cwd; on cd-unavailable it's a rescue (loud + non-zero) iff
@@ -233,7 +233,7 @@ fn post_close_action(launch_cwd: &Path, repo_root: &Path) -> Action {
 /// `run_tui`'s drain block can run it. See `App::pending_handoff` for the
 /// coverage invariant.
 ///
-/// Variants must hold OWNED data only — the drain block consumes the value
+/// Variants must hold owned data only — the drain block consumes the value
 /// (`match handoff { … }`), so any borrowed reference would prevent the
 /// move-into-borrow-typed-param-struct pattern used by `Close`/`Transfer`
 /// (and the equivalent move-semantics future variants need).
@@ -270,11 +270,11 @@ enum PendingHandoff {
     /// `jj bookmark create --revision <change_id> -- <name>`. Records
     /// `"bookmark create {name}"` in action history.
     BookmarkCreate { name: String, change_id: String },
-    /// Sequence: save_all_stale_diffs(repo_root) THEN update_stale(repo_root).
+    /// Sequence: save_all_stale_diffs(repo_root) then update_stale(repo_root).
     /// Fused so the user sees one working screen rather than two.
     /// Triggered from `Mode::StaleAlert` + 'r'.
     UpdateStaleSequence,
-    /// Sequence: save_all_stale_diffs(ws_path) THEN update_workspace_stale(ws_path).
+    /// Sequence: save_all_stale_diffs(ws_path) then update_workspace_stale(ws_path).
     /// Per-workspace counterpart of `UpdateStaleSequence`. Triggered from
     /// `Mode::UpdateStale` + 'y'.
     UpdateWorkspaceStale {
@@ -717,8 +717,8 @@ impl App {
             })
         });
 
-        // Freshness invariant (load-bearing): probe staleness over the PRIOR
-        // workspace list FIRST. `is_workspace_stale` runs a LIVE `jj status`,
+        // Freshness invariant (load-bearing): probe staleness over the prior
+        // workspace list first. `is_workspace_stale` runs a live `jj status`,
         // which snapshots pending working-copy edits — so every list-derived
         // value read below (revisions, bookmarks, change ids) is
         // post-snapshot. Mutating dialogs (sync/close/transfer) depend on
@@ -761,7 +761,7 @@ impl App {
         }
         self.workspace_list.set_stale_names(stale_names);
         // fresh_op_head (the dialog baseline) is captured inside rebuild_lists,
-        // BEFORE the list query it represents. refresh() also just probed every
+        // before the list query it represents. refresh() also just probed every
         // workspace's staleness (the live probe snapshots), so re-baseline the
         // periodic-poll gate to that same post-probe head.
         self.last_stale_probe_op_head
@@ -772,7 +772,7 @@ impl App {
     }
 
     /// Workspace (name, path) pairs eligible for the staleness probe
-    /// (non-empty, existing paths) — from the CURRENT `workspace_list`.
+    /// (non-empty, existing paths) — from the current `workspace_list`.
     fn ws_probe_paths(&self) -> Vec<(String, PathBuf)> {
         self.workspace_list
             .workspaces()
@@ -806,7 +806,7 @@ impl App {
     /// Returns `false` if `list_workspaces` failed — the prior list is left
     /// in place (stale), so the caller must fail closed for mutating dialogs.
     fn rebuild_lists(&mut self, focused: Option<&(String, String)>) -> bool {
-        // Op head captured BEFORE the list query, so the dialog baseline derived
+        // Op head captured before the list query, so the dialog baseline derived
         // from the rebuilt list is <= the list's freshness: an external op
         // landing after this point yields current != baseline at the execute
         // gate (Changed/refresh), never a masked stale plan. The probe-loop
@@ -880,7 +880,7 @@ impl App {
     /// Query all workspaces for staleness and update the visual indicators.
     ///
     /// Indicator-only variant used by periodic / selection polls; the probe is
-    /// LIVE (snapshot side effect) so it is GATED on op-head movement: a
+    /// live (snapshot side effect) so it is gated on op-head movement: a
     /// workspace can only become jj-stale via an operation, and every operation
     /// moves the op head, so an unchanged head means no new staleness is
     /// possible — skip, leaving an idle repo's pending edits un-snapshotted.
@@ -1023,7 +1023,7 @@ impl App {
             return false;
         };
         // Compare against the freshness baseline (op head when the dialog data
-        // was last refreshed), NOT the recompute-mutated `sync_info.op_head`
+        // was last refreshed), not the recompute-mutated `sync_info.op_head`
         // (re-stamped to "now" on every target change), which would mask
         // external movement that happened before the user pressed Enter.
         info.op_head.clone_from(&dialog.freshness_baseline);
@@ -1086,7 +1086,7 @@ impl App {
     /// recompute, and the warning banner. User selections survive.
     fn stale_refresh_sync_dialog(&mut self, src_name: &str) {
         self.refresh();
-        // If the refresh could not produce reliable list data, do NOT
+        // If the refresh could not produce reliable list data, do not
         // re-resolve the dialog from the stale list — leave the prior plan,
         // surface the reason, and let the gate refuse the next Enter.
         if let Some(reason) = self.dialog_open_block {
@@ -1121,7 +1121,7 @@ impl App {
 
     /// Execute-time freshness gate for the close/transfer dialog (strict:
     /// the executable plan spans revisions/bookmarks/target entries beyond
-    /// `SyncModeInfo`, so ANY op-head movement refreshes and re-confirms).
+    /// `SyncModeInfo`, so any op-head movement refreshes and re-confirms).
     fn gate_close_execute(&mut self, op: Operation) -> bool {
         // See gate_sync_execute: refuse to execute against possibly-stale list
         // data; re-attempt via stale_refresh so Enter literally retries.
@@ -1200,7 +1200,7 @@ impl App {
     /// selections (operation, toggles, target-by-name) survive.
     fn stale_refresh_close_dialog(&mut self, op: Operation) {
         self.refresh();
-        // If the refresh could not produce reliable list data, do NOT
+        // If the refresh could not produce reliable list data, do not
         // re-resolve from the stale list — leave the prior plan, surface the
         // reason, and let the gate refuse the next Enter.
         if let Some(reason) = self.dialog_open_block {
@@ -3206,7 +3206,7 @@ impl App {
 }
 
 // ===========================================================================
-// Non-interactive CLI commands (unchanged — these still exit after execution)
+// Non-interactive CLI commands (exit after execution)
 // ===========================================================================
 
 /// Non-interactive workspace switch (used by `ji switch <target>`).
@@ -3563,7 +3563,7 @@ fn drain_pending_handoff(
             );
             match result {
                 Ok(create_result) => {
-                    // Defer the select_by_name until AFTER the post-match
+                    // Defer the select_by_name until after the post-match
                     // `app.refresh()` — at this point `workspace_list` is
                     // still the pre-create snapshot and does not contain
                     // the new workspace, so calling select_by_name now would
@@ -3680,7 +3680,7 @@ fn drain_pending_handoff(
         app.enter_op_log();
     }
     // Bookmark batch ops keep the dialog open against the freshly-refreshed
-    // workspace state. Must run AFTER `app.refresh()` so workspace_list
+    // workspace state. Must run after `app.refresh()` so workspace_list
     // reflects the new state.
     if rebuild_bookmarks_after {
         if let Some(ws) = app.workspace_list.selected_workspace() {
@@ -3761,9 +3761,9 @@ pub fn run() -> Result<()> {
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         // Only exit if there's no pending deferred work. An event handler
-        // can set BOTH `app.action = Some(Action::SwitchTo(...))` AND
+        // can set both `app.action = Some(Action::SwitchTo(...))` and
         // `app.pending_handoff = Some(...)` in the same step (e.g. the
-        // `ConfirmRemoveFiles` 'y' handler, which switches workspaces AND
+        // `ConfirmRemoveFiles` 'y' handler, which switches workspaces and
         // queues a directory deletion); if we honoured the
         // quit signal here we'd skip the drain entirely and the deferred
         // action would be lost.
@@ -3849,7 +3849,7 @@ mod tests {
         let repo_root = PathBuf::from("/repo");
         match post_close_action(&launch_cwd, &repo_root) {
             Action::CloseCd { origin, safety } => {
-                assert_eq!(origin, launch_cwd); // the cwd, NOT the workspace root
+                assert_eq!(origin, launch_cwd); // the cwd, not the workspace root
                 assert_eq!(safety, repo_root);
             }
             _ => panic!("expected CloseCd"),

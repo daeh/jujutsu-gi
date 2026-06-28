@@ -193,6 +193,13 @@ tasks:
       - cargo upgrade --incompatible
       - cargo update
       - cargo fetch
+      # clap + clap_complete are pulled in via their UNSTABLE features
+      # (unstable-ext for `#[arg(add = …)]`, unstable-dynamic for `CompleteEnv` /
+      # `ArgValueCompleter`) to drive dynamic shell completion. Those APIs can
+      # change between releases with NO semver signal, so the bump above can
+      # break completion silently — hence the warning below.
+      - |
+        echo "WARNING: clap/clap_complete were upgraded — their unstable-ext / unstable-dynamic APIs drive dynamic shell completion and can change with no semver signal. Re-verify before relying on this build: task build && cargo test, then a manual COMPLETE=zsh ./target/debug/ji -- ji switch '' check (also bash, fish)."
 
   # === INTERACTIVE TESTING ===
 

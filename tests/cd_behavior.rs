@@ -1,10 +1,10 @@
 //! Binary-level integration tests for `ji`'s parent-shell cd behavior.
 //!
 //! Each test runs the real `ji` binary (`CARGO_BIN_EXE_ji`) in a temp jj repo
-//! with an ISOLATED shell env (HOME/XDG_CONFIG_HOME/ZDOTDIR/SHELL, null stdin,
+//! with an isolated shell env (HOME/XDG_CONFIG_HOME/ZDOTDIR/SHELL, null stdin,
 //! and a controlled `JI_DIRECTIVE_FILE`), so a developer's real installed
 //! wrapper can't affect the result. These assert exit status / target path /
-//! quiet stderr / rescue wording — NOT the exact diagnosed reason (the
+//! quiet stderr / rescue wording — not the exact diagnosed reason (the
 //! process-tree walk sees the real ancestor shell), which is covered by the
 //! pure `cd_reason` unit tests in `src/shell.rs`.
 
@@ -98,6 +98,10 @@ impl Repo {
 
 fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+fn stdout(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
 #[test]
@@ -199,7 +203,7 @@ fn close_default_is_refused() {
 #[test]
 fn rescue_when_current_workspace_deleted() {
     let r = Repo::new();
-    // Standing IN the feature workspace, close it into default AND delete its files.
+    // Standing in the feature workspace, close it into default and delete its files.
     let o = r.run(&r.feature_ws, &["close", "--delete-files", "default"], None);
     let e = stderr(&o);
     assert!(
@@ -219,7 +223,7 @@ fn rescue_when_current_workspace_deleted() {
 #[test]
 fn benign_close_keeps_dir_exits_zero_with_hint() {
     let r = Repo::new();
-    // Close feature into default WITHOUT --delete-files: the dir survives → benign.
+    // Close feature into default without --delete-files: the dir survives → benign.
     let o = r.run(&r.feature_ws, &["close", "default"], None);
     let e = stderr(&o);
     assert!(
@@ -256,4 +260,29 @@ fn install_non_tty_does_not_hang_or_prompt() {
     );
     // It wrote the managed file rather than waiting for input.
     assert!(r.home.join(".config/ji/init.zsh").exists());
+}
+
+#[test]
+fn install_single_shell_output_is_stable() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    std::fs::write(home.join(".zshrc"), "").unwrap();
+
+    let o = Command::new(env!("CARGO_BIN_EXE_ji"))
+        .args(["config", "shell", "install", "zsh", "--dry-run"])
+        .current_dir(home)
+        .stdin(Stdio::null())
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("ZDOTDIR", home)
+        .env("SHELL", "/bin/zsh")
+        .env_remove("JI_DIRECTIVE_FILE")
+        .output()
+        .expect("run ji");
+
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("--- "), "stdout: {s}");
+    assert!(s.contains("+++ "), "stdout: {s}");
+    assert!(s.contains("# >>> ji shell integration >>>"), "stdout: {s}");
 }

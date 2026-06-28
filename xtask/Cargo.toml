@@ -8,6 +8,5 @@ description = "Build-side tooling for ji (man pages, completions)."
 [dependencies]
 anyhow = "1"
 clap = "4.6"
-clap_complete = "4.6"
 clap_mangen = "0.3"
 ji = { path = ".." }

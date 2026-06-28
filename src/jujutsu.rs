@@ -3,9 +3,10 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::sync::{OnceLock, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const MIN_JJ_VERSION: &str = "0.42.0";
 const JJ_INSTALL_URL: &str = "https://jj-vcs.github.io/jj/latest/install-and-setup/";
@@ -111,8 +112,9 @@ pub(crate) fn records(output: &str) -> impl Iterator<Item = &str> {
 // `--ignore-working-copy`.
 //   - omit (live):    `jj_cmd_wc`, `jj_cmd_ws_wc` (+ the `run_jj_ws_live`
 //                     wrapper)
-//   - include (read): `jj_cmd`, `jj_cmd_ws`, `jj_cmd_bootstrap` (+ `run_jj`
-//                     and the raw readers consuming them)
+//   - include (read): `jj_cmd`, `jj_cmd_ws`, `jj_cmd_bootstrap` (+ `run_jj`,
+//                     `run_jj_bootstrap_timeout`, and the raw readers
+//                     consuming them)
 // Every jj subprocess in production code is constructed via one of these
 // builders (`run_jj*`, `run_jj_output`, and direct `.status()` calls all
 // consume one); the only exceptions are the builder bodies themselves and
@@ -121,7 +123,10 @@ pub(crate) fn records(output: &str) -> impl Iterator<Item = &str> {
 //
 // Variant taxonomy — which form belongs at a site:
 //
-// 1. Read recorded state ........ ignore-WC (`jj_cmd`/`jj_cmd_ws`/`run_jj`).
+// 1. Read recorded state ........ ignore-WC (`jj_cmd`/`jj_cmd_ws`/`run_jj`);
+//    per-keystroke shell completion reads via `jj_cmd_bootstrap` +
+//    `run_jj_bootstrap_timeout` (cwd-relative, no version check, no `-R`,
+//    bounded ~9s timeout) — `completion_workspaces`/`completion_local_bookmarks`.
 // 2. Involved-workspace freshness (gate / CLI entry) ... explicit
 //    `snapshot_ws` (conditional) via `commands::snapshot_workspaces` —
 //    capture src/tgt pending edits so the planned operation reflects
@@ -187,7 +192,7 @@ fn jj_cmd(repo: &Path) -> Command {
     cmd
 }
 
-/// Build a `Command` targeting a repo via `--repository` WITHOUT `--ignore-working-copy`.
+/// Build a `Command` targeting a repo via `--repository` without `--ignore-working-copy`.
 /// Use only for commands that must read/write the working copy (Live policy).
 fn jj_cmd_wc(repo: &Path) -> Command {
     let mut cmd = Command::new("jj");
@@ -202,7 +207,7 @@ pub(crate) fn jj_cmd_ws(ws_path: &Path) -> Command {
     cmd
 }
 
-/// Build a `Command` targeting a workspace via `current_dir` WITHOUT `--ignore-working-copy`.
+/// Build a `Command` targeting a workspace via `current_dir` without `--ignore-working-copy`.
 /// Use only for commands that must read/write the working copy (Live policy).
 fn jj_cmd_ws_wc(ws_path: &Path) -> Command {
     let mut cmd = Command::new("jj");
@@ -231,7 +236,7 @@ pub(crate) fn run_jj(repo: &Path, args: &[&str]) -> Result<String> {
 /// copy — including mtime-only changes — produces "No snapshot needed." and
 /// leaves the op head untouched; only a content change creates an operation.
 ///
-/// FAILS on a jj-stale working copy. Callers rely on this both as a safety
+/// Fails on a jj-stale working copy. Callers rely on this both as a safety
 /// property (`workspace_forget`) and as a classifier (the execution-time
 /// protection phase skips workspaces whose snapshot failed *because* they
 /// are stale — see `commands::prepare_execution_freshness`).
@@ -258,7 +263,7 @@ pub fn snapshot_ws(ws_path: &Path) -> Result<()> {
 /// *ahead* of it (pending edits).
 ///
 /// No production caller, by design: this is the non-mutating WC-ahead
-/// primitive reserved for a future unsaved-edits indicator. It is NOT a
+/// primitive reserved for a future unsaved-edits indicator. It is not a
 /// cheap pre-check for `snapshot_ws` — it scans the whole working copy and
 /// writes staged (non-integrated) op-store data, so probe-then-snapshot is
 /// pure overhead over a direct (already-conditional) `snapshot_ws`.
@@ -293,7 +298,7 @@ pub fn has_unsnapshotted_changes(ws_path: &Path) -> Result<bool> {
     Ok(recorded != preview)
 }
 
-/// Run a jj command in a workspace directory WITHOUT `--ignore-working-copy`.
+/// Run a jj command in a workspace directory without `--ignore-working-copy`.
 /// jj will auto-snapshot the workspace's working copy before executing.
 pub(crate) fn run_jj_ws_live(ws_path: &Path, args: &[&str]) -> Result<String> {
     run_jj_inner(jj_cmd_ws_wc(ws_path), args)
@@ -326,7 +331,7 @@ fn classify_jj_nonzero(args: &[&str], stderr: &[u8]) -> anyhow::Error {
     }
 }
 
-/// Run a jj subprocess WITHOUT a version check. Used by:
+/// Run a jj subprocess without a version check. Used by:
 /// - the bootstrap path (`workspace_root_by_name`) so shell-integration
 ///   commands like `ji config shell install` don't require a working jj.
 /// - the version check itself (`jj_version()`), to avoid recursion.
@@ -355,6 +360,82 @@ fn run_jj_raw(mut cmd: Command, args: &[&str]) -> Result<String> {
 pub(crate) fn run_jj_inner(cmd: Command, args: &[&str]) -> Result<String> {
     check_min_jj_version_once()?;
     run_jj_raw(cmd, args)
+}
+
+/// Run a bootstrap jj command (`--ignore-working-copy`, no `-R`, no version
+/// check) under a wall-clock timeout, for per-keystroke shell completion.
+///
+/// Snapshot policy: bucket 1 (reads recorded state) — `cmd` must come from
+/// `jj_cmd_bootstrap()` so `--ignore-working-copy` is present.
+///
+/// Polls the child's exit against the deadline, so the prompt can't freeze even
+/// if jj closes stdout but never exits — which waiting on `.output()` or on the
+/// reader's EOF would allow. stderr is discarded; stdout drains on a reader
+/// thread so a full pipe can't deadlock the child. On timeout the child is
+/// killed, reaped, and the reader detached. Returns the trimmed stdout, or an
+/// error (timeout, spawn failure, nonzero exit) the caller turns into an empty
+/// candidate list. Call sites pass `--no-pager` so no pager grandchild lingers
+/// on the stdout pipe.
+fn run_jj_bootstrap_timeout(mut cmd: Command, args: &[&str], timeout: Duration) -> Result<String> {
+    use std::io::Read as _;
+    let start = Instant::now();
+    let mut child = cmd
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| classify_jj_spawn_failure(e, args))?;
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    // Poll for exit against the deadline; kill if it overruns.
+    let deadline = start + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap (SIGKILL is uninterruptible)
+                    drop(reader); // detach — never block on a grandchild-held pipe
+                    anyhow::bail!("jj completion query timed out after {timeout:?}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(reader);
+                return Err(anyhow::Error::new(e).context("waiting on jj completion query"));
+            }
+        }
+    };
+    // Exited in time. Take the drained stdout, but don't block forever if
+    // something still holds the pipe open.
+    let bytes = match rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(buf) => {
+            let _ = reader.join(); // reader has sent, so join returns immediately
+            buf
+        }
+        Err(_) => Vec::new(),
+    };
+    // Nonzero exit = a failed query (e.g. not in a repo); don't parse the
+    // partial output it left behind.
+    if !status.success() {
+        anyhow::bail!("jj completion query exited unsuccessfully ({status})");
+    }
+    crate::subprocess_log::log_subprocess(&args.join(" "), start.elapsed());
+    Ok(String::from_utf8(bytes)
+        .context("invalid utf-8")?
+        .trim()
+        .to_string())
 }
 
 /// Run a `Command`, log the invocation if logging is enabled, and return the
@@ -681,6 +762,29 @@ const LIST_TEMPLATE: &str = concat!(
     r#" ++ "\x1e""#,
 );
 
+/// Unquote a workspace name from `jj workspace list` output: jj wraps names
+/// containing spaces in double quotes and escapes inner quotes/backslashes.
+pub(crate) fn unquote_ws_name(raw: &str) -> String {
+    if raw.len() > 1 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Parse a `self.root()` field: jj emits `<Error: …>` for a deleted workspace
+/// directory; map that (and only that) to `None`, otherwise the path.
+pub(crate) fn parse_ws_root(raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.contains("<Error") {
+        None
+    } else {
+        Some(PathBuf::from(raw))
+    }
+}
+
 /// Lightweight workspace record from a single `jj workspace list` call.
 ///
 /// Used where only identity-level data is needed (the execution-time
@@ -696,7 +800,7 @@ pub struct WorkspaceEntry {
     pub description: String,
 }
 
-/// List workspaces with ONE jj call (no per-workspace enrichment).
+/// List workspaces with one jj call (no per-workspace enrichment).
 pub fn list_workspace_entries(repo: &Path) -> Result<Vec<WorkspaceEntry>> {
     let stdout = run_jj(repo, &["workspace", "list", "--template", LIST_TEMPLATE])?;
     let mut entries = Vec::new();
@@ -705,22 +809,10 @@ pub fn list_workspace_entries(repo: &Path) -> Result<Vec<WorkspaceEntry>> {
         if fields.len() < 4 {
             anyhow::bail!("unexpected workspace list format: {record}");
         }
-        // jj wraps names containing spaces in double quotes for display
-        // and escapes inner quotes/backslashes. Strip and unescape.
-        let raw_name = fields[0];
-        let name = if raw_name.starts_with('"') && raw_name.ends_with('"') && raw_name.len() > 1 {
-            raw_name[1..raw_name.len() - 1]
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\")
-        } else {
-            raw_name.to_string()
-        };
-        let raw_path = fields[1].trim();
-        let path = if raw_path.contains("<Error") {
-            PathBuf::new()
-        } else {
-            PathBuf::from(raw_path)
-        };
+        // jj quotes names containing spaces and emits a `<Error…>` sentinel
+        // for a deleted workspace root; shared helpers handle both.
+        let name = unquote_ws_name(fields[0]);
+        let path = parse_ws_root(fields[1]).unwrap_or_default();
         entries.push(WorkspaceEntry {
             name,
             path,
@@ -793,9 +885,118 @@ pub fn list_workspaces(repo: &Path) -> Result<Vec<Workspace>> {
     Ok(workspaces)
 }
 
+// ---------------------------------------------------------------------------
+// Shell-completion readers (per-keystroke; one non-mutating bootstrap call each)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock ceiling for a single completion query: a safety net for a wedged
+/// jj, not the expected latency (normally well under 100 ms).
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(9);
+
+/// Template: `name \x1f committer-epoch \x1f root \x1e`. Root goes last because
+/// `self.root()` is an unescaped filesystem path that may contain our `\x1f`
+/// delimiter; as the final field it survives `splitn` whole. The name is
+/// jj-escaped and the epoch is digits, so neither holds a delimiter.
+const COMPLETION_WS_TEMPLATE: &str = concat!(
+    r#"name ++ "\x1f""#,
+    r#" ++ self.target().committer().timestamp().format("%s") ++ "\x1f""#,
+    r#" ++ self.root()"#,
+    r#" ++ "\x1e""#,
+);
+
+/// A workspace as needed for shell completion.
+pub struct CompletionWorkspace {
+    pub name: String,
+    /// `None` when jj reports the `<Error…>` sentinel (deleted dir).
+    pub root: Option<PathBuf>,
+    /// `@`'s committer timestamp (epoch seconds) — "last touched". Not
+    /// `last_nonempty_timestamp`, which would cost a jj call per workspace; this
+    /// rides along in the single `workspace list` call.
+    pub last_touched: Option<i64>,
+}
+
+/// List workspaces for shell completion in one non-mutating jj subprocess from
+/// cwd (no version check, no `-R` — jj resolves the repo from cwd) under a
+/// bounded timeout. Any error (not in a repo, timeout, …) is returned for the
+/// caller to turn into an empty candidate list.
+pub fn completion_workspaces() -> Result<Vec<CompletionWorkspace>> {
+    let stdout = run_jj_bootstrap_timeout(
+        jj_cmd_bootstrap(),
+        &[
+            "--no-pager",
+            "workspace",
+            "list",
+            "--template",
+            COMPLETION_WS_TEMPLATE,
+        ],
+        COMPLETION_TIMEOUT,
+    )?;
+    Ok(parse_completion_workspaces(&stdout))
+}
+
+/// Parse `COMPLETION_WS_TEMPLATE` records. `splitn(3)` is safe because root —
+/// the only field that can hold a delimiter — comes last (see the template).
+fn parse_completion_workspaces(stdout: &str) -> Vec<CompletionWorkspace> {
+    let mut out = Vec::new();
+    for record in records(stdout) {
+        let mut fields = record.splitn(3, DELIM_FIELD);
+        let (Some(name), Some(ts), Some(root)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue; // fewer than 3 fields → malformed → skip (fail-soft)
+        };
+        out.push(CompletionWorkspace {
+            name: unquote_ws_name(name),
+            root: parse_ws_root(root),
+            last_touched: ts.trim().parse::<i64>().ok(),
+        });
+    }
+    out
+}
+
+/// Local bookmark names with their commit's committer timestamp, for `ji new`
+/// completion — one non-mutating bootstrap subprocess under a bounded timeout.
+/// Local only: `local_bookmarks` is a `jj log` template keyword (not valid in
+/// `jj bookmark list --template`), and a commit matched by `bookmarks()` that
+/// carries only a remote bookmark yields an empty field, skipped below.
+pub fn completion_local_bookmarks() -> Result<Vec<(String, Option<i64>)>> {
+    // Epoch (digits) first; the name list goes last so `splitn` keeps it whole
+    // if a name ever holds a `\x1f` (defensive — they don't in practice).
+    const TEMPLATE: &str = concat!(
+        r#"committer.timestamp().format("%s") ++ "\x1f""#,
+        r#" ++ local_bookmarks.map(|b| b.name()).join("\x01")"#,
+        r#" ++ "\x1e""#,
+    );
+    let stdout = run_jj_bootstrap_timeout(
+        jj_cmd_bootstrap(),
+        &[
+            "--no-pager",
+            "log",
+            "--no-graph",
+            "--revision",
+            "bookmarks()",
+            "--template",
+            TEMPLATE,
+        ],
+        COMPLETION_TIMEOUT,
+    )?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for record in records(&stdout) {
+        let mut fields = record.splitn(2, DELIM_FIELD);
+        let ts = fields.next().and_then(|t| t.trim().parse::<i64>().ok());
+        let names = fields.next().unwrap_or("");
+        for name in names.split(DELIM_LIST).filter(|n| !n.is_empty()) {
+            if seen.insert(name.to_string()) {
+                out.push((name.to_string(), ts));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Topologically order workspaces, children before parents (descendant-first).
 ///
-/// Returns indices into `entries`. ONE `jj log` over all workspace `@`s
+/// Returns indices into `entries`. one `jj log` over all workspace `@`s
 /// (jj log's default order is reverse-topological), mapped back to entries
 /// by change id. Entries whose change id doesn't appear (e.g. raced away)
 /// keep their relative order at the end.
@@ -966,7 +1167,6 @@ pub fn create_bookmark_at(repo: &Path, bookmark_name: &str, revision: &str) -> R
     Ok(())
 }
 
-/// Check if a bookmark exists (resolves to at least one revision).
 /// Resolve a bookmark to its change_id (8-char short form). Returns None if
 /// the bookmark doesn't exist.
 pub fn bookmark_change_id(repo: &Path, bookmark: &str) -> Option<String> {
@@ -1268,7 +1468,7 @@ pub(crate) fn metaedit_author_in_workspace(ws_path: &Path, author: &str) -> Resu
 /// Uses `current_dir(ws_path)` so the workspace's `@` is updated.
 /// Returns the change-id of the newly created merge revision.
 ///
-/// Runs WITHOUT `--ignore-working-copy` so jj auto-snapshots pending edits
+/// Runs without `--ignore-working-copy` so jj auto-snapshots pending edits
 /// into the current `@` before creating the merge. This is safe because
 /// `new_merge` is always the first `@`-mutation of its workspace.
 pub fn new_merge(
@@ -1456,7 +1656,7 @@ pub fn is_stale_error(err: &anyhow::Error) -> bool {
 /// Check whether the working copy is stale by running a lightweight command
 /// without `--ignore-working-copy` (Live policy: must probe live WC state).
 ///
-/// (`--no-graph` is NOT a `jj status` flag — passing it made this exit 2 at
+/// (`--no-graph` is not a `jj status` flag — passing it made this exit 2 at
 /// argument parsing, so the check silently always returned `false`. Same bug
 /// as the sibling `is_workspace_stale`.)
 pub fn is_working_copy_stale(repo: &Path) -> bool {
@@ -1483,13 +1683,13 @@ pub fn update_stale(repo: &Path) -> Result<String> {
 /// Check if a specific workspace's working copy is stale.
 /// Live policy: must probe live WC state.
 ///
-/// LOAD-BEARING side effect: the live `jj status` snapshots the workspace's
-/// pending working-copy edits. The TUI's `refresh()` runs this probe BEFORE
+/// Load-bearing side effect: the live `jj status` snapshots the workspace's
+/// pending working-copy edits. The TUI's `refresh()` runs this probe before
 /// rebuilding its workspace list precisely so that list-derived dialog data
 /// (revisions, bookmarks, change ids) reflects post-snapshot reality. Do not
 /// add `--ignore-working-copy` here — a stale-check structurally cannot use
 /// it, and the snapshot side effect is relied upon.
-/// (`--no-graph` is NOT a `jj status` flag; passing it made the whole probe
+/// (`--no-graph` is not a `jj status` flag; passing it made the whole probe
 /// exit 2 at argument parsing — no staleness detection, no snapshot.)
 pub fn is_workspace_stale(ws_path: &Path) -> bool {
     if !ws_path.exists() {
@@ -1950,6 +2150,64 @@ mod tests {
             .sum()
     }
 
+    #[test]
+    fn bootstrap_timeout_bounds_a_slow_child() {
+        // A child that sleeps far past the deadline must return Err promptly
+        // (kill + reap), never blocking the prompt. Uses `sleep`, not jj, so
+        // the `Command::new("jj")` census count is unaffected.
+        let start = Instant::now();
+        let res =
+            run_jj_bootstrap_timeout(Command::new("sleep"), &["30"], Duration::from_millis(150));
+        assert!(res.is_err(), "expected timeout error, got {res:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timeout did not bound the wait: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn bootstrap_timeout_propagates_nonzero_exit() {
+        // `false` exits 1 with no output → no timeout, but a nonzero status →
+        // Err, so the caller yields no candidates (never parses partial stdout).
+        let res = run_jj_bootstrap_timeout(Command::new("false"), &[], Duration::from_secs(5));
+        assert!(res.is_err(), "nonzero exit must be an error, got {res:?}");
+    }
+
+    #[test]
+    fn unquote_ws_name_strips_and_unescapes() {
+        assert_eq!(unquote_ws_name("plain"), "plain");
+        assert_eq!(unquote_ws_name(r#""with space""#), "with space");
+        // jj escapes an inner quote as \" inside the quoted name.
+        assert_eq!(unquote_ws_name(r#""a \" b""#), r#"a " b"#);
+        // and an inner backslash as \\.
+        assert_eq!(unquote_ws_name(r#""a \\ b""#), r"a \ b");
+    }
+
+    #[test]
+    fn completion_workspaces_root_with_delimiter_not_misparsed() {
+        // `self.root()` is an unescaped filesystem path that can contain the
+        // field delimiter; it is last in the template, so splitn captures the
+        // whole path rather than misparsing into a truncated/orphaned candidate
+        // (the concrete case a reviewer found: a workspace root with `\x1f`).
+        let f = DELIM_FIELD;
+        let r = DELIM_RECORD;
+        let stdout =
+            format!("ws-a{f}1700000000{f}/normal/root{r}weird{f}1700000001{f}/has{f}delim{r}");
+        let parsed = parse_completion_workspaces(&stdout);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "ws-a");
+        assert_eq!(parsed[0].last_touched, Some(1_700_000_000));
+        assert_eq!(parsed[0].root.as_deref(), Some(Path::new("/normal/root")));
+        // The embedded delimiter stays inside the captured (last) root field.
+        assert_eq!(parsed[1].name, "weird");
+        assert_eq!(parsed[1].last_touched, Some(1_700_000_001));
+        assert_eq!(
+            parsed[1].root.as_deref(),
+            Some(Path::new(&format!("/has{f}delim")))
+        );
+    }
+
     /// Census tripwire — keeps the snapshot-policy census (doc block above
     /// the core helpers) maintained:
     ///
@@ -1958,7 +2216,7 @@ mod tests {
     ///     file — the five builders plus the version-detection call.
     /// (b) The live/snapshot wrappers have a pinned number of mentions. A
     ///     new call site through an existing wrapper (a new live/snapshot
-    ///     vector) fails this test until the census doc block AND this
+    ///     vector) fails this test until the census doc block and this
     ///     table are updated together.
     ///
     /// Counts are textual occurrences on non-comment lines (definitions
@@ -2001,6 +2259,12 @@ mod tests {
             ("update_workspace_stale", 12),
             ("update_stale", 2),
             ("has_unsnapshotted_changes", 1),
+            // Non-mutating completion bootstrap readers (ignore-WC, bounded
+            // timeout): def + the two completion fns (+ timeout-runner tests for
+            // run_jj_bootstrap_timeout). Pinned so new completion readers trip
+            // this until classified in the census doc block above.
+            ("jj_cmd_bootstrap", 4),
+            ("run_jj_bootstrap_timeout", 5),
         ];
         for (name, want) in expected {
             let pat = format!("{name}(");

@@ -49,8 +49,8 @@ impl GraphPane {
 
     /// Apply dim styling based on change_id membership.
     ///
-    /// When `dim_matched` is false, dims lines whose change_id is NOT in `ids`.
-    /// When `dim_matched` is true, dims lines whose change_id IS in `ids`.
+    /// When `dim_matched` is false, dims lines whose change_id is not in `ids`.
+    /// When `dim_matched` is true, dims lines whose change_id is in `ids`.
     /// Lines with no change_id (graph connectors) are left undimmed.
     pub(crate) fn highlight(&mut self, ids: &HashSet<&str>, dim_matched: bool) {
         let mut text = self.original_text.clone();

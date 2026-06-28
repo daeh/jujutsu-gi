@@ -56,7 +56,7 @@ pub(crate) struct CloseDialog {
     pub source_missing: bool,
     /// Op head at the last point the dialog's data was made fresh (open or an
     /// in-place stale refresh). The execute gate compares the current op head
-    /// against THIS, not `close_info.op_head` — `recompute_close_mode()`
+    /// against this, not `close_info.op_head` — `recompute_close_mode()`
     /// re-stamps the latter to "now" on every target cycle, which would
     /// otherwise mask external movement (stale revisions/bookmarks/target ids)
     /// from the gate.

@@ -57,7 +57,7 @@ codesign -f -s - ~/.local/bin/ji
 ji config shell install [SHELL]
 ```
 
-With no argument it targets the active shell (falling back to `$SHELL`); pass `zsh`, `bash`, or `fish` to install another. The wrapper lets `ji` change your shell's current directory when you switch workspaces. See [shell-integration.md](shell-integration.md) for details and for manual installation.
+With no argument it targets the active shell (falling back to `$SHELL`); pass `zsh`, `bash`, or `fish` to install another, or `--all` to install for every shell that already has a config. The wrapper lets `ji` change your shell's current directory when you switch workspaces. See [shell-integration.md](shell-integration.md) for details and for manual installation.
 
 ## Upgrading
 

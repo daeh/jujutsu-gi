@@ -3,7 +3,7 @@
 //! from the same source.
 
 use clap::builder::styling::{AnsiColor, Color, Style, Styles};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::commands;
 
@@ -48,12 +48,14 @@ pub enum Commands {
     /// Switch to a workspace
     Switch {
         /// Workspace name, bookmark, or change ID prefix
+        #[arg(add = crate::completion::workspace_completer())]
         target: String,
     },
 
     /// Create a new workspace
     New {
         /// Bookmark name for the workspace
+        #[arg(add = crate::completion::new_bookmark_completer())]
         bookmark: String,
 
         /// Revision to branch from (default: @)
@@ -76,10 +78,11 @@ pub enum Commands {
     /// Close a workspace into a target
     Close {
         /// Target workspace (positional unless --source is used)
+        #[arg(add = crate::completion::workspace_completer())]
         target: Option<String>,
 
         /// Source workspace (defaults to current workspace)
-        #[arg(long)]
+        #[arg(long, add = crate::completion::workspace_completer())]
         source: Option<String>,
 
         /// Close method
@@ -94,10 +97,11 @@ pub enum Commands {
     /// Transfer changes between workspaces
     Transfer {
         /// Target workspace (positional unless --source is used)
+        #[arg(add = crate::completion::workspace_completer())]
         target: Option<String>,
 
         /// Source workspace (defaults to current workspace)
-        #[arg(long)]
+        #[arg(long, add = crate::completion::workspace_completer())]
         source: Option<String>,
 
         /// Transfer method
@@ -108,10 +112,11 @@ pub enum Commands {
     /// Sync current workspace with a target
     Sync {
         /// Target workspace (positional unless --source is used)
+        #[arg(add = crate::completion::workspace_completer())]
         target: Option<String>,
 
         /// Source workspace (defaults to current workspace)
-        #[arg(long)]
+        #[arg(long, add = crate::completion::workspace_completer())]
         source: Option<String>,
     },
 
@@ -158,6 +163,10 @@ pub enum ShellCommands {
         /// Shell to install for (defaults to the active shell, falls back to $SHELL)
         shell: Option<String>,
 
+        /// Install for every shell with an existing config (skips shells with none)
+        #[arg(long, conflicts_with = "shell")]
+        all: bool,
+
         /// Print the diff that would be applied, don't write
         #[arg(long)]
         dry_run: bool,
@@ -191,4 +200,52 @@ pub enum ShellCommands {
         /// Shell to inspect (defaults to the active shell, falls back to $SHELL)
         shell: Option<String>,
     },
+}
+
+/// `Cli::command()` adjusted for the completion tree: hide every non-positional
+/// option on each (sub)command so a bare `<TAB>` offers only the positional
+/// candidates (workspaces, bookmarks), not flags. clap_complete still surfaces
+/// the hidden flags once the token starts with `-`. clap's built-in `--help` /
+/// `--version` are added too late for `mut_args` to see, so we disable them and
+/// re-add our own for the hide pass to catch. Only the completion tree changes;
+/// `Cli::parse` is untouched. Passed to `CompleteEnv::with_factory`.
+pub fn completion_command() -> clap::Command {
+    use clap::{Arg, ArgAction};
+
+    fn process(cmd: clap::Command, is_root: bool) -> clap::Command {
+        // Re-add --help so the hide pass below can see it (clap's built-in is
+        // added too late).
+        let cmd = cmd.disable_help_flag(true).arg(
+            Arg::new("help")
+                .short('h')
+                .long("help")
+                .action(ArgAction::Help)
+                .help("Print help"),
+        );
+        // --version exists only on the root command.
+        let cmd = if is_root {
+            cmd.disable_version_flag(true).arg(
+                Arg::new("version")
+                    .short('V')
+                    .long("version")
+                    .action(ArgAction::Version)
+                    .help("Print version"),
+            )
+        } else {
+            cmd
+        };
+        // Hide every non-positional (including the help/version we just re-added):
+        // clap_complete drops hidden args when completing a positional, but still
+        // offers them after `--`.
+        let cmd = cmd.mut_args(|arg| {
+            if arg.is_positional() || arg.is_hide_set() {
+                arg
+            } else {
+                arg.hide(true)
+            }
+        });
+        cmd.mut_subcommands(|sub| process(sub, false))
+    }
+
+    process(Cli::command(), true)
 }

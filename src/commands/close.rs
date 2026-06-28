@@ -80,11 +80,11 @@ pub fn close_with_info(
         bail!("sync state could not be determined: {e}");
     }
 
-    // Validate head info — strict mode for ALL close methods, including
-    // Detach/Abandon (previously exempt): the close plan spans revisions,
+    // Validate head info — strict mode for all close methods, including
+    // Detach/Abandon: the close plan spans revisions,
     // bookmarks, and target entries beyond SyncModeInfo, so any op-head
     // movement since `info` was computed bails rather than executing a
-    // possibly divergent plan. Heads AND lca come from the validated info.
+    // possibly divergent plan. Heads and lca come from the validated info.
     let validated =
         super::validate_head_info(repo, info, params.source_name, params.target_name, false)?;
 
@@ -224,7 +224,7 @@ pub fn close_with_info(
                     params.source_name,
                 );
             }
-            // Resolve effective head BEFORE forget — workspace won't exist after.
+            // Resolve effective head before forget — workspace won't exist after.
             detach_src_head = Some(jj_utils::find_effective_head(repo, params.source_name)?);
             operations::forget_workspace(repo, params.source_path, params.source_name)?;
         }

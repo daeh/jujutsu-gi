@@ -142,7 +142,7 @@ Template variables are applied by **string substitution only** — they are not 
 # Good — the value is substituted into the command string at expansion time.
 touch_marker = "echo {{ change_id }} > .ji/created-at"
 
-# Will NOT work — $workspace_path is not set in the hook's environment.
+# Will not work — $workspace_path is not set in the hook's environment.
 bad = "cd $workspace_path && ls"
 ```
 

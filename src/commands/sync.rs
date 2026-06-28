@@ -61,7 +61,7 @@ pub fn sync_with_info(
     repo_name: &str,
     author: Option<&str>,
 ) -> Result<operations::SyncOutcome> {
-    // Lenient validation: SyncModeInfo IS the complete sync plan, so an
+    // Lenient validation: SyncModeInfo is the complete sync plan, so an
     // op-head move with a plan-equivalent re-detection may proceed (with the
     // fresh info). Anything else bails.
     let validated = super::validate_head_info(repo, info, src_name, tgt_name, true)?;

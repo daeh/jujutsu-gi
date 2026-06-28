@@ -15,6 +15,11 @@ const MANAGED_HEADER: &str = "# ji-managed: do not edit";
 
 const ZSH_WRAPPER: &str = r#"if command -v ji >/dev/null 2>&1; then
     ji() {
+        if [[ -n ${COMPLETE-} ]]; then
+            command ji "$@"
+            return
+        fi
+
         local directive_file exit_code=0
         directive_file="$(mktemp)"
 
@@ -36,6 +41,11 @@ fi
 
 const BASH_WRAPPER: &str = r#"if command -v ji >/dev/null 2>&1; then
     ji() {
+        if [[ -n ${COMPLETE-} ]]; then
+            command ji "$@"
+            return
+        fi
+
         local directive_file exit_code=0
         directive_file="$(mktemp)"
 
@@ -56,6 +66,11 @@ fi
 "#;
 
 const FISH_WRAPPER: &str = r#"function ji --description 'ji workspace switcher (with cd directive support)'
+    if set -q COMPLETE
+        command ji $argv
+        return $status
+    end
+
     set -l directive_file (mktemp)
 
     JI_DIRECTIVE_FILE=$directive_file command ji $argv
@@ -76,15 +91,6 @@ end
 
 const SUPPORTED_SHELLS: &str = "zsh, bash, fish";
 
-fn shell_kind(shell: &str) -> Result<clap_complete::Shell> {
-    match shell {
-        "zsh" => Ok(clap_complete::Shell::Zsh),
-        "bash" => Ok(clap_complete::Shell::Bash),
-        "fish" => Ok(clap_complete::Shell::Fish),
-        other => bail!("unsupported shell: {other} (supported: {SUPPORTED_SHELLS})"),
-    }
-}
-
 fn wrapper_script(shell: &str) -> Result<&'static str> {
     match shell {
         "zsh" => Ok(ZSH_WRAPPER),
@@ -94,26 +100,81 @@ fn wrapper_script(shell: &str) -> Result<&'static str> {
     }
 }
 
-fn completion_script(shell: &str, cmd: &mut clap::Command) -> Result<String> {
-    let kind = shell_kind(shell)?;
+/// Raw clap_complete per-shell dynamic registration (no extra wrapping). The
+/// single source for both the sourced init form (`completion_script`) and the
+/// packaged form (`packaged_completion`). Deterministic, so install/status
+/// drift detection still recomputes an equal body. Not the static
+/// `clap_complete::generate` form — that cannot carry the dynamic
+/// `ArgValueCompleter` candidates.
+fn raw_registration(shell: &str) -> Result<String> {
+    use clap_complete::env::{Bash, EnvCompleter, Fish, Zsh};
+    let completer: &dyn EnvCompleter = match shell {
+        "zsh" => &Zsh,
+        "bash" => &Bash,
+        "fish" => &Fish,
+        other => bail!("unsupported shell: {other} (supported: {SUPPORTED_SHELLS})"),
+    };
     let mut buf: Vec<u8> = Vec::new();
-    clap_complete::generate(kind, cmd, "ji", &mut buf);
-    let script = String::from_utf8(buf).context("clap_complete generated invalid UTF-8")?;
-    // zsh `compdef` only exists after `autoload -U compinit && compinit` has run.
-    // Guard so users without compinit get the wrapper but silently skip completion
-    // instead of an error at shell startup.
-    if shell == "zsh" {
-        Ok(format!(
+    completer
+        .write_registration("COMPLETE", "ji", "ji", "ji", &mut buf)
+        .context("generating dynamic completion registration")?;
+    String::from_utf8(buf).context("clap_complete generated invalid UTF-8")
+}
+
+/// Dynamic completion registration for the *sourced* init body. When sourced it
+/// registers a completer that invokes `ji` with the tokenized command line at
+/// completion time.
+fn completion_script(shell: &str) -> Result<String> {
+    let script = raw_registration(shell)?;
+    match shell {
+        // zsh `compdef` only exists after `compinit`; guard so users without it
+        // get the wrapper but silently skip completion instead of erroring.
+        "zsh" => Ok(format!(
             "if (( ${{+functions[compdef]}} )); then\n{script}\nfi\n"
-        ))
-    } else {
-        Ok(script)
+        )),
+        // The fish wrapper has no outer `command -v ji` guard (unlike the zsh/
+        // bash rc sourcing), so guard the fish registration itself.
+        "fish" => Ok(format!("if command -q ji\n{script}\nend\n")),
+        _ => Ok(script),
     }
 }
 
+/// Completion file contents for `cargo xtask gen-completions` → the packaged
+/// (Homebrew / zsh `site-functions`) install, so packaged completions are
+/// dynamic rather than stale static. bash/fish use clap's registration as-is
+/// (Homebrew sources the bash file; fish autoloads the `complete` line, and
+/// ji's `$COMPLETE` wrapper short-circuit prevents the fish-wrapper recursion
+/// clap's bare-command call would otherwise cause). zsh is made autoload-safe
+/// for an fpath `_ji`.
+pub fn packaged_completion(shell: &str) -> Result<String> {
+    let script = raw_registration(shell)?;
+    match shell {
+        "zsh" => Ok(make_zsh_autoload_safe(&script)),
+        _ => Ok(script),
+    }
+}
+
+/// Make clap's dynamic zsh registration safe to autoload from `fpath` as `_ji`.
+/// clap's registration ends with `compdef <func> ji`, which assumes the script
+/// is sourced/eval'd. Installed as `site-functions/_ji` and autoloaded by
+/// compinit, the file body instead runs AS `_ji` on the first completion, where
+/// a bare `compdef` is too late. Replace the trailing `compdef` with a
+/// dual-mode guard: in autoload mode (`funcstack[1]` == `_ji`) call clap's
+/// completer directly; otherwise (sourced) register it via `compdef`. If clap's
+/// output format ever changes so the trailing line isn't found, the script is
+/// returned unchanged (still functional in the sourced mode).
+fn make_zsh_autoload_safe(script: &str) -> String {
+    let func = "_clap_dynamic_completer_ji";
+    let trailing = format!("compdef {func} ji");
+    let replacement = format!(
+        "if [ \"$funcstack[1]\" = \"_ji\" ]; then\n    {func} \"$@\"\nelse\n    compdef {func} ji\nfi"
+    );
+    script.replace(&trailing, &replacement)
+}
+
 /// What `ji config shell init <shell>` streams to stdout.
-pub fn print_init(shell: &str, cmd: &mut clap::Command) -> Result<()> {
-    let body = render_managed_body(shell, cmd)?;
+pub fn print_init(shell: &str) -> Result<()> {
+    let body = render_managed_body(shell)?;
     print!("{body}");
     Ok(())
 }
@@ -293,9 +354,9 @@ pub fn detect_shell() -> Result<String> {
 //
 // `ji` changes the parent shell's directory only when its wrapper is active
 // (the wrapper exports `JI_DIRECTIVE_FILE` and sources what we write). When the
-// wrapper is NOT active we can't cd, so instead of crashing we diagnose WHY and
+// wrapper is not active we can't cd, so instead of crashing we diagnose why and
 // print a terse, reason-specific note. Diagnosis (process-tree walk + filesystem
-// probes) runs ONLY on the cd-unavailable path — never on the wrapped happy path.
+// probes) runs only on the cd-unavailable path — never on the wrapped happy path.
 // =====================================================================
 
 /// Why `ji` could not change the parent shell's directory.
@@ -466,14 +527,12 @@ fn wrapper_state(env: &ShellEnv, shell: &str) -> WrapperState {
             }
         }
         "zsh" | "bash" => {
-            use clap::CommandFactory;
-            let mut cmd = crate::cli::Cli::command();
             let primary = if shell == "zsh" {
                 zsh_primary(env)
             } else {
                 bash_primary(env)
             };
-            let Ok(body) = render_managed_body(shell, &mut cmd) else {
+            let Ok(body) = render_managed_body(shell) else {
                 return WrapperState::Drift;
             };
             let Ok(stanza) = render_rc_stanza(shell) else {
@@ -487,9 +546,9 @@ fn wrapper_state(env: &ShellEnv, shell: &str) -> WrapperState {
             let Ok(hits) = find_hits(&scan_locations(env, shell, &primary), env) else {
                 return WrapperState::Drift;
             };
-            // Working requires EXACTLY the canonical install and nothing else: a single hit
+            // Working requires exactly the canonical install and nothing else: a single hit
             // that is the primary rc's marker block. Duplicate primary blocks, or any
-            // cross-file/legacy/malformed/unresolved hit ⇒ not canonical (review fix).
+            // cross-file/legacy/malformed/unresolved hit ⇒ not canonical.
             let canonical_only = hits.len() == 1
                 && hits[0].path == primary
                 && matches!(hits[0].kind, HitKind::MarkerBlock { .. });
@@ -528,11 +587,11 @@ fn cd_reason_advice(reason: &CdUnavailable) -> String {
         }
         CdUnavailable::InstalledInactive => {
             "shell integration is installed but wasn't active for this command — open a new shell, \
-             or run `ji` directly (not via `command ji`/a path)"
+             or run `ji` directly (not via `command ji`/a path) — diagnose with: ji config shell status"
                 .into()
         }
         CdUnavailable::RanByPath => {
-            "invoke `ji` as a bare command — the shell wrapper only wraps `ji`".into()
+            "invoke `ji` as a bare command — the shell wrapper only wraps `ji` — diagnose with: ji config shell status".into()
         }
         CdUnavailable::UnsupportedShell(n) => {
             format!("auto-cd isn't supported for {n} (supported: {SUPPORTED_SHELLS})")
@@ -543,6 +602,106 @@ fn cd_reason_advice(reason: &CdUnavailable) -> String {
 fn warn_cd_unavailable(reason: &CdUnavailable, target: &Path) {
     eprintln!("(ji)::cd did not change directory to {}", sq(target));
     eprintln!("(ji)::cd {}", cd_reason_advice(reason));
+}
+
+/// Pure gate (unit-testable): only offer when the active shell is a supported
+/// Inspect shell, the reason is genuinely not-installed, we're on a TTY, and the
+/// active shell hasn't been declined.
+fn should_offer(action: &StatusAction, reason: &CdUnavailable, tty: bool, declined: bool) -> bool {
+    matches!(reason, CdUnavailable::NotInstalled)
+        && tty
+        && !declined
+        && matches!(action, StatusAction::Inspect(_))
+}
+
+/// Best-effort inline install offer. Returns Ok(true) if it handled output (so the
+/// caller can stay silent), Ok(false) to fall back to the plain cd note. Never errors
+/// out of the cd path — all problems are printed inside.
+fn try_offer_install(reason: &CdUnavailable) -> Result<bool> {
+    use std::io::IsTerminal;
+    if !matches!(reason, CdUnavailable::NotInstalled) {
+        return Ok(false);
+    }
+    let report = detect_active_report();
+    let action = status_action(&report);
+    let active = match &action {
+        StatusAction::Inspect(s) => s.clone(),
+        StatusAction::ReportOnly => return Ok(false),
+    };
+    let Some(active_static) = SUPPORTED.iter().copied().find(|s| *s == active) else {
+        return Ok(false);
+    };
+    let Ok(env) = ShellEnv::from_process_env() else {
+        return Ok(false);
+    };
+    let tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let declined = install_prompt_declined(&env, &active);
+    if !should_offer(&action, reason, tty, declined) {
+        return Ok(false);
+    }
+
+    let probe = probe_shells(&env);
+    let mut attempt: Vec<&str> = vec![active_static];
+    for &s in &probe.present {
+        if s != active_static {
+            attempt.push(s);
+        }
+    }
+    // One bucket per shell: only absent shells are "skipped"; errored ones go to
+    // failures (via probe_errors). Both exclude attempted shells (active ∪ present).
+    let skipped: Vec<&str> = probe
+        .absent
+        .iter()
+        .copied()
+        .filter(|s| !attempt.contains(s))
+        .collect();
+    let probe_errors: Vec<(&str, std::io::Error)> = probe
+        .errored
+        .into_iter()
+        .filter(|(s, _)| !attempt.contains(s))
+        .collect();
+
+    let outcome = multi_install(
+        &env,
+        &attempt,
+        &skipped,
+        probe_errors,
+        InstallOpts {
+            dry_run: false,
+            force: false,
+            interactive: true,
+        },
+        "(ji)::shell install integration now? [y/N/?] ",
+    )?;
+    render_multi_outcome(&env, &outcome);
+
+    if outcome.cancelled {
+        set_install_prompt_declined(&env, &active);
+        return Ok(true);
+    }
+    // Clear the per-shell decline marker for every shell verified installed by
+    // this offer (it configures active ∪ present), not just the active one.
+    for s in outcome.applied.iter().chain(outcome.unchanged.iter()) {
+        clear_install_prompt_declined(&env, s);
+    }
+    if active_configured(&outcome, &active) {
+        let active_shadow = outcome
+            .shadows
+            .iter()
+            .find(|(s, h)| s == &active && h.shadows_wrapper());
+        if let Some((_, h)) = active_shadow {
+            eprintln!(
+                "(ji)::shell installed, but `ji` is shadowed by {}:{} — remove it, then restart your shell",
+                h.path.display(),
+                h.line_no
+            );
+        } else {
+            eprintln!(
+                "(ji)::shell installed — restart your shell (or open a new one) to activate auto-cd"
+            );
+        }
+    }
+    Ok(true)
 }
 
 /// The cd policy for a call site, and the outcome the policy maps a request to.
@@ -561,7 +720,7 @@ enum CdAction {
     Rescue(CdUnavailable),
 }
 
-/// PURE decision core: request + policy → outcome (no I/O). Unit-tested.
+/// Pure decision core: request + policy → outcome (no I/O). Unit-tested.
 fn decide_cd(req: &CdRequest, policy: Policy) -> CdAction {
     match req {
         CdRequest::Directed => CdAction::Done,
@@ -584,13 +743,15 @@ fn perform_cd(action: CdAction, safety: &Path) -> Result<()> {
         CdAction::Done => Ok(()),
         CdAction::Warn(r) => {
             warn_cd_unavailable(&r, safety);
+            let _ = try_offer_install(&r);
             Ok(())
         }
         CdAction::WarnNonzero(r) => {
             warn_cd_unavailable(&r, safety);
+            let _ = try_offer_install(&r);
             Err(CdNotApplied.into())
         }
-        // Rescue NEVER uses the generic `warn_cd_unavailable`: it LEADS with the escape,
+        // Rescue never uses the generic `warn_cd_unavailable`: it leads with the escape,
         // and the reason-advice is a strictly subordinate secondary line.
         CdAction::Rescue(r) => {
             eprintln!(
@@ -618,7 +779,7 @@ pub fn apply_followup_cd(path: &Path) -> Result<()> {
 /// (3) Post-close cd: the user's workspace was closed; land them at `safety`
 /// (repo root). `origin` is the actual launch cwd (may be a subdirectory), so
 /// rescue is keyed to whether `origin` itself still exists. `origin` is probed
-/// ONLY when the cd didn't happen — no filesystem cost on the wrapped happy path.
+/// only when the cd didn't happen — no filesystem cost on the wrapped happy path.
 pub fn apply_close_cd(origin: &Path, safety: &Path) -> Result<()> {
     match request_cd(safety) {
         Ok(CdRequest::Directed) => Ok(()),
@@ -632,8 +793,8 @@ pub fn apply_close_cd(origin: &Path, safety: &Path) -> Result<()> {
             )
         }
         Err(e) => {
-            // Rescue guarantee: if the cwd is gone AND the directive write failed, still
-            // LEAD with the loud escape — never a bare anyhow dump.
+            // Rescue guarantee: if the cwd is gone and the directive write failed, still
+            // lead with the loud escape — never a bare anyhow dump.
             if origin.try_exists().unwrap_or(true) {
                 Err(e)
             } else {
@@ -698,6 +859,28 @@ impl ShellEnv {
     }
 }
 
+fn declined_marker(env: &ShellEnv, shell: &str) -> PathBuf {
+    env.xdg_config_home
+        .join("ji")
+        .join(format!("install-prompt-declined-{shell}"))
+}
+
+fn install_prompt_declined(env: &ShellEnv, shell: &str) -> bool {
+    declined_marker(env, shell).exists()
+}
+
+fn set_install_prompt_declined(env: &ShellEnv, shell: &str) {
+    let p = declined_marker(env, shell);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&p, b"");
+}
+
+fn clear_install_prompt_declined(env: &ShellEnv, shell: &str) {
+    let _ = std::fs::remove_file(declined_marker(env, shell));
+}
+
 // =====================================================================
 // Options
 // =====================================================================
@@ -743,6 +926,101 @@ fn strip_inline_comment(s: &str) -> &str {
         i += 1;
     }
     s.trim_end()
+}
+
+fn detect_bypass_alias(line: &str) -> Option<(String, String)> {
+    let line = strip_inline_comment(line.trim_start());
+    let rest = line.strip_prefix("alias")?;
+    if !rest.chars().next().is_some_and(|c| c.is_whitespace()) {
+        return None;
+    }
+    let mut rest = rest.trim_start();
+    loop {
+        let tok = rest.split_whitespace().next().unwrap_or("");
+        if matches!(tok, "-g" | "-s" | "-r" | "--") {
+            rest = rest[tok.len()..].trim_start();
+        } else {
+            break;
+        }
+    }
+
+    let name_end = rest.find(|c: char| c == '=' || c.is_whitespace())?;
+    let name = rest[..name_end].to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let after = &rest[name_end..];
+    let raw_value = match after.strip_prefix('=') {
+        Some(v) => v,
+        None => after.trim_start(),
+    };
+
+    let vt = raw_value.trim_start();
+    if vt.starts_with("$(") || vt.starts_with('`') {
+        return None;
+    }
+
+    let unq = unquote_one(raw_value);
+    let mut words = unq.split_whitespace();
+    let mut first = words.next()?;
+    if first == "eval" {
+        return None;
+    }
+
+    let mut forced = false;
+    if matches!(first, "command" | "env" | "exec" | "nohup") {
+        forced = true;
+        // Skip any `VAR=val` env-assignments that follow the wrapper (e.g.
+        // `env FOO=1 /opt/bin/ji`); a following `-flag` (e.g. `command -v`) is a
+        // lookup, not a clean bypass, so bail false-positive-free.
+        first = loop {
+            match words.next() {
+                None => return None,
+                Some(w) if w.starts_with('-') => return None,
+                Some(w) if !is_var_assignment(w) => break w,
+                Some(_) => {} // skip a VAR=val assignment, keep looking
+            }
+        };
+    }
+
+    if first.contains('/') || first.contains('\\') {
+        let base = first
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(first)
+            .to_ascii_lowercase();
+        if base == "ji" || base == "ji.exe" {
+            return Some((name, unq.to_string()));
+        }
+    } else if forced && first.eq_ignore_ascii_case("ji") {
+        return Some((name, unq.to_string()));
+    }
+    None
+}
+
+fn unquote_one(s: &str) -> &str {
+    let t = s.trim();
+    for q in ['\'', '"'] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            return &t[1..t.len() - 1];
+        }
+    }
+    t
+}
+
+/// Is `tok` a shell `VAR=value` assignment (a valid identifier before `=`)?
+/// Used to skip `env FOO=1 …` style prefixes when classifying an alias value.
+fn is_var_assignment(tok: &str) -> bool {
+    match tok.find('=') {
+        Some(eq) if eq > 0 => {
+            let name = &tok[..eq];
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
 }
 
 /// Heuristic detector for "this line installs ji shell integration". Used only
@@ -1079,6 +1357,29 @@ enum HitKind {
     UnresolvedSource(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowKind {
+    Alias,
+    Function,
+}
+
+#[derive(Debug, Clone)]
+struct AliasHit {
+    path: PathBuf,
+    line_no: usize,
+    name: String,
+    target: String,
+    kind: ShadowKind,
+}
+
+impl AliasHit {
+    /// True iff this shadows the `ji` wrapper itself (vs a differently-named
+    /// alias that merely runs the binary directly).
+    fn shadows_wrapper(&self) -> bool {
+        matches!(self.kind, ShadowKind::Function) || self.name == "ji"
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ScanLocation {
     path: PathBuf,
@@ -1172,6 +1473,51 @@ fn scan_locations(env: &ShellEnv, shell: &str, primary: &Path) -> Vec<ScanLocati
         }
     }
 
+    out
+}
+
+fn scan_bypass_aliases(env: &ShellEnv, shell: &str, primary: &Path) -> Vec<AliasHit> {
+    let skip_path = if shell == "fish" {
+        Some(fish_primary(env))
+    } else {
+        env.managed_file(shell).ok()
+    };
+    let mut out = Vec::new();
+    for loc in scan_locations(env, shell, primary) {
+        if skip_path.as_ref().is_some_and(|p| p == &loc.path) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&loc.path) else {
+            continue;
+        };
+        for (i, line) in contents.lines().enumerate() {
+            let line_no = i + 1;
+            if let Some((name, target)) = detect_bypass_alias(line) {
+                out.push(AliasHit {
+                    path: loc.path.clone(),
+                    line_no,
+                    name,
+                    target,
+                    kind: ShadowKind::Alias,
+                });
+            }
+            if shell == "fish" {
+                let line = strip_inline_comment(line.trim_start());
+                if line == "function ji"
+                    || line.starts_with("function ji ")
+                    || line.starts_with("function ji;")
+                {
+                    out.push(AliasHit {
+                        path: loc.path.clone(),
+                        line_no,
+                        name: "ji".into(),
+                        target: String::new(),
+                        kind: ShadowKind::Function,
+                    });
+                }
+            }
+        }
+    }
     out
 }
 
@@ -1315,9 +1661,9 @@ fn scan_for_legacy(
 // Managed-body rendering
 // =====================================================================
 
-fn render_managed_body(shell: &str, cmd: &mut clap::Command) -> Result<String> {
+fn render_managed_body(shell: &str) -> Result<String> {
     let wrapper = wrapper_script(shell)?;
-    let completion = completion_script(shell, cmd)?;
+    let completion = completion_script(shell)?;
     Ok(format!("{MANAGED_HEADER}\n{wrapper}\n{completion}"))
 }
 
@@ -1325,8 +1671,8 @@ fn render_fish_wrapper_body() -> String {
     format!("{MANAGED_HEADER}\n{FISH_WRAPPER}")
 }
 
-fn render_fish_completion_body(cmd: &mut clap::Command) -> Result<String> {
-    let completion = completion_script("fish", cmd)?;
+fn render_fish_completion_body() -> Result<String> {
+    let completion = completion_script("fish")?;
     Ok(format!("{MANAGED_HEADER}\n{completion}"))
 }
 
@@ -1541,17 +1887,330 @@ fn remove_block(rc_contents: &str, byte_range: &Range<usize>) -> String {
 // Install
 // =====================================================================
 
-pub fn install(
-    env: &ShellEnv,
-    shell: &str,
-    cmd: &mut clap::Command,
-    opts: InstallOpts,
-) -> Result<()> {
-    match shell {
-        "zsh" | "bash" => install_posix(env, shell, cmd, opts),
-        "fish" => install_fish(env, cmd, opts),
-        other => bail!("unsupported shell: {other} (supported: {SUPPORTED_SHELLS})"),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteRole {
+    ManagedFile,
+    PrimaryRc,
+    FishWrapper,
+    FishCompletions,
+}
+
+struct PlannedWrite {
+    path: PathBuf,
+    before: String,
+    after: String,
+    role: WriteRole,
+}
+
+struct ShellInstallPlan {
+    shell: String,
+    writes: Vec<PlannedWrite>,
+    shadows: Vec<AliasHit>,
+}
+
+impl ShellInstallPlan {
+    fn changed(&self) -> bool {
+        self.writes.iter().any(|w| w.before != w.after)
     }
+
+    fn show(&self, w: &mut dyn std::io::Write) {
+        for p in &self.writes {
+            print_dry_run_diff(w, &p.path, &p.before, &p.after);
+        }
+    }
+}
+
+pub fn install(env: &ShellEnv, shell: &str, opts: InstallOpts) -> Result<()> {
+    let plan = plan_install(env, shell, opts.force, &mut std::io::stderr())?;
+    if opts.dry_run {
+        plan.show(&mut std::io::stdout());
+        return Ok(());
+    }
+    if opts.interactive && plan.changed() {
+        let label = "(ji)::shell apply these changes? [y/N/?] ";
+        let confirmed = confirm_install(label, || plan.show(&mut std::io::stdout()))?;
+        if !confirmed {
+            eprintln!("(ji)::shell install cancelled");
+            return Ok(());
+        }
+    }
+    apply_plan(&plan)?;
+    if installed_ok(env, shell) {
+        clear_install_prompt_declined(env, shell);
+    }
+    Ok(())
+}
+
+struct ShellProbe {
+    present: Vec<&'static str>,
+    absent: Vec<&'static str>,
+    errored: Vec<(&'static str, std::io::Error)>,
+}
+
+fn probe_shells(env: &ShellEnv) -> ShellProbe {
+    let mut probe = ShellProbe {
+        present: Vec::new(),
+        absent: Vec::new(),
+        errored: Vec::new(),
+    };
+
+    for &shell in SUPPORTED {
+        let candidates = match shell {
+            "zsh" => vec![zsh_primary(env)],
+            "bash" => vec![
+                env.home.join(".bash_profile"),
+                env.home.join(".bash_login"),
+                env.home.join(".profile"),
+            ],
+            "fish" => vec![env.xdg_config_home.join("fish")],
+            _ => Vec::new(),
+        };
+
+        let mut first_error = None;
+        let mut found = false;
+        for path in candidates {
+            match path.try_exists() {
+                // fish "present" means its config DIRECTORY exists, not a stray
+                // file at that path (which would otherwise be attempted and fail).
+                Ok(true) if shell != "fish" || path.is_dir() => {
+                    found = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if found {
+            probe.present.push(shell);
+        } else if let Some(e) = first_error {
+            probe.errored.push((shell, e));
+        } else {
+            probe.absent.push(shell);
+        }
+    }
+
+    probe
+}
+
+fn installed_ok(env: &ShellEnv, shell: &str) -> bool {
+    match shell {
+        "zsh" | "bash" => {
+            let primary = if shell == "zsh" {
+                zsh_primary(env)
+            } else {
+                bash_primary(env)
+            };
+            let (Ok(managed), Ok(body), Ok(stanza)) = (
+                env.managed_file(shell),
+                render_managed_body(shell),
+                render_rc_stanza(shell),
+            ) else {
+                return false;
+            };
+            state_for(&managed, &body) == "present"
+                && rc_stanza_status(&primary, &stanza) == TriState::Present
+        }
+        "fish" => {
+            let primary = fish_primary(env);
+            let completions = fish_completions_path(env);
+            let wrapper_body = render_fish_wrapper_body();
+            let Ok(completion_body) = render_fish_completion_body() else {
+                return false;
+            };
+            state_for(&primary, &wrapper_body) == "present"
+                && state_for(&completions, &completion_body) == "present"
+        }
+        _ => false,
+    }
+}
+
+struct MultiOutcome {
+    applied: Vec<String>,
+    unchanged: Vec<String>,
+    skipped: Vec<String>,
+    failures: Vec<(String, anyhow::Error)>,
+    cancelled: bool,
+    dry_run: bool,
+    shadows: Vec<(String, AliasHit)>,
+}
+
+fn skipped_strings(skipped: &[&str]) -> Vec<String> {
+    skipped.iter().map(|s| s.to_string()).collect()
+}
+
+fn multi_install(
+    env: &ShellEnv,
+    attempt: &[&str],
+    skipped: &[&str],
+    probe_errors: Vec<(&str, std::io::Error)>,
+    opts: InstallOpts,
+    prompt: &str,
+) -> Result<MultiOutcome> {
+    let mut failures = Vec::new();
+    for (s, e) in probe_errors {
+        let err = anyhow::anyhow!("could not probe {s} shell config: {e}");
+        eprintln!("(ji)::shell {s}: {err}");
+        failures.push((s.to_string(), err));
+    }
+
+    let mut plans = Vec::new();
+    for shell in attempt {
+        match plan_install(env, shell, opts.force, &mut std::io::stderr()) {
+            Ok(plan) => plans.push(plan),
+            Err(e) => {
+                eprintln!("(ji)::shell {shell}: {e}");
+                failures.push((shell.to_string(), e));
+            }
+        }
+    }
+
+    let any_changed = plans.iter().any(|p| p.changed());
+
+    if opts.dry_run {
+        for p in &plans {
+            p.show(&mut std::io::stdout());
+        }
+        return Ok(MultiOutcome {
+            applied: Vec::new(),
+            unchanged: Vec::new(),
+            skipped: skipped_strings(skipped),
+            failures,
+            cancelled: false,
+            dry_run: true,
+            shadows: Vec::new(),
+        });
+    }
+
+    if opts.interactive && any_changed {
+        let confirmed = confirm_install(prompt, || {
+            let mut e = std::io::stderr();
+            for p in &plans {
+                p.show(&mut e);
+            }
+        })?;
+        if !confirmed {
+            return Ok(MultiOutcome {
+                applied: Vec::new(),
+                unchanged: Vec::new(),
+                skipped: skipped_strings(skipped),
+                failures,
+                cancelled: true,
+                dry_run: false,
+                shadows: Vec::new(),
+            });
+        }
+    }
+
+    let mut outcome = MultiOutcome {
+        applied: Vec::new(),
+        unchanged: Vec::new(),
+        skipped: skipped_strings(skipped),
+        failures,
+        cancelled: false,
+        dry_run: false,
+        shadows: Vec::new(),
+    };
+
+    for plan in &plans {
+        match apply_plan(plan) {
+            Ok(()) if installed_ok(env, &plan.shell) => {
+                if plan.changed() {
+                    outcome.applied.push(plan.shell.clone());
+                } else {
+                    outcome.unchanged.push(plan.shell.clone());
+                }
+                outcome.shadows.extend(
+                    plan.shadows
+                        .iter()
+                        .cloned()
+                        .map(|hit| (plan.shell.clone(), hit)),
+                );
+                debug_assert!(active_configured(&outcome, &plan.shell));
+            }
+            Ok(()) => {
+                let err = anyhow::anyhow!("managed files not canonical after apply");
+                eprintln!("(ji)::shell {}: {err}", plan.shell);
+                outcome.failures.push((plan.shell.clone(), err));
+            }
+            Err(e) => {
+                eprintln!("(ji)::shell {}: {e}", plan.shell);
+                outcome.failures.push((plan.shell.clone(), e));
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn integration_present(o: &MultiOutcome) -> bool {
+    !o.applied.is_empty() || !o.unchanged.is_empty()
+}
+
+fn active_configured(o: &MultiOutcome, active: &str) -> bool {
+    o.applied.iter().any(|s| s == active) || o.unchanged.iter().any(|s| s == active)
+}
+
+fn render_multi_outcome(env: &ShellEnv, o: &MultiOutcome) {
+    if o.dry_run {
+        return;
+    }
+    let _ = o.shadows.len();
+
+    for shell in &o.skipped {
+        match shell.as_str() {
+            "bash" => eprintln!(
+                "(ji)::shell skipped bash; no {0}/.bash_profile, {0}/.bash_login, or {0}/.profile",
+                env.home.display()
+            ),
+            "zsh" => eprintln!(
+                "(ji)::shell skipped zsh; no {}/.zshrc",
+                env.zdotdir.display()
+            ),
+            "fish" => eprintln!(
+                "(ji)::shell skipped fish; {}/fish not found",
+                env.xdg_config_home.display()
+            ),
+            _ => {}
+        }
+    }
+
+    if o.cancelled {
+        eprintln!("(ji)::shell install cancelled");
+    } else if !o.applied.is_empty() {
+        eprintln!("(ji)::shell configured {} shell(s)", o.applied.len());
+    } else if integration_present(o) {
+        eprintln!("(ji)::shell all configured shells already up-to-date");
+    } else if o.failures.is_empty() {
+        eprintln!("(ji)::shell no shells with an existing config found");
+    }
+}
+
+pub fn install_all(env: &ShellEnv, opts: InstallOpts) -> Result<()> {
+    let probe = probe_shells(env);
+    let outcome = multi_install(
+        env,
+        &probe.present,
+        &probe.absent,
+        probe.errored,
+        opts,
+        "(ji)::shell apply these changes? [y/N/?] ",
+    )?;
+    render_multi_outcome(env, &outcome);
+    for s in outcome.applied.iter().chain(outcome.unchanged.iter()) {
+        clear_install_prompt_declined(env, s);
+    }
+    if !outcome.failures.is_empty() {
+        bail!(
+            "(ji)::shell {} shell(s) failed to configure",
+            outcome.failures.len()
+        );
+    }
+    Ok(())
 }
 
 enum Confirm {
@@ -1593,7 +2252,7 @@ fn confirm_core(
 
 /// Live wrapper binding stdin/stderr into `confirm_core` (called only when
 /// `opts.interactive` and there's a change to confirm).
-fn confirm_install(preview: impl Fn()) -> Result<bool> {
+fn confirm_install(prompt: &str, preview: impl Fn()) -> Result<bool> {
     use std::io::Write;
     confirm_core(
         || {
@@ -1605,7 +2264,7 @@ fn confirm_install(preview: impl Fn()) -> Result<bool> {
         },
         || {
             let mut e = std::io::stderr();
-            write!(e, "(ji)::shell apply these changes? [y/N/?] ")?;
+            write!(e, "{prompt}")?;
             e.flush()
         },
         preview,
@@ -1613,12 +2272,52 @@ fn confirm_install(preview: impl Fn()) -> Result<bool> {
     .map_err(Into::into)
 }
 
-fn install_posix(
+fn plan_install(
     env: &ShellEnv,
     shell: &str,
-    cmd: &mut clap::Command,
-    opts: InstallOpts,
-) -> Result<()> {
+    force: bool,
+    notes: &mut dyn std::io::Write,
+) -> Result<ShellInstallPlan> {
+    match shell {
+        "zsh" | "bash" => plan_install_posix(env, shell, force, notes),
+        "fish" => plan_install_fish(env, force, notes),
+        other => bail!("unsupported shell: {other} (supported: {SUPPORTED_SHELLS})"),
+    }
+}
+
+fn emit_shadow_notes(notes: &mut dyn std::io::Write, shadows: &[AliasHit]) {
+    for h in shadows {
+        if h.shadows_wrapper() {
+            let what = if matches!(h.kind, ShadowKind::Function) {
+                "function ji".into()
+            } else {
+                format!("alias {}", h.name)
+            };
+            let _ = writeln!(
+                notes,
+                "(ji)::shell: note: `ji` shadowed by {} in {}:{} — remove it for auto-cd to work",
+                what,
+                h.path.display(),
+                h.line_no
+            );
+        } else {
+            let _ = writeln!(
+                notes,
+                "(ji)::shell: note: alias {} in {}:{} runs ji directly (bypassing auto-cd; use `ji`)",
+                h.name,
+                h.path.display(),
+                h.line_no
+            );
+        }
+    }
+}
+
+fn plan_install_posix(
+    env: &ShellEnv,
+    shell: &str,
+    force: bool,
+    notes: &mut dyn std::io::Write,
+) -> Result<ShellInstallPlan> {
     let primary = if shell == "zsh" {
         zsh_primary(env)
     } else {
@@ -1629,7 +2328,7 @@ fn install_posix(
         let canonical = primary
             .canonicalize()
             .with_context(|| format!("failed to canonicalize {}", primary.display()))?;
-        if chezmoi_strong_signal(&canonical) && !opts.force {
+        if chezmoi_strong_signal(&canonical) && !force {
             bail!(
                 "(ji)::shell: {} resolves into a chezmoi source directory ({}); edits will be reverted by `chezmoi apply`. Pass --force to install anyway.",
                 primary.display(),
@@ -1637,7 +2336,8 @@ fn install_posix(
             );
         }
         if dotfile_manager_soft_signal(env, &canonical) {
-            eprintln!(
+            let _ = writeln!(
+                notes,
                 "(ji)::shell: note: {} resolves to {} (outside $HOME or dotfile-manager-shaped layout); edits may be reverted by your dotfile tool.",
                 primary.display(),
                 canonical.display(),
@@ -1652,12 +2352,13 @@ fn install_posix(
 
     let locations = scan_locations(env, shell, &primary);
     let hits = find_hits(&locations, env)?;
+    let shadows = scan_bypass_aliases(env, shell, &primary);
 
     let malformed: Vec<&Hit> = hits
         .iter()
         .filter(|h| matches!(h.kind, HitKind::MalformedMarker))
         .collect();
-    if !malformed.is_empty() && !opts.force {
+    if !malformed.is_empty() && !force {
         let first = malformed[0];
         bail!(
             "(ji)::shell: malformed marker block in {}:{} — edit manually or pass --force to overwrite",
@@ -1685,7 +2386,8 @@ fn install_posix(
 
     for u in &unresolved {
         if let HitKind::UnresolvedSource(raw) = &u.kind {
-            eprintln!(
+            let _ = writeln!(
+                notes,
                 "(ji)::shell: note: unresolved source-like line in {}:{} (`{}`)",
                 u.path.display(),
                 u.line_no,
@@ -1693,8 +2395,9 @@ fn install_posix(
             );
         }
     }
+    emit_shadow_notes(notes, &shadows);
 
-    if !nonprimary_hits.is_empty() && !opts.force {
+    if !nonprimary_hits.is_empty() && !force {
         let first = nonprimary_hits[0];
         let via = first
             .via
@@ -1711,7 +2414,7 @@ fn install_posix(
 
     if let Some(h) = primary_legacy
         && primary_marker.is_none()
-        && !opts.force
+        && !force
     {
         bail!(
             "(ji)::shell: existing integration line found in {}:{} — remove it manually, or pass --force to install alongside it.",
@@ -1721,7 +2424,7 @@ fn install_posix(
     }
 
     let managed_path = env.managed_file(shell)?;
-    let managed_body = render_managed_body(shell, cmd)?;
+    let managed_body = render_managed_body(shell)?;
     let stanza = render_rc_stanza(shell)?;
 
     let primary_contents = if primary.exists() {
@@ -1751,102 +2454,55 @@ fn install_posix(
         append_block(&primary_contents, &stanza)
     };
 
-    // One diff-set, shared by dry-run and the interactive preview (no drift).
-    let diffs = [
-        (
-            managed_path.clone(),
-            existing_or_empty(&managed_path),
-            managed_body.clone(),
-        ),
-        (
-            primary.clone(),
-            primary_contents.clone(),
-            new_primary_contents.clone(),
-        ),
-    ];
-    let changed = diffs.iter().any(|(_, before, after)| before != after);
-    let show = || {
-        for (p, before, after) in &diffs {
-            print_dry_run_diff(p, before, after);
-        }
-    };
-    if opts.dry_run {
-        show();
-        return Ok(());
-    }
-    // Skip the prompt when nothing would change (already up to date): no diff to confirm.
-    if opts.interactive && changed && !confirm_install(show)? {
-        eprintln!("(ji)::shell install cancelled");
-        return Ok(());
-    }
-
-    let managed_outcome = write_atomic(&managed_path, &managed_body)?;
-    match managed_outcome {
-        WriteOutcome::Created => eprintln!(
-            "(ji)::shell installed managed file {}",
-            managed_path.display()
-        ),
-        WriteOutcome::Updated => eprintln!(
-            "(ji)::shell updated managed file {}",
-            managed_path.display()
-        ),
-        WriteOutcome::Unchanged => {}
-    }
-
-    let primary_outcome = if new_primary_contents == primary_contents {
-        WriteOutcome::Unchanged
-    } else {
-        if !primary.exists()
-            && let Some(parent) = primary.parent()
-            && !parent.exists()
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        write_atomic(&primary, &new_primary_contents)?
-    };
-    match primary_outcome {
-        WriteOutcome::Created => eprintln!(
-            "(ji)::shell created {} with managed block",
-            primary.display()
-        ),
-        WriteOutcome::Updated => eprintln!(
-            "(ji)::shell updated {} with managed block",
-            primary.display()
-        ),
-        WriteOutcome::Unchanged => {
-            eprintln!("(ji)::shell {} already up-to-date", primary.display());
-        }
-    }
-
-    Ok(())
+    Ok(ShellInstallPlan {
+        shell: shell.to_string(),
+        writes: vec![
+            PlannedWrite {
+                path: managed_path.clone(),
+                before: existing_or_empty(&managed_path),
+                after: managed_body,
+                role: WriteRole::ManagedFile,
+            },
+            PlannedWrite {
+                path: primary,
+                before: primary_contents,
+                after: new_primary_contents,
+                role: WriteRole::PrimaryRc,
+            },
+        ],
+        shadows,
+    })
 }
 
 fn existing_or_empty(p: &Path) -> String {
     std::fs::read_to_string(p).unwrap_or_default()
 }
 
-fn print_dry_run_diff(path: &Path, before: &str, after: &str) {
+fn print_dry_run_diff(w: &mut dyn std::io::Write, path: &Path, before: &str, after: &str) {
     if before == after {
         return;
     }
-    println!("--- {}", path.display());
-    println!("+++ {} (after install)", path.display());
+    let _ = writeln!(w, "--- {}", path.display());
+    let _ = writeln!(w, "+++ {} (after install)", path.display());
     for line in before.lines() {
-        println!("- {line}");
+        let _ = writeln!(w, "- {line}");
     }
     for line in after.lines() {
-        println!("+ {line}");
+        let _ = writeln!(w, "+ {line}");
     }
-    println!();
+    let _ = writeln!(w);
 }
 
-fn install_fish(env: &ShellEnv, cmd: &mut clap::Command, opts: InstallOpts) -> Result<()> {
+fn plan_install_fish(
+    env: &ShellEnv,
+    force: bool,
+    notes: &mut dyn std::io::Write,
+) -> Result<ShellInstallPlan> {
     let primary = fish_primary(env);
     let completions = fish_completions_path(env);
     let shadow = fish_shadow_path(env);
 
-    if shadow.exists() && !opts.force {
+    if shadow.exists() && !force {
         bail!(
             "(ji)::shell: {} exists and would shadow our `functions/ji.fish` (fish auto-sources conf.d at startup, blocking the autoload) — remove it manually, or pass --force.",
             shadow.display(),
@@ -1855,12 +2511,13 @@ fn install_fish(env: &ShellEnv, cmd: &mut clap::Command, opts: InstallOpts) -> R
 
     let locations = scan_locations(env, "fish", &primary);
     let hits = find_hits(&locations, env)?;
+    let shadows = scan_bypass_aliases(env, "fish", &primary);
 
     let malformed: Vec<&Hit> = hits
         .iter()
         .filter(|h| matches!(h.kind, HitKind::MalformedMarker))
         .collect();
-    if !malformed.is_empty() && !opts.force {
+    if !malformed.is_empty() && !force {
         let first = malformed[0];
         bail!(
             "(ji)::shell: malformed marker block in {}:{} — edit manually or pass --force to overwrite",
@@ -1876,7 +2533,7 @@ fn install_fish(env: &ShellEnv, cmd: &mut clap::Command, opts: InstallOpts) -> R
         })
         .collect();
 
-    if !nonprimary_hits.is_empty() && !opts.force {
+    if !nonprimary_hits.is_empty() && !force {
         let first = nonprimary_hits[0];
         bail!(
             "(ji)::shell: existing integration found in {}:{} — remove it manually, or pass --force to install anyway.",
@@ -1884,15 +2541,16 @@ fn install_fish(env: &ShellEnv, cmd: &mut clap::Command, opts: InstallOpts) -> R
             first.line_no,
         );
     }
+    emit_shadow_notes(notes, &shadows);
 
     let wrapper_body = render_fish_wrapper_body();
-    let completion_body = render_fish_completion_body(cmd)?;
+    let completion_body = render_fish_completion_body()?;
 
     for (path, label) in [(&primary, "wrapper"), (&completions, "completions")] {
         if path.exists() {
             let existing = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            if !is_managed(&existing) && !opts.force {
+            if !is_managed(&existing) && !force {
                 bail!(
                     "(ji)::shell: {} exists and is not ji-managed — remove it manually, or pass --force to overwrite ({label}).",
                     path.display(),
@@ -1901,58 +2559,70 @@ fn install_fish(env: &ShellEnv, cmd: &mut clap::Command, opts: InstallOpts) -> R
         }
     }
 
-    let diffs = [
-        (
-            primary.clone(),
-            existing_or_empty(&primary),
-            wrapper_body.clone(),
-        ),
-        (
-            completions.clone(),
-            existing_or_empty(&completions),
-            completion_body.clone(),
-        ),
-    ];
-    let changed = diffs.iter().any(|(_, before, after)| before != after);
-    let show = || {
-        for (p, before, after) in &diffs {
-            print_dry_run_diff(p, before, after);
-        }
-    };
-    if opts.dry_run {
-        show();
-        return Ok(());
-    }
-    if opts.interactive && changed && !confirm_install(show)? {
-        eprintln!("(ji)::shell install cancelled");
-        return Ok(());
-    }
+    Ok(ShellInstallPlan {
+        shell: "fish".to_string(),
+        writes: vec![
+            PlannedWrite {
+                path: primary.clone(),
+                before: existing_or_empty(&primary),
+                after: wrapper_body,
+                role: WriteRole::FishWrapper,
+            },
+            PlannedWrite {
+                path: completions.clone(),
+                before: existing_or_empty(&completions),
+                after: completion_body,
+                role: WriteRole::FishCompletions,
+            },
+        ],
+        shadows,
+    })
+}
 
-    let wo = write_atomic(&primary, &wrapper_body)?;
-    match wo {
-        WriteOutcome::Created => {
-            eprintln!("(ji)::shell wrapper installed in {}", primary.display());
+fn apply_plan(plan: &ShellInstallPlan) -> Result<()> {
+    let _shell = plan.shell.as_str();
+    for w in &plan.writes {
+        let outcome = write_atomic(&w.path, &w.after)?;
+        match (w.role, outcome) {
+            (WriteRole::ManagedFile, WriteOutcome::Created) => {
+                eprintln!("(ji)::shell installed managed file {}", w.path.display());
+            }
+            (WriteRole::ManagedFile, WriteOutcome::Updated) => {
+                eprintln!("(ji)::shell updated managed file {}", w.path.display());
+            }
+            (WriteRole::ManagedFile, WriteOutcome::Unchanged) => {}
+            (WriteRole::PrimaryRc, WriteOutcome::Created) => eprintln!(
+                "(ji)::shell created {} with managed block",
+                w.path.display()
+            ),
+            (WriteRole::PrimaryRc, WriteOutcome::Updated) => eprintln!(
+                "(ji)::shell updated {} with managed block",
+                w.path.display()
+            ),
+            (WriteRole::PrimaryRc, WriteOutcome::Unchanged) => {
+                eprintln!("(ji)::shell {} already up-to-date", w.path.display());
+            }
+            (WriteRole::FishWrapper, WriteOutcome::Created) => {
+                eprintln!("(ji)::shell wrapper installed in {}", w.path.display());
+            }
+            (WriteRole::FishWrapper, WriteOutcome::Updated) => {
+                eprintln!("(ji)::shell wrapper updated in {}", w.path.display());
+            }
+            (WriteRole::FishWrapper, WriteOutcome::Unchanged) => eprintln!(
+                "(ji)::shell wrapper already up-to-date in {}",
+                w.path.display()
+            ),
+            (WriteRole::FishCompletions, WriteOutcome::Created) => {
+                eprintln!("(ji)::shell completions installed in {}", w.path.display());
+            }
+            (WriteRole::FishCompletions, WriteOutcome::Updated) => {
+                eprintln!("(ji)::shell completions updated in {}", w.path.display());
+            }
+            (WriteRole::FishCompletions, WriteOutcome::Unchanged) => eprintln!(
+                "(ji)::shell completions already up-to-date in {}",
+                w.path.display()
+            ),
         }
-        WriteOutcome::Updated => eprintln!("(ji)::shell wrapper updated in {}", primary.display()),
-        WriteOutcome::Unchanged => eprintln!(
-            "(ji)::shell wrapper already up-to-date in {}",
-            primary.display()
-        ),
-    }
-    let co = write_atomic(&completions, &completion_body)?;
-    match co {
-        WriteOutcome::Created => eprintln!(
-            "(ji)::shell completions installed in {}",
-            completions.display()
-        ),
-        WriteOutcome::Updated => eprintln!(
-            "(ji)::shell completions updated in {}",
-            completions.display()
-        ),
-        WriteOutcome::Unchanged => eprintln!(
-            "(ji)::shell completions already up-to-date in {}",
-            completions.display()
-        ),
     }
 
     Ok(())
@@ -1988,7 +2658,7 @@ fn uninstall_posix(env: &ShellEnv, shell: &str, opts: UninstallOpts) -> Result<(
         if let Some(range) = ranges.first() {
             let after = remove_block(&contents, range);
             if opts.dry_run {
-                print_dry_run_diff(&primary, &contents, &after);
+                print_dry_run_diff(&mut std::io::stdout(), &primary, &contents, &after);
             } else {
                 write_atomic(&primary, &after)?;
                 eprintln!(
@@ -2015,6 +2685,9 @@ fn uninstall_posix(env: &ShellEnv, shell: &str, opts: UninstallOpts) -> Result<(
 
     if nothing_to_do {
         eprintln!("(ji)::shell nothing to uninstall for {shell}");
+    }
+    if !opts.dry_run {
+        clear_install_prompt_declined(env, shell);
     }
     Ok(())
 }
@@ -2051,6 +2724,9 @@ fn uninstall_fish(env: &ShellEnv, opts: UninstallOpts) -> Result<()> {
 
     if nothing_to_do {
         eprintln!("(ji)::shell nothing to uninstall for fish");
+    }
+    if !opts.dry_run {
+        clear_install_prompt_declined(env, "fish");
     }
     Ok(())
 }
@@ -2131,7 +2807,7 @@ fn print_active_report(r: &ActiveReport) {
 /// unsupported/unknown active shell is reported, not an error (only the
 /// mutating commands error on that). Genuine I/O errors from the underlying
 /// inspectors still propagate.
-pub fn status(env: &ShellEnv, target: Option<&str>, cmd: &mut clap::Command) -> Result<()> {
+pub fn status(env: &ShellEnv, target: Option<&str>) -> Result<()> {
     let report = detect_active_report();
     print_active_report(&report);
 
@@ -2149,20 +2825,20 @@ pub fn status(env: &ShellEnv, target: Option<&str>, cmd: &mut clap::Command) -> 
     };
 
     match shell.as_str() {
-        "zsh" | "bash" => status_posix(env, &shell, cmd),
-        "fish" => status_fish(env, cmd),
+        "zsh" | "bash" => status_posix(env, &shell),
+        "fish" => status_fish(env),
         other => bail!("unsupported shell: {other} (supported: {SUPPORTED_SHELLS})"),
     }
 }
 
-fn status_posix(env: &ShellEnv, shell: &str, cmd: &mut clap::Command) -> Result<()> {
+fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
     let primary = if shell == "zsh" {
         zsh_primary(env)
     } else {
         bash_primary(env)
     };
     let managed = env.managed_file(shell)?;
-    let body = render_managed_body(shell, cmd)?;
+    let body = render_managed_body(shell)?;
     let stanza = render_rc_stanza(shell)?;
 
     println!("ji shell integration: {shell}");
@@ -2216,6 +2892,31 @@ fn status_posix(env: &ShellEnv, shell: &str, cmd: &mut clap::Command) -> Result<
             );
         }
     }
+    let shadows = scan_bypass_aliases(env, shell, &primary);
+    if shadows.is_empty() {
+        println!("  bypass aliases: none");
+    } else {
+        println!("  bypass aliases:");
+        for h in &shadows {
+            let what = if matches!(h.kind, ShadowKind::Function) {
+                "function ji".to_string()
+            } else {
+                format!("alias {} -> {}", h.name, h.target)
+            };
+            let note = if h.shadows_wrapper() {
+                "shadows the wrapper"
+            } else {
+                "runs ji directly"
+            };
+            println!(
+                "    {}:{} — {} ({})",
+                h.path.display(),
+                h.line_no,
+                what,
+                note
+            );
+        }
+    }
     let unresolved: Vec<&Hit> = hits
         .iter()
         .filter(|h| matches!(h.kind, HitKind::UnresolvedSource(_)))
@@ -2230,12 +2931,12 @@ fn status_posix(env: &ShellEnv, shell: &str, cmd: &mut clap::Command) -> Result<
     Ok(())
 }
 
-fn status_fish(env: &ShellEnv, cmd: &mut clap::Command) -> Result<()> {
+fn status_fish(env: &ShellEnv) -> Result<()> {
     let primary = fish_primary(env);
     let completions = fish_completions_path(env);
     let shadow = fish_shadow_path(env);
     let wrapper_body = render_fish_wrapper_body();
-    let completion_body = render_fish_completion_body(cmd)?;
+    let completion_body = render_fish_completion_body()?;
 
     println!("ji shell integration: fish");
     println!(
@@ -2269,6 +2970,31 @@ fn status_fish(env: &ShellEnv, cmd: &mut clap::Command) -> Result<()> {
         println!("  cross-file hits:");
         for h in cross {
             println!("    {}:{} — {}", h.path.display(), h.line_no, h.line_text);
+        }
+    }
+    let shadows = scan_bypass_aliases(env, "fish", &primary);
+    if shadows.is_empty() {
+        println!("  bypass aliases: none");
+    } else {
+        println!("  bypass aliases:");
+        for h in &shadows {
+            let what = if matches!(h.kind, ShadowKind::Function) {
+                "function ji".to_string()
+            } else {
+                format!("alias {} -> {}", h.name, h.target)
+            };
+            let note = if h.shadows_wrapper() {
+                "shadows the wrapper"
+            } else {
+                "runs ji directly"
+            };
+            println!(
+                "    {}:{} — {} ({})",
+                h.path.display(),
+                h.line_no,
+                what,
+                note
+            );
         }
     }
     Ok(())
@@ -2332,6 +3058,87 @@ fn display_canonical(p: &Path) -> String {
     match p.canonicalize() {
         Ok(c) if c != p => format!("{} -> {}", p.display(), c.display()),
         _ => p.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn detect_bypass_alias_flags_direct_binary_aliases() {
+        for (line, name, target) in [
+            ("alias ji=/opt/bin/ji", "ji", "/opt/bin/ji"),
+            ("alias j=/opt/bin/ji", "j", "/opt/bin/ji"),
+            (
+                "alias ji='/opt/bin/ji --color'",
+                "ji",
+                "/opt/bin/ji --color",
+            ),
+            ("alias ji='command ji'", "ji", "command ji"),
+            (
+                "alias gji='command /opt/bin/ji'",
+                "gji",
+                "command /opt/bin/ji",
+            ),
+            (r#"alias ji="$HOME/bin/ji""#, "ji", "$HOME/bin/ji"),
+            ("alias ji /usr/bin/ji", "ji", "/usr/bin/ji"),
+            ("alias ji 'command ji'", "ji", "command ji"),
+            (
+                "alias ji='env FOO=bar /opt/bin/ji'",
+                "ji",
+                "env FOO=bar /opt/bin/ji",
+            ),
+            ("alias ji='env FOO=1 ji'", "ji", "env FOO=1 ji"),
+        ] {
+            assert_eq!(
+                detect_bypass_alias(line),
+                Some((name.to_string(), target.to_string())),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_bypass_alias_rejects_non_bypass_aliases() {
+        for line in [
+            "alias ji=ji",
+            "alias ji='ji --x'",
+            "alias x='echo /opt/bin/ji'",
+            "alias ji='command -v /opt/bin/ji'",
+            "alias x=/p/jj",
+            "alias jcsi='ji config shell init zsh'",
+            "alias ji='$(which ji)'",
+            "unalias ji",
+            "# alias ji=",
+            "alias ji",
+        ] {
+            assert_eq!(detect_bypass_alias(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn alias_hit_shadows_wrapper_for_ji_alias_or_function() {
+        let alias_ji = AliasHit {
+            path: PathBuf::from("/tmp/rc"),
+            line_no: 1,
+            name: "ji".into(),
+            target: "/opt/bin/ji".into(),
+            kind: ShadowKind::Alias,
+        };
+        let alias_j = AliasHit {
+            name: "j".into(),
+            ..alias_ji.clone()
+        };
+        let function_ji = AliasHit {
+            target: String::new(),
+            kind: ShadowKind::Function,
+            ..alias_ji.clone()
+        };
+
+        assert!(alias_ji.shadows_wrapper());
+        assert!(!alias_j.shadows_wrapper());
+        assert!(function_ji.shadows_wrapper());
     }
 }
 
@@ -2611,7 +3418,6 @@ mod detection_tests {
 #[cfg(test)]
 mod cd_tests {
     use super::*;
-    use clap::CommandFactory;
     use tempfile::TempDir;
 
     fn env_for(tmp: &TempDir) -> ShellEnv {
@@ -2623,6 +3429,65 @@ mod cd_tests {
             zsh_custom: None,
             omz_root: None,
         }
+    }
+
+    // ---- inline install offer gate + decline markers ----
+
+    #[test]
+    fn should_offer_only_for_not_installed_inspect_tty_not_declined() {
+        let inspect = StatusAction::Inspect("zsh".into());
+        assert!(should_offer(
+            &inspect,
+            &CdUnavailable::NotInstalled,
+            true,
+            false
+        ));
+
+        for reason in [
+            CdUnavailable::InstalledInactive,
+            CdUnavailable::RanByPath,
+            CdUnavailable::NeedsRefresh,
+            CdUnavailable::UnsupportedShell("nu".into()),
+        ] {
+            assert!(!should_offer(&inspect, &reason, true, false), "{reason:?}");
+        }
+
+        assert!(!should_offer(
+            &StatusAction::ReportOnly,
+            &CdUnavailable::NotInstalled,
+            true,
+            false
+        ));
+        assert!(!should_offer(
+            &inspect,
+            &CdUnavailable::NotInstalled,
+            false,
+            false
+        ));
+        assert!(!should_offer(
+            &inspect,
+            &CdUnavailable::NotInstalled,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn install_prompt_declined_marker_is_per_shell() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp);
+        let expected = env
+            .xdg_config_home
+            .join("ji")
+            .join("install-prompt-declined-zsh");
+        assert_eq!(declined_marker(&env, "zsh"), expected);
+
+        set_install_prompt_declined(&env, "zsh");
+        assert!(install_prompt_declined(&env, "zsh"));
+        assert!(!install_prompt_declined(&env, "bash"));
+
+        clear_install_prompt_declined(&env, "zsh");
+        assert!(!install_prompt_declined(&env, "zsh"));
     }
 
     // ---- sq quoting ----
@@ -2706,7 +3571,7 @@ mod cd_tests {
             cd_reason(&inspect, &unknown, None, WrapperState::Drift, false),
             CdUnavailable::NeedsRefresh
         ));
-        // "restart"-class advice is reachable ONLY from Working:
+        // "restart"-class advice is reachable only from Working:
         assert!(matches!(
             cd_reason(&inspect, &unknown, None, WrapperState::Working, false),
             CdUnavailable::InstalledInactive
@@ -2813,19 +3678,37 @@ mod cd_tests {
         assert!(rc_stanza_state(&rc, &stanza).contains("(present)"));
     }
 
-    // ---- wrapper_state (temp env; uses the real Cli command, matching install) ----
+    // ---- packaged (xtask) completion ----
+
+    #[test]
+    fn packaged_zsh_is_autoload_safe() {
+        let zsh = packaged_completion("zsh").unwrap();
+        assert!(
+            zsh.starts_with("#compdef ji"),
+            "packaged _ji must start with the #compdef autoload header"
+        );
+        assert!(
+            zsh.contains("funcstack[1]"),
+            "packaged _ji must carry the dual-mode autoload guard"
+        );
+        // The bare trailing `compdef … ji` must have been replaced by the guard.
+        assert!(
+            !zsh.trim_end()
+                .ends_with("compdef _clap_dynamic_completer_ji ji")
+        );
+        // bash/fish pass clap's registration through unchanged (dynamic).
+        assert!(packaged_completion("bash").unwrap().contains("COMPLETE"));
+        let fish = packaged_completion("fish").unwrap();
+        assert!(fish.contains("complete") && fish.contains("COMPLETE=fish"));
+    }
+
+    // ---- wrapper_state (temp env; matches install) ----
 
     #[test]
     fn wrapper_state_canonical_zsh_install_is_working() {
         let tmp = TempDir::new().unwrap();
         let env = env_for(&tmp);
-        install(
-            &env,
-            "zsh",
-            &mut crate::cli::Cli::command(),
-            InstallOpts::default(),
-        )
-        .unwrap();
+        install(&env, "zsh", InstallOpts::default()).unwrap();
         assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Working);
     }
 
@@ -2840,13 +3723,7 @@ mod cd_tests {
     fn wrapper_state_drift_when_managed_file_corrupted() {
         let tmp = TempDir::new().unwrap();
         let env = env_for(&tmp);
-        install(
-            &env,
-            "zsh",
-            &mut crate::cli::Cli::command(),
-            InstallOpts::default(),
-        )
-        .unwrap();
+        install(&env, "zsh", InstallOpts::default()).unwrap();
         std::fs::write(env.managed_file("zsh").unwrap(), "garbage\n").unwrap();
         assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Drift);
     }
@@ -2855,13 +3732,7 @@ mod cd_tests {
     fn wrapper_state_fish_shadow_blocks_working() {
         let tmp = TempDir::new().unwrap();
         let env = env_for(&tmp);
-        install(
-            &env,
-            "fish",
-            &mut crate::cli::Cli::command(),
-            InstallOpts::default(),
-        )
-        .unwrap();
+        install(&env, "fish", InstallOpts::default()).unwrap();
         assert_eq!(wrapper_state(&env, "fish"), WrapperState::Working);
         let shadow = fish_shadow_path(&env);
         std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
@@ -2873,13 +3744,7 @@ mod cd_tests {
     fn wrapper_state_rc_stanza_drift_is_drift() {
         let tmp = TempDir::new().unwrap();
         let env = env_for(&tmp);
-        install(
-            &env,
-            "zsh",
-            &mut crate::cli::Cli::command(),
-            InstallOpts::default(),
-        )
-        .unwrap();
+        install(&env, "zsh", InstallOpts::default()).unwrap();
         // A valid marker block whose contents drifted from the canonical stanza.
         std::fs::write(
             env.home.join(".zshrc"),
@@ -2893,15 +3758,9 @@ mod cd_tests {
     fn wrapper_state_duplicate_marker_block_is_not_working() {
         let tmp = TempDir::new().unwrap();
         let env = env_for(&tmp);
-        install(
-            &env,
-            "zsh",
-            &mut crate::cli::Cli::command(),
-            InstallOpts::default(),
-        )
-        .unwrap();
+        install(&env, "zsh", InstallOpts::default()).unwrap();
         assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Working);
-        // A SECOND primary marker block ⇒ not an exact single canonical install (review fix).
+        // A second primary marker block ⇒ not an exact single canonical install.
         let rc = env.home.join(".zshrc");
         let mut contents = std::fs::read_to_string(&rc).unwrap();
         contents.push_str(&format!("\n{MARKER_BEGIN}\nsource /dup\n{MARKER_END}\n"));

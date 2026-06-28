@@ -58,7 +58,7 @@ pub fn transfer_with_info(
 
     // Strict validation: the transfer plan spans more than SyncModeInfo
     // (target entries, selected method semantics), so any op-head movement
-    // since `info` was computed bails. Heads AND lca come from the
+    // since `info` was computed bails. Heads and lca come from the
     // validated info — never from the possibly stale `info`.
     let validated =
         super::validate_head_info(repo, info, params.source_name, params.target_name, false)?;

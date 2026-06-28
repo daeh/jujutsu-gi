@@ -19,9 +19,10 @@ ji config shell install            # detect the active shell
 ji config shell install zsh        # explicit
 ji config shell install bash
 ji config shell install fish
+ji config shell install --all      # every shell with an existing config
 ```
 
-The installer is idempotent — re-running it leaves already-managed files and the rc stanza in place. On a terminal it previews the changes and prompts `[y/N/?]` before writing (`?` re-shows the diff); pass `--yes` to skip the prompt, or `--dry-run` to preview without writing. A non-interactive run (piped/CI) writes directly. `install` writes:
+The installer is idempotent — re-running it leaves already-managed files and the rc stanza in place. On a terminal it previews the changes and prompts `[y/N/?]` before writing (`?` re-shows the diff); pass `--yes` to skip the prompt, or `--dry-run` to preview without writing. A non-interactive run (piped/CI) writes directly. `--all` configures every shell that already has a config and reports the rest as skipped (it never creates a config for a shell you don't use). `install` writes:
 
 | Shell | What it writes |
 |---|---|
@@ -32,6 +33,12 @@ The installer is idempotent — re-running it leaves already-managed files and t
 Paths shown assume the defaults: the wrapper directory follows `$XDG_CONFIG_HOME`, and zsh's rc file follows `$ZDOTDIR`.
 
 After install, start a new shell or source the rc file.
+
+If you run `ji switch`/`new`/`close` on a terminal and the wrapper isn't installed, `ji` offers to install it then and there (`[y/N/?]`, configuring the shell you're in plus any other shell with a config). A decline is remembered per shell; `ji config shell install` re-enables the offer.
+
+## Bypass aliases
+
+`ji config shell status` reports anything that prevents the wrapper from running. In zsh/bash a `ji` *alias* that points at the binary (e.g. `alias ji=/opt/homebrew/bin/ji` or `alias ji='command ji'`) shadows the wrapper function, so `ji` runs the bare binary and auto-cd silently won't happen; in fish, an `alias ji …` or a user `function ji` does the same. A differently-named alias that runs the binary (e.g. `alias j=/opt/homebrew/bin/ji`) doesn't shadow `ji`, but `j` won't change directory. `status` lists these so you can remove them. (A zsh/bash `ji() { … }` *function* is not detected.)
 
 ## Print without installing
 
@@ -51,6 +58,12 @@ if command -v ji >/dev/null 2>&1; then eval "$(command ji config shell init)"; f
 ```
 
 **fish** — write the output of `ji config shell init fish` to `~/.config/fish/functions/ji.fish`.
+
+## Tab completion
+
+Installing the integration also registers dynamic tab-completion for workspace and bookmark arguments. `ji switch <TAB>` — and `close`, `transfer`, `sync`, including their `--source` flag — completes live workspace targets; `ji new <TAB>` completes existing local bookmarks. Each candidate carries a relative last-modified time, and workspace candidates add a status marker: `(2h)` was touched two hours ago, `(2h)[*]` is the current workspace, `(1y)[x]` is orphaned (its directory is gone).
+
+zsh and fish show the annotations, ordered most-recent-first (orphaned workspaces last); bash completes plain names. Candidates come from a single non-mutating `jj` query per `<TAB>` under a bounded timeout, so completion never snapshots the working copy or stalls the prompt.
 
 ## Supported shells
 

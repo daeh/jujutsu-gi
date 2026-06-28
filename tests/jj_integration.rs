@@ -782,7 +782,7 @@ fn probe_detects_edits_without_touching_op_log() {
     // Un-snapshotted edit: dirty, and the probe leaves no trace.
     std::fs::write(repo.root().join("b.txt"), "pending").unwrap();
     let before_head = op_head(&repo);
-    // Compare op IDs only: the default op-log template renders RELATIVE
+    // Compare op IDs only: the default op-log template renders relative
     // timestamps ("now" -> "1 second ago"), which the probe's own elapsed
     // time can flip between the two captures (flaky). The guarantee under
     // test is "no operation integrated" — that is exactly the op-ID set/order.
@@ -890,7 +890,7 @@ fn snapshot_ws_fails_on_stale_workspace() {
 /// Make workspace `ws` jj-stale by rewriting its `@` TREE from the default
 /// workspace: write `filename` in default and squash it into `<ws>@`. The
 /// workspace's on-disk WC now lags the operation that rewrote its commit.
-/// (A description-only rewrite is NOT enough on jj 0.42 — it reconciles
+/// (A description-only rewrite is not enough on jj 0.42 — it reconciles
 /// automatically; only a tree change leaves the workspace stale.)
 fn make_stale(repo: &TestRepo, ws: &str, filename: &str) {
     std::fs::write(repo.root().join(filename), "stale-maker").unwrap();
@@ -1090,7 +1090,7 @@ fn plan_equivalent_semantics() {
 }
 
 /// validate_head_info: lenient (sync) proceeds with fresh lca on equivalent
-/// movement and bails on plan change; strict bails on ANY movement.
+/// movement and bails on plan change; strict bails on any movement.
 #[test]
 fn validate_head_info_flavors() {
     let repo = TestRepo::new();
@@ -1107,7 +1107,7 @@ fn validate_head_info_flavors() {
     let v = commands::validate_head_info(repo.root(), &info, "feat", "default", false).unwrap();
     assert_eq!(v.op_head, info.op_head);
 
-    // Unrelated movement: lenient passes with the FRESH info (new op head,
+    // Unrelated movement: lenient passes with the fresh info (new op head,
     // same lca); strict bails.
     std::fs::write(side.join("side.txt"), "side-edit").unwrap();
     jujutsu::snapshot_ws(&side).unwrap();
@@ -1266,7 +1266,7 @@ fn protection_setup(repo: &TestRepo) -> (String, PathBuf) {
 
 /// Edit-survival: a third-party workspace whose `@` descends from the
 /// rewrite range and holds a pending un-snapshotted edit gets that edit
-/// captured by the broad protection snapshot BEFORE the rebase-method
+/// captured by the broad protection snapshot before the rebase-method
 /// transfer rewrites its ancestry — reachable afterwards, not stranded.
 #[test]
 fn protection_snapshot_preserves_third_party_edits() {
@@ -1353,7 +1353,7 @@ fn protection_skips_stale_third_party_and_reports() {
 }
 
 /// Sync's broad protection: a dirty third-party workspace whose `@` descends
-/// from a DIRTY involved (source) workspace is captured descendant-first —
+/// from a dirty involved (source) workspace is captured descendant-first —
 /// its edit is folded before the source's own snapshot rebases it — and the
 /// source's post-gate edit rides into the fast-forwarded target.
 #[test]
@@ -1478,7 +1478,7 @@ fn sync_aborts_on_relocated_involved_path() {
     );
     let tgt_id_before = repo.change_id("default@");
 
-    // Fresh info (validate_head_info passes) but params hold the OLD path.
+    // Fresh info (validate_head_info passes) but params hold the old path.
     let info = commands::detect_sync_mode(repo.root(), "feat", "default");
     let err = commands::sync::sync_with_info(
         repo.root(),

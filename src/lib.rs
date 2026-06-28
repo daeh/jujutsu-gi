@@ -1,6 +1,7 @@
 pub mod action_history;
 pub mod cli;
 pub mod commands;
+pub mod completion;
 pub mod config;
 pub mod graph;
 pub mod hooks;

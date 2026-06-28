@@ -6,8 +6,9 @@
 
 **Cause:** `ji` can only change the parent shell's directory when its wrapper is active. The note says why it couldn't, and what to do:
 
-- *enable auto-cd with: `ji config shell install`* — the wrapper isn't installed.
-- *installed but wasn't active for this command — open a new shell, or run `ji` directly* — the session started before install, or you ran `command ji` / a full path, which bypasses the wrapper.
+- *enable auto-cd with: `ji config shell install`* — the wrapper isn't installed. On a terminal, `ji` offers to install it right there (`[y/N/?]`); declining is remembered per shell, and `ji config shell install` re-enables it.
+- *installed but wasn't active for this command … — diagnose with: `ji config shell status`* — the session started before install, or you ran `command ji` / a full path, which bypasses the wrapper.
+- *invoke `ji` as a bare command … — diagnose with: `ji config shell status`* — `ji` was run via a path or `command ji`, so the wrapper didn't intercept it. A `ji` **alias** pointing at the binary (e.g. `alias ji=/opt/homebrew/bin/ji`) causes this too; `ji config shell status` lists any such bypass alias or `function ji` shadowing the wrapper — remove it for auto-cd to work.
 - *on-disk integration doesn't match ji — inspect with `ji config shell status`, then reinstall or remove the conflicting entry* — the on-disk wrapper drifted, or a conflicting integration was found.
 - *auto-cd isn't supported for `<shell>`* — only zsh, bash, and fish are supported.
 

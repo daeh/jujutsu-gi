@@ -1,6 +1,6 @@
 //! Build-side helper for the `ji` crate. Currently supports:
 //!   - `gen-man`         — write the ji(1) man page to target/man/ji.1
-//!   - `gen-completions` — write shell completions to target/completions/
+//!   - `gen-completions` — write dynamic shell completion registrations to target/completions/
 //!
 //! Run via `cargo xtask <sub>` (alias in .cargo/config.toml) or
 //! `cargo run -p xtask -- <sub>`.
@@ -46,12 +46,15 @@ fn gen_man() -> Result<()> {
 }
 
 fn gen_completions() -> Result<()> {
-    use clap_complete::Shell;
     let dir = out_dir("completions")?;
-    let mut cmd = Cli::command();
-    for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
-        let path = clap_complete::generate_to(shell, &mut cmd, "ji", &dir)
-            .with_context(|| format!("generating {shell:?} completions"))?;
+    // Dynamic registrations shared with `ji config shell install` (via
+    // ji::shell::packaged_completion), so packaged completions are dynamic, not
+    // stale static. Filenames match the Homebrew formula's install lines.
+    for (shell, file) in [("bash", "ji.bash"), ("zsh", "_ji"), ("fish", "ji.fish")] {
+        let body = ji::shell::packaged_completion(shell)
+            .with_context(|| format!("generating {shell} completion"))?;
+        let path = dir.join(file);
+        fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
         println!("wrote {}", path.display());
     }
     Ok(())
