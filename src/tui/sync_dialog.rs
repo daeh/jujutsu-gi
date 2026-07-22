@@ -334,7 +334,7 @@ impl SyncDialog {
                 && let Some(bm) = &self.src_singular_bookmark
             {
                 cmds.push(Line::from(vec![
-                    lit("jj bookmark set --revision "),
+                    lit("jj bookmark set --allow-backwards --revision "),
                     rev(&format!("\"{src_escaped}\"@")),
                     lit(&format!(" -- {bm}")),
                 ]));
@@ -344,7 +344,7 @@ impl SyncDialog {
                 && let Some(bm) = &self.tgt_singular_bookmark
             {
                 cmds.push(Line::from(vec![
-                    lit("jj bookmark set --revision "),
+                    lit("jj bookmark set --allow-backwards --revision "),
                     rev(&format!("\"{tgt_escaped}\"@")),
                     lit(&format!(" -- {bm}")),
                 ]));

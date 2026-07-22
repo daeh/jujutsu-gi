@@ -38,6 +38,8 @@ pub fn detect_sync_mode(repo: &Path, src_name: &str, tgt_name: &str) -> SyncMode
         tgt_actual_head: String::new(),
         src_trivial_id: None,
         tgt_trivial_id: None,
+        src_trivial_ids: Vec::new(),
+        tgt_trivial_ids: Vec::new(),
         lca: String::new(),
         op_head: op_head.clone(),
     };
@@ -75,6 +77,8 @@ pub fn detect_sync_mode(repo: &Path, src_name: &str, tgt_name: &str) -> SyncMode
         tgt_actual_head: tgt_info.actual_head,
         src_trivial_id: src_info.trivial_id,
         tgt_trivial_id: tgt_info.trivial_id,
+        src_trivial_ids: src_info.trivial_ids,
+        tgt_trivial_ids: tgt_info.trivial_ids,
         lca,
         op_head,
     }
@@ -118,6 +122,8 @@ pub fn plan_equivalent(a: &SyncModeInfo, b: &SyncModeInfo) -> bool {
         && a.tgt_actual_head == b.tgt_actual_head
         && a.src_trivial_id == b.src_trivial_id
         && a.tgt_trivial_id == b.tgt_trivial_id
+        && a.src_trivial_ids == b.src_trivial_ids
+        && a.tgt_trivial_ids == b.tgt_trivial_ids
         && a.lca == b.lca
 }
 
@@ -589,8 +595,8 @@ pub fn resolve_predicted_stale(predicted: &[String], ws_paths: &[(String, PathBu
 pub struct BookmarkResult {
     /// Non-singular bookmarks not auto-handled (caller may apply manual action).
     pub remaining: Vec<String>,
-    /// Warnings from bookmark operations that failed.
-    pub warnings: Vec<String>,
+    /// Bookmark commands that failed after the primary operation.
+    pub errors: Vec<types::PostOperationError>,
 }
 
 /// Handle singular bookmarks after a close/transfer operation.
@@ -610,12 +616,15 @@ pub fn post_op_bookmarks(
     mut bookmarks: Vec<String>,
     src_effective_head_override: Option<&str>,
 ) -> BookmarkResult {
-    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
 
-    /// Collect a bookmark-operation result into the warnings list.
-    fn collect(result: anyhow::Result<Option<String>>, warnings: &mut Vec<String>) {
+    /// Collect a failed bookmark operation as a structured post-op error.
+    fn collect(
+        result: anyhow::Result<Option<String>>,
+        errors: &mut Vec<types::PostOperationError>,
+    ) {
         if let Err(e) = result {
-            warnings.push(format!("{e:#}"));
+            errors.push(types::PostOperationError::from_anyhow(&e));
         }
     }
 
@@ -629,7 +638,7 @@ pub fn post_op_bookmarks(
                     repo_name,
                     source_name,
                 ),
-                &mut warnings,
+                &mut errors,
             );
         }
         // Close: source forgotten, revisions remain (detach or merged).
@@ -650,7 +659,7 @@ pub fn post_op_bookmarks(
                         source_name,
                         &head,
                     ),
-                    &mut warnings,
+                    &mut errors,
                 );
             }
             // Advance target bookmark for structure-preserving ops.
@@ -667,7 +676,7 @@ pub fn post_op_bookmarks(
                         repo_name,
                         target_name,
                     ),
-                    &mut warnings,
+                    &mut errors,
                 );
             }
         }
@@ -686,7 +695,7 @@ pub fn post_op_bookmarks(
                         repo_name,
                         ws_name,
                     ),
-                    &mut warnings,
+                    &mut errors,
                 );
             }
         }
@@ -703,36 +712,36 @@ pub fn post_op_bookmarks(
 
     BookmarkResult {
         remaining: bookmarks,
-        warnings,
+        errors,
     }
 }
 
 /// Apply manual bookmark action (close only, for remaining non-singular bookmarks).
 ///
-/// Returns warnings for any bookmark operations that failed.
+/// Returns structured errors for any bookmark operations that failed.
 pub fn post_op_manual_bookmarks(
     repo: &Path,
     bookmarks: &[String],
     action: types::BookmarkAction,
     target_change_id: &str,
-) -> Vec<String> {
-    let mut warnings = Vec::new();
+) -> Vec<types::PostOperationError> {
+    let mut errors = Vec::new();
     match action {
         types::BookmarkAction::Advance => {
             for bm in bookmarks {
-                if let Err(e) = jujutsu::bookmark_set(repo, bm, target_change_id) {
-                    warnings.push(format!("advancing {bm}: {e:#}"));
+                if let Err(e) = jujutsu::bookmark_set_exact(repo, bm, target_change_id) {
+                    errors.push(types::PostOperationError::from_anyhow(&e));
                 }
             }
         }
         types::BookmarkAction::Delete => {
             for bm in bookmarks {
                 if let Err(e) = jujutsu::bookmark_delete(repo, bm) {
-                    warnings.push(format!("deleting {bm}: {e:#}"));
+                    errors.push(types::PostOperationError::from_anyhow(&e));
                 }
             }
         }
         types::BookmarkAction::NoAction => {}
     }
-    warnings
+    errors
 }

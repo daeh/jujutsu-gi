@@ -902,7 +902,7 @@ impl CloseDialog {
                     if let Some(info) = &self.close_info {
                         let target = self.shortest(&info.src_effective_head);
                         cmds.push(Line::from(vec![
-                            lit("jj bookmark set --revision "),
+                            lit("jj bookmark set --allow-backwards --revision "),
                             rev(target),
                             lit(&format!(" -- {bm}")),
                         ]));
@@ -916,7 +916,7 @@ impl CloseDialog {
                 | Operation::MergeSquash => {
                     let escaped = jujutsu::escape_revset_string(name);
                     cmds.push(Line::from(vec![
-                        lit("jj bookmark set --revision "),
+                        lit("jj bookmark set --allow-backwards --revision "),
                         rev(&format!("\"{escaped}\"@")),
                         lit(&format!(" -- {bm}")),
                     ]));
@@ -932,7 +932,7 @@ impl CloseDialog {
                 | Operation::FastForwardTargetClose => {
                     let escaped = jujutsu::escape_revset_string(target_name);
                     cmds.push(Line::from(vec![
-                        lit("jj bookmark set --revision "),
+                        lit("jj bookmark set --allow-backwards --revision "),
                         rev(&format!("\"{escaped}\"@")),
                         lit(&format!(" -- {bm}")),
                     ]));
@@ -945,7 +945,7 @@ impl CloseDialog {
                 | Operation::MergeSquash => {
                     let escaped = jujutsu::escape_revset_string(target_name);
                     cmds.push(Line::from(vec![
-                        lit("jj bookmark set --revision "),
+                        lit("jj bookmark set --allow-backwards --revision "),
                         rev(&format!("\"{escaped}\"@")),
                         lit(&format!(" -- {bm}")),
                     ]));
@@ -960,7 +960,7 @@ impl CloseDialog {
                 BookmarkAction::Advance => {
                     for bm in &self.bookmarks {
                         cmds.push(Line::from(vec![
-                            lit("jj bookmark set --revision "),
+                            lit("jj bookmark set --allow-backwards --revision "),
                             rev(target_id),
                             lit(&format!(" -- {bm}")),
                         ]));

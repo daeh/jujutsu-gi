@@ -107,6 +107,12 @@ pub fn sync_with_info(
                 warnings.push(format!("{e:#}"));
             }
         }
+        for chain in [&src_hi.trivial_ids, &tgt_hi.trivial_ids] {
+            let ids: Vec<&str> = chain.iter().map(String::as_str).collect();
+            if let Err(e) = jj_utils::abandon_trivial_heads(repo, &ids) {
+                warnings.push(format!("{e:#}"));
+            }
+        }
         // WC-behind report: third-party workspaces staled by the sync (no
         // predicted-stale resolution — sync rewrites no interior revisions).
         warnings.extend(super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped));

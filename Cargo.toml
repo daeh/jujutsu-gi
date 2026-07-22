@@ -3,9 +3,9 @@ members = [".", "xtask"]
 
 [package]
 name = "ji"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 description = "Jujutsu workspace manager TUI"
 license = "MIT"
 readme = "README.md"

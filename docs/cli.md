@@ -126,8 +126,8 @@ Close a workspace — integrating its work into a target, or (for the `detach`/`
 | `merge` | yes | Creates a merge commit whose parents are the effective heads of both workspaces |
 | `squash-merge` | yes | Squashes the source chain into one commit, then merges |
 | `fast-forward` | yes | Fast-forwards the target to the source's effective head |
-| `detach` | no | Forgets the workspace without touching its revisions (disposal method) |
-| `abandon` | no | Forgets the workspace and abandons all its revisions (disposal method) |
+| `detach` | no | Forgets the workspace, keeping meaningful and explicitly bookmarked revisions while removing unreferenced trivial heads |
+| `abandon` | no | Forgets the workspace and abandons all its revisions |
 
 For full diagrams and the jj command sequences ji runs for each method, see [operations.md](operations.md).
 
@@ -253,7 +253,7 @@ Prints the shell wrapper function to stdout.
 
 ### `ji config shell install [SHELL]`
 
-Installs the shell wrapper. Idempotent. On a terminal it previews the changes and prompts `[y/N/?]` before writing (`?` re-shows the diff); a non-interactive run (piped/CI) writes directly. With no `[SHELL]` it targets the active shell; `--all` instead installs for **every shell with an existing config** (skipping shells with none, reported per shell). Flags: `--all`, `--dry-run` (print the diff without writing), `--force` (install even if integration is detected elsewhere, or overwrite non-ji-managed files), `--yes`/`-y` (skip the prompt). `--all` and an explicit `[SHELL]` are mutually exclusive. See [shell-integration.md](shell-integration.md) for target locations and manual install.
+Installs the shell wrapper. Idempotent. On a terminal it previews the changes and prompts `[y/N/?]` before writing (`?` re-shows the diff); a non-interactive run (piped/CI) writes directly. With no `[SHELL]` it targets the active shell; `--all` instead installs for **every shell with an existing config** (skipping shells with none, reported per shell). Flags: `--all`, `--dry-run` (print the diff without writing), `--force` (install even if integration is detected elsewhere, or overwrite non-ji-managed files), `--yes`/`-y` (skip the prompt). `--all` and an explicit `[SHELL]` are mutually exclusive. For fish, when a dynamic completion is already provided on `$fish_complete_path` (e.g. Homebrew's `vendor_completions.d/ji.fish`), install relies on it and removes a redundant/stale user-directory copy instead of writing one that would shadow it. See [shell-integration.md](shell-integration.md) for target locations and manual install.
 
 When `ji switch`/`new`/`close` can't change the directory because the wrapper isn't installed, on a terminal it offers to install integration right there (`[y/N/?]`); declining is remembered per shell.
 
@@ -263,7 +263,7 @@ Removes the wrapper files and rc stanza that `install` added. Flags: `--dry-run`
 
 ### `ji config shell status [SHELL]`
 
-Reports install state, drift, any cross-file integration hits, and any bypass aliases — a `ji` alias (or fish `function ji`) that shadows the wrapper, or a differently-named alias that runs the `ji` binary directly.
+Reports install state, drift, any cross-file integration hits, and any bypass aliases — a `ji` alias (or fish `function ji`) that shadows the wrapper, or a differently-named alias that runs the `ji` binary directly. For fish it also reports whether the user completion is shadowing (or being shadowed by) another `ji.fish` on `$fish_complete_path`, and how to resolve it.
 
 ---
 

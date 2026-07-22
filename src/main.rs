@@ -139,6 +139,16 @@ fn main() -> anyhow::Result<()> {
 
             let result = commands::close::close(&params)?;
 
+            let had_post_errors = !result.post_errors.is_empty();
+            if had_post_errors {
+                eprintln!(
+                    "{}",
+                    commands::types::format_post_close_errors(&src_name, &result.post_errors)
+                );
+            }
+            if !result.warnings.is_empty() {
+                eprintln!("(ji)::warning: {}", result.warnings.join("; "));
+            }
             if !result.stale_warnings.is_empty() {
                 eprintln!("(ji)::stale: {}", result.stale_warnings.join(", "));
             }
@@ -153,6 +163,10 @@ fn main() -> anyhow::Result<()> {
             // non-zero) if the launch cwd no longer exists, benign hint otherwise.
             if closing_cwd {
                 shell::apply_close_cd(&shell_cwd, &repo_root)?;
+            }
+
+            if had_post_errors {
+                std::process::exit(1);
             }
 
             Ok(())
@@ -194,6 +208,14 @@ fn main() -> anyhow::Result<()> {
 
             let result = commands::transfer::transfer(&params)?;
 
+            if !result.post_errors.is_empty() {
+                for error in &result.post_errors {
+                    eprintln!("(ji)::error: {}", error.display_block());
+                }
+            }
+            if !result.warnings.is_empty() {
+                eprintln!("(ji)::warning: {}", result.warnings.join("; "));
+            }
             if !result.stale_warnings.is_empty() {
                 eprintln!("(ji)::stale: {}", result.stale_warnings.join(", "));
             }

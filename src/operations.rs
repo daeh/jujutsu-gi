@@ -78,7 +78,8 @@ fn squash_chain(
 }
 
 /// Abandon trivial heads from the given workspaces (non-critical cleanup).
-/// Returns warnings from any bookmark-move failures during abandonment.
+/// Returns warnings from cleanup failures; bookmarked heads are retained for
+/// the command layer to handle according to its bookmark policy.
 fn find_abandon_trivial_heads(repo: &Path, workspaces: &[&WorkspaceHeadInfo]) -> Vec<String> {
     let ids: Vec<&str> = workspaces
         .iter()

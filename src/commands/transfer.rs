@@ -197,9 +197,8 @@ pub fn transfer_with_info(
         .collect();
     super::resolve_predicted_stale(&to_resolve, &fresh.ws_paths);
 
-    // Post-op: staleness warnings + operation warnings.
-    let mut stale_warnings = super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped);
-    stale_warnings.extend(op_warnings);
+    let stale_warnings = super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped);
+    let warnings = op_warnings;
 
     // Post-op: singular bookmarks (both survive → advance both to effective head).
     let bm_result = super::post_op_bookmarks(
@@ -213,10 +212,20 @@ pub fn transfer_with_info(
         Vec::new(),
         None,
     );
-    stale_warnings.extend(bm_result.warnings);
+    let mut post_errors = bm_result.errors;
+
+    for chain in [&src_hi.trivial_ids, &tgt_hi.trivial_ids] {
+        let ids: Vec<&str> = chain.iter().map(String::as_str).collect();
+        if let Err(e) = jj_utils::abandon_trivial_heads(repo, &ids) {
+            post_errors.push(super::types::PostOperationError::from_anyhow(&e));
+        }
+    }
 
     Ok(CloseTransferResult {
         stale_warnings,
+        warnings,
+        post_errors,
+        resolved_operation: operation,
         predicted_stale,
         pending_remove_path: None,
     })

@@ -28,9 +28,11 @@ The installer is idempotent — re-running it leaves already-managed files and t
 |---|---|
 | zsh  | wrapper → `~/.config/ji/init.zsh`; a sourcing stanza → `~/.zshrc` |
 | bash | wrapper → `~/.config/ji/init.bash`; a sourcing stanza → `~/.bash_profile` (or `~/.bash_login` / `~/.profile`, whichever already exists) |
-| fish | wrapper function → `~/.config/fish/functions/ji.fish` (autoloaded; no rc edit); completions → `~/.config/fish/completions/ji.fish` |
+| fish | wrapper function → `~/.config/fish/functions/ji.fish` (autoloaded; no rc edit); completions → `~/.config/fish/completions/ji.fish`, **only when no vendor completion already provides them** |
 
 Paths shown assume the defaults: the wrapper directory follows `$XDG_CONFIG_HOME`, and zsh's rc file follows `$ZDOTDIR`.
+
+fish autoloads the first `ji.fish` it finds on `$fish_complete_path`, and the user directory comes first. When a dynamic completion is already installed elsewhere on that path — e.g. Homebrew's `…/share/fish/vendor_completions.d/ji.fish` — `install` relies on it and does **not** write a user-directory copy; if it finds a redundant or stale ji-managed one there, it removes it so the vendor completion isn't shadowed. `ji config shell status fish` reports such a shadow and the fix.
 
 After install, start a new shell or source the rc file.
 

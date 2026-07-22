@@ -767,6 +767,187 @@ fn op_head(repo: &TestRepo) -> String {
     jujutsu::current_op_head(repo.root()).unwrap_or_default()
 }
 
+#[test]
+fn detach_moves_singular_bookmark_and_abandons_trivial_tip() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "base revision");
+    let base = repo.change_id("@");
+    let recovery = repo.tmp().join("recovery");
+    jj_r(
+        repo.root(),
+        &[
+            "workspace",
+            "add",
+            &recovery.to_string_lossy(),
+            "--name",
+            "recovery",
+            "--revision",
+            &base,
+            "--message",
+            "rec",
+        ],
+    );
+    let trivial_tip = repo.change_id("recovery@");
+    jj_r(
+        repo.root(),
+        &[
+            "bookmark",
+            "create",
+            "--revision",
+            "recovery@",
+            "--",
+            "recovery",
+        ],
+    );
+
+    let params = commands::close::CloseParams {
+        repo_root: repo.root(),
+        source_name: "recovery",
+        source_path: &recovery,
+        target_name: "default",
+        target_path: repo.root(),
+        target_change_id: &base,
+        method: CloseMethod::Detach,
+        delete_files: false,
+        bookmark_action: BookmarkAction::NoAction,
+        bookmarks: vec!["recovery".into()],
+        revisions: &[],
+        workspace_path_template: "{{ bookmark }}",
+        repo_name: "repo",
+        author: None,
+    };
+    let result = commands::close::close(&params).expect("detach should succeed");
+
+    assert!(result.post_errors.is_empty(), "{:?}", result.post_errors);
+    assert_eq!(repo.change_id("recovery"), base);
+    assert!(
+        !repo.rev_exists(&trivial_tip),
+        "unreferenced trivial workspace tip should be abandoned"
+    );
+    assert!(
+        !jj_r(repo.root(), &["workspace", "list"]).contains("recovery:"),
+        "workspace should be forgotten"
+    );
+}
+
+#[test]
+fn detach_abandons_stacked_unreferenced_trivial_tips() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "base revision");
+    let base = repo.change_id("@");
+    let recovery = repo.tmp().join("recovery");
+    jj_r(
+        repo.root(),
+        &[
+            "workspace",
+            "add",
+            &recovery.to_string_lossy(),
+            "--name",
+            "recovery",
+            "--revision",
+            &base,
+            "--message",
+            "rec",
+        ],
+    );
+    let lower_tip = repo.change_id("recovery@");
+    jj(&recovery, &["new", "--message", "wip"]);
+    let upper_tip = repo.change_id("recovery@");
+    jj_r(
+        repo.root(),
+        &[
+            "bookmark",
+            "create",
+            "--revision",
+            "recovery@",
+            "--",
+            "recovery",
+        ],
+    );
+
+    let params = commands::close::CloseParams {
+        repo_root: repo.root(),
+        source_name: "recovery",
+        source_path: &recovery,
+        target_name: "default",
+        target_path: repo.root(),
+        target_change_id: &base,
+        method: CloseMethod::Detach,
+        delete_files: false,
+        bookmark_action: BookmarkAction::NoAction,
+        bookmarks: vec!["recovery".into()],
+        revisions: &[],
+        workspace_path_template: "{{ bookmark }}",
+        repo_name: "repo",
+        author: None,
+    };
+    let result = commands::close::close(&params).expect("detach should succeed");
+
+    assert!(result.post_errors.is_empty(), "{:?}", result.post_errors);
+    assert_eq!(repo.change_id("recovery"), base);
+    assert!(!repo.rev_exists(&upper_tip));
+    assert!(!repo.rev_exists(&lower_tip));
+}
+
+#[test]
+fn detach_preserves_trivial_tip_pinned_by_no_action_bookmark() {
+    let repo = TestRepo::new();
+    repo.commit_file("base.txt", "base", "base revision");
+    let base = repo.change_id("@");
+    let recovery = repo.tmp().join("recovery");
+    jj_r(
+        repo.root(),
+        &[
+            "workspace",
+            "add",
+            &recovery.to_string_lossy(),
+            "--name",
+            "recovery",
+            "--revision",
+            &base,
+            "--message",
+            "rec",
+        ],
+    );
+    let trivial_tip = repo.change_id("recovery@");
+    for bookmark in ["recovery", "keep"] {
+        jj_r(
+            repo.root(),
+            &[
+                "bookmark",
+                "create",
+                "--revision",
+                "recovery@",
+                "--",
+                bookmark,
+            ],
+        );
+    }
+
+    let params = commands::close::CloseParams {
+        repo_root: repo.root(),
+        source_name: "recovery",
+        source_path: &recovery,
+        target_name: "default",
+        target_path: repo.root(),
+        target_change_id: &base,
+        method: CloseMethod::Detach,
+        delete_files: false,
+        bookmark_action: BookmarkAction::NoAction,
+        bookmarks: vec!["recovery".into(), "keep".into()],
+        revisions: &[],
+        workspace_path_template: "{{ bookmark }}",
+        repo_name: "repo",
+        author: None,
+    };
+    let result = commands::close::close(&params).expect("detach should succeed");
+
+    assert!(result.post_errors.is_empty(), "{:?}", result.post_errors);
+    assert_eq!(repo.change_id("recovery"), base);
+    assert_eq!(repo.change_id("keep"), trivial_tip);
+    assert!(repo.rev_exists(&trivial_tip));
+}
+
 /// The probe detects un-snapshotted edits without integrating any operation.
 #[test]
 fn probe_detects_edits_without_touching_op_log() {
@@ -1064,6 +1245,8 @@ fn plan_equivalent_semantics() {
         tgt_actual_head: "t-act".into(),
         src_trivial_id: None,
         tgt_trivial_id: Some("t-act".into()),
+        src_trivial_ids: Vec::new(),
+        tgt_trivial_ids: vec!["t-act".into()],
         lca: "t-eff".into(),
         op_head: "op-1".into(),
     };

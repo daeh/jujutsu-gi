@@ -1,4 +1,4 @@
-use crate::jj_utils::WorkspaceHeadInfo;
+use crate::{jj_utils::WorkspaceHeadInfo, jujutsu::JjCommandError};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -43,6 +43,8 @@ pub struct SyncModeInfo {
     pub tgt_actual_head: String,
     pub src_trivial_id: Option<String>,
     pub tgt_trivial_id: Option<String>,
+    pub src_trivial_ids: Vec<String>,
+    pub tgt_trivial_ids: Vec<String>,
     /// Last common ancestor of src and tgt effective heads.
     pub lca: String,
     /// Operation head when this info was computed (for staleness detection).
@@ -56,6 +58,7 @@ impl SyncModeInfo {
             effective_head: self.src_effective_head.clone(),
             actual_head: self.src_actual_head.clone(),
             trivial_id: self.src_trivial_id.clone(),
+            trivial_ids: self.src_trivial_ids.clone(),
         }
     }
 
@@ -65,6 +68,7 @@ impl SyncModeInfo {
             effective_head: self.tgt_effective_head.clone(),
             actual_head: self.tgt_actual_head.clone(),
             trivial_id: self.tgt_trivial_id.clone(),
+            trivial_ids: self.tgt_trivial_ids.clone(),
         }
     }
 }
@@ -102,6 +106,19 @@ pub enum Operation {
     // Disposal (close only)
     Detach,
     Abandon,
+}
+
+impl Operation {
+    pub fn close_method_label(self) -> Option<&'static str> {
+        match self {
+            Self::MergeClose => Some("merge"),
+            Self::MergeSquashClose => Some("squash-merge"),
+            Self::FastForwardTargetClose => Some("fast-forward"),
+            Self::Detach => Some("detach"),
+            Self::Abandon => Some("abandon"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -190,6 +207,12 @@ impl TryFrom<Operation> for TransferMethod {
 pub struct CloseTransferResult {
     /// Workspaces that remained stale after post-op cleanup.
     pub stale_warnings: Vec<String>,
+    /// Non-fatal informational warnings unrelated to workspace staleness.
+    pub warnings: Vec<String>,
+    /// Commands or checks that failed after the primary operation completed.
+    pub post_errors: Vec<PostOperationError>,
+    /// Concrete operation executed after resolving an adaptive request.
+    pub resolved_operation: Operation,
     /// Third-party workspaces predicted to become stale by this operation.
     /// Production resolves these internally; integration tests read the set
     /// to pin the prediction logic.
@@ -198,8 +221,66 @@ pub struct CloseTransferResult {
     pub pending_remove_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PostOperationError {
+    Command { command: String, stderr: String },
+    Message(String),
+}
+
+impl PostOperationError {
+    pub fn from_anyhow(error: &anyhow::Error) -> Self {
+        if let Some(command_error) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<JjCommandError>())
+        {
+            Self::Command {
+                command: command_error.command().to_string(),
+                stderr: command_error.stderr().to_string(),
+            }
+        } else {
+            Self::Message(format!("{error:#}"))
+        }
+    }
+
+    pub fn display_block(&self) -> String {
+        match self {
+            Self::Command { command, stderr } => format!("Cmd: `{command}`\n{stderr}"),
+            Self::Message(message) => format!("Error: {message}"),
+        }
+    }
+}
+
+pub fn format_post_close_errors(workspace_name: &str, errors: &[PostOperationError]) -> String {
+    let blocks = errors
+        .iter()
+        .map(PostOperationError::display_block)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("workspace '{workspace_name}' closed with error.\n{blocks}")
+}
+
 /// Result of create execution.
 pub struct CreateResult {
     pub workspace_name: String,
     pub workspace_path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_close_command_error_matches_status_contract() {
+        let error = PostOperationError::Command {
+            command: "jj bookmark set --allow-backwards --revision abc -- recovery".into(),
+            stderr: "Error: refused\nHint: retry".into(),
+        };
+        assert_eq!(
+            format_post_close_errors("recovery", &[error]),
+            "workspace 'recovery' closed with error.\n\
+             Cmd: `jj bookmark set --allow-backwards --revision abc -- recovery`\n\
+             Error: refused\n\
+             Hint: retry"
+        );
+    }
 }

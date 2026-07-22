@@ -275,6 +275,9 @@ pub struct WorkspaceHeadInfo {
     pub actual_head: String,
     /// If @ is a trivial head, its change ID; None otherwise.
     pub trivial_id: Option<String>,
+    /// Consecutive trivial revisions skipped between the actual and effective
+    /// heads, ordered from the actual head toward the effective head.
+    pub trivial_ids: Vec<String>,
 }
 
 /// Resolve effective head, actual head, and triviality for a workspace in 1-2 jj calls.
@@ -308,6 +311,7 @@ pub fn resolve_workspace_head_info(repo: &Path, ws_name: &str) -> Result<Workspa
             effective_head: actual.clone(),
             actual_head: actual,
             trivial_id: None,
+            trivial_ids: Vec::new(),
         });
     }
 
@@ -320,6 +324,7 @@ pub fn resolve_workspace_head_info(repo: &Path, ws_name: &str) -> Result<Workspa
             effective_head: actual.clone(),
             actual_head: actual,
             trivial_id: None,
+            trivial_ids: Vec::new(),
         });
     }
 
@@ -334,11 +339,14 @@ pub fn resolve_workspace_head_info(repo: &Path, ws_name: &str) -> Result<Workspa
 
     if is_trivial {
         // Walk back past any stacked trivial-content ancestors.
-        let effective = find_nontrivial_target(repo, &format!("{ws}@-"))?;
+        let target = find_nontrivial_target(repo, &format!("{ws}@-"))?;
+        let mut trivial_ids = vec![change_id.clone()];
+        trivial_ids.extend(target.skipped_trivial_ids);
         Ok(WorkspaceHeadInfo {
-            effective_head: effective,
+            effective_head: target.change_id,
             actual_head: change_id.clone(),
             trivial_id: Some(change_id),
+            trivial_ids,
         })
     } else {
         // @ is a head but not trivial. Effective head = actual head.
@@ -347,6 +355,7 @@ pub fn resolve_workspace_head_info(repo: &Path, ws_name: &str) -> Result<Workspa
             effective_head: change_id.clone(),
             actual_head: change_id,
             trivial_id: None,
+            trivial_ids: Vec::new(),
         })
     }
 }
@@ -622,39 +631,25 @@ fn check_emptiness(
     }
 }
 
-/// Abandon revisions only if each is still a trivial head (head + empty + trivial description).
-/// Re-checks each revision immediately before abandoning. Abandons those that are still
-/// trivial, then returns an error if any were not trivial heads.
+/// Abandon the unreferenced prefix of a trivial chain.
 ///
-/// If a trivial head has local bookmarks, moves them to the parent before
-/// abandoning — prevents orphaning bookmarks on abandoned revisions.
+/// IDs must be ordered from the former workspace tip toward its effective
+/// head. Each revision is re-checked immediately before it is abandoned; doing
+/// this sequentially makes the next interior revision a head before checking
+/// it. A bookmark stops cleanup and is preserved exactly — bookmark policy is
+/// the caller's responsibility.
 pub fn abandon_trivial_heads(repo: &Path, change_ids: &[&str]) -> Result<()> {
-    let mut to_abandon = Vec::new();
-    let mut skipped = Vec::new();
-    for id in change_ids {
-        if check_trivial_head(repo, id)?.is_some() {
-            // Move any local bookmarks to the parent before abandoning.
-            let bookmarks = jujutsu::local_bookmarks_on(repo, id)?;
-            if !bookmarks.is_empty() {
-                let parent = resolve_change_id(repo, &format!("parents({id})"))?;
-                for bm in &bookmarks {
-                    jujutsu::bookmark_set(repo, bm, &parent)
-                        .with_context(|| format!("moving bookmark {bm} off trivial head {id}"))?;
-                }
-            }
-            to_abandon.push(*id);
-        } else {
-            skipped.push(*id);
+    let existing = filter_existing_revisions(repo, change_ids)?;
+    for id in existing {
+        if !jujutsu::local_bookmarks_on(repo, id)?.is_empty() {
+            break;
         }
+        anyhow::ensure!(
+            check_trivial_head(repo, id)?.is_some(),
+            "revision is no longer a trivial head: {id}"
+        );
+        jujutsu::abandon_revisions(repo, &[id])?;
     }
-    if !to_abandon.is_empty() {
-        jujutsu::abandon_revisions(repo, &to_abandon)?;
-    }
-    anyhow::ensure!(
-        skipped.is_empty(),
-        "revisions not trivial heads: {}",
-        skipped.join(", ")
-    );
     Ok(())
 }
 
@@ -673,7 +668,7 @@ pub fn abandon_trivial_heads(repo: &Path, change_ids: &[&str]) -> Result<()> {
 pub fn find_effective_head(repo: &Path, ws_name: &str) -> Result<String> {
     let ws = ws_at_revset(ws_name);
     let ws_at = format!("{ws}@");
-    find_nontrivial_target(repo, &ws_at)
+    Ok(find_nontrivial_target(repo, &ws_at)?.change_id)
 }
 
 /// Maximum depth to walk backward through trivial-content ancestors.
@@ -687,11 +682,17 @@ const MAX_TRIVIAL_WALK: usize = 10;
 /// when `@` is trivial and `@-` is also empty: after `@` is abandoned, `@-`
 /// becomes a trivial head. By walking past it now, we avoid placing bookmarks
 /// on revisions that will become trivial heads after cleanup.
-fn find_nontrivial_target(repo: &Path, starting_revset: &str) -> Result<String> {
+struct EffectiveTarget {
+    change_id: String,
+    skipped_trivial_ids: Vec<String>,
+}
+
+fn find_nontrivial_target(repo: &Path, starting_revset: &str) -> Result<EffectiveTarget> {
     let template = TMPL_ID_EMPTY_PARENTS_DESC;
 
     let mut current_revset = starting_revset.to_string();
     let mut last_change_id = String::new();
+    let mut skipped_trivial_ids = Vec::new();
 
     for _ in 0..MAX_TRIVIAL_WALK {
         let stdout = jujutsu::run_jj(
@@ -709,7 +710,10 @@ fn find_nontrivial_target(repo: &Path, starting_revset: &str) -> Result<String> 
         let parts: Vec<&str> = stdout.splitn(4, jujutsu::DELIM_FIELD).collect();
         if parts.len() < 4 {
             // Malformed output — return what we have.
-            return resolve_change_id(repo, &current_revset);
+            return Ok(EffectiveTarget {
+                change_id: resolve_change_id(repo, &current_revset)?,
+                skipped_trivial_ids,
+            });
         }
 
         let change_id = parts[0];
@@ -721,26 +725,43 @@ fn find_nontrivial_target(repo: &Path, starting_revset: &str) -> Result<String> 
 
         // Non-empty revision → has content, return it.
         if !is_empty {
-            return Ok(last_change_id);
+            return Ok(EffectiveTarget {
+                change_id: last_change_id,
+                skipped_trivial_ids,
+            });
         }
 
         // Merge → don't walk through (ambiguous parents), return it.
         // Root (no parents) → nowhere to go, return it.
         if parent_count != 1 {
-            return Ok(last_change_id);
+            return Ok(EffectiveTarget {
+                change_id: last_change_id,
+                skipped_trivial_ids,
+            });
         }
 
         // Non-trivial description → meaningful even if empty, return it.
         if !is_trivial_description(repo, &current_revset, desc) {
-            return Ok(last_change_id);
+            return Ok(EffectiveTarget {
+                change_id: last_change_id,
+                skipped_trivial_ids,
+            });
         }
 
         // Trivial content — walk to parent.
+        skipped_trivial_ids.push(change_id.to_string());
         current_revset = format!("parents({change_id})");
     }
 
-    // Depth limit reached — return the last revision we examined.
-    Ok(last_change_id)
+    // At the depth limit, the deepest revision examined becomes the effective
+    // target rather than being discarded as trivial.
+    if skipped_trivial_ids.last() == Some(&last_change_id) {
+        skipped_trivial_ids.pop();
+    }
+    Ok(EffectiveTarget {
+        change_id: last_change_id,
+        skipped_trivial_ids,
+    })
 }
 
 /// Ensure the workspace has a fresh trivial head.
@@ -849,8 +870,8 @@ pub fn advance_singular_bookmark(
     if current_id == target_revision {
         return Ok(None);
     }
-    jujutsu::bookmark_set(repo, &bm_name, target_revision)
-        .with_context(|| format!("advancing bookmark {bm_name}"))?;
+    jujutsu::bookmark_set_exact(repo, &bm_name, target_revision)
+        .with_context(|| format!("advancing bookmark '{bm_name}'"))?;
     Ok(Some(bm_name))
 }
 
@@ -877,8 +898,8 @@ pub fn advance_singular_bookmark_to_effective_head(
     if current_id == effective {
         return Ok(None);
     }
-    jujutsu::bookmark_set(repo, &bm_name, &effective)
-        .with_context(|| format!("advancing bookmark {bm_name}"))?;
+    jujutsu::bookmark_set_exact(repo, &bm_name, &effective)
+        .with_context(|| format!("advancing bookmark '{bm_name}'"))?;
     Ok(Some(bm_name))
 }
 
@@ -898,7 +919,7 @@ pub fn delete_singular_bookmark(
             None => return Ok(None),
         };
     jujutsu::bookmark_delete(repo, &bm_name)
-        .with_context(|| format!("deleting bookmark {bm_name}"))?;
+        .with_context(|| format!("deleting bookmark '{bm_name}'"))?;
     Ok(Some(bm_name))
 }
 

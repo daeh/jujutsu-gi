@@ -198,8 +198,23 @@ tasks:
       # `ArgValueCompleter`) to drive dynamic shell completion. Those APIs can
       # change between releases with NO semver signal, so the bump above can
       # break completion silently — hence the warning below.
-      - |
-        echo "WARNING: clap/clap_complete were upgraded — their unstable-ext / unstable-dynamic APIs drive dynamic shell completion and can change with no semver signal. Re-verify before relying on this build: task build && cargo test, then a manual COMPLETE=zsh ./target/debug/ji -- ji switch '' check (also bash, fish)."
+      - cmd: |
+          printf '%s\n' \
+            'WARNING: clap/clap_complete were upgraded.' \
+            'Their unstable-ext / unstable-dynamic APIs drive dynamic shell completion and can change with no semver signal.' \
+            '' \
+            'Automated verification (success: exits 0):' \
+            '' \
+            '  task build && cargo test' \
+            '' \
+            'Manual completion probes (success: each lists the expected workspace names):' \
+            '' \
+            "  env _CLAP_COMPLETE_INDEX=2 COMPLETE=zsh ./target/debug/ji -- ji switch ''" \
+            "  env _CLAP_COMPLETE_INDEX=2 _CLAP_COMPLETE_COMP_TYPE=9 _CLAP_COMPLETE_SPACE=false COMPLETE=bash ./target/debug/ji -- ji switch ''" \
+            "  env COMPLETE=fish ./target/debug/ji -- ji switch ''" \
+            '' \
+            'An empty completion list is a failure even if the probe exits 0; completion is deliberately fail-soft.'
+        silent: true
 
   # === INTERACTIVE TESTING ===
 

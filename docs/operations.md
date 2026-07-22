@@ -405,7 +405,7 @@ t@:  A → X → Y → Z
 ji close --method detach
 ```
 
-Forget the source workspace without touching its revisions. The source chain remains in the graph as an anonymous line of work (or anchored to any bookmarks that were on it).
+Forget the source workspace without touching meaningful revisions. After applying the selected bookmark policy, ji abandons the unreferenced trivial heads it skipped when resolving the effective head. A trivial head retained by a non-singular `NoAction` bookmark remains in the graph.
 
 **Available in:** any sync mode. No target is required.
 
@@ -414,6 +414,8 @@ Forget the source workspace without touching its revisions. The source chain rem
 ```bash
 [{src}] jj util snapshot
 jj workspace forget -- {src_name}
+jj bookmark set --allow-backwards --revision {src_eff} -- {singular_bookmark}  # if needed
+jj abandon -- {unreferenced_trivial_heads...}                                # if any
 ```
 
 **Diagram:**
@@ -428,7 +430,7 @@ s@: ↳ X → Y → Z
               @
 ```
 
-The source revisions (`X → Y → Z`) still live in the graph as an anonymous branch off `A`. Use `detach` when you want to keep the revisions reachable (e.g., a bookmark pins them, or you want to revisit them later) but no longer want a workspace sitting on them. Note: the source workspace is forgotten, so the `s@` row shows only the surviving revisions — the `@` marker below `Z` marks where the last `@` sat before the forget, not a live workspace head.
+The meaningful source revisions (`X → Y → Z`) still live in the graph as an anonymous branch off `A`. Use `detach` when you want to keep the work reachable but no longer want a workspace sitting on it. Trivial heads are removed unless an explicitly retained non-singular bookmark still pins them. The source workspace is forgotten, so the `s@` row shows only the surviving revisions — the `@` marker below `Z` marks where the last `@` sat before the forget, not a live workspace head.
 
 ### Close: abandon
 

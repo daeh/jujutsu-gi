@@ -65,7 +65,8 @@ pub(crate) fn key_pair_two(
     }
 }
 
-/// Arbitrary styled marker (e.g. `STATUS ` in red bold). Trailing spaces in
+/// Arbitrary styled marker (e.g. a `STATUS ` chip); the caller supplies the
+/// style. Trailing spaces in
 /// `text` are treated as the separator, matching the `key_pair` convention.
 pub(crate) fn marker(text: &'static str, style: Style) -> Hint {
     let (body, sep) = split_trailing_spaces(text);

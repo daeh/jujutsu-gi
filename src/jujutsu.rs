@@ -1,6 +1,7 @@
 use crate::hooks::HookVars;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -317,6 +318,62 @@ fn classify_jj_spawn_failure(err: io::Error, args: &[&str]) -> anyhow::Error {
     }
 }
 
+/// A jj subprocess that started successfully but exited non-zero.
+///
+/// Keeps the user-facing invocation and stderr separate so partial-success
+/// operations can report the command verbatim instead of parsing anyhow text.
+#[derive(Debug)]
+pub struct JjCommandError {
+    command: String,
+    stderr: String,
+}
+
+impl JjCommandError {
+    fn new(args: &[&str], stderr: &[u8]) -> Self {
+        Self {
+            command: format_jj_command(args),
+            stderr: String::from_utf8_lossy(stderr)
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+        }
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn stderr(&self) -> &str {
+        &self.stderr
+    }
+}
+
+impl fmt::Display for JjCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} failed: {}", self.command, self.stderr)
+    }
+}
+
+impl std::error::Error for JjCommandError {}
+
+fn format_jj_command(args: &[&str]) -> String {
+    let mut words = Vec::with_capacity(args.len() + 1);
+    words.push("jj".to_string());
+    words.extend(args.iter().map(|arg| shell_quote_word(arg)));
+    words.join(" ")
+}
+
+fn shell_quote_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_=+./:@,".contains(c))
+    {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\"'\"'"))
+    }
+}
+
 /// Classify a non-zero exit from a jj subprocess. Detects the common
 /// "not in a jj repo" stderr substring and points the user at `ji init`.
 fn classify_jj_nonzero(args: &[&str], stderr: &[u8]) -> anyhow::Error {
@@ -327,7 +384,7 @@ fn classify_jj_nonzero(args: &[&str], stderr: &[u8]) -> anyhow::Error {
             stderr_str.trim()
         )
     } else {
-        anyhow::anyhow!("jj {} failed: {}", args.join(" "), stderr_str)
+        anyhow::Error::new(JjCommandError::new(args, stderr))
     }
 }
 
@@ -1112,11 +1169,23 @@ pub fn create_bookmark(repo: &Path, ws_name: &str, bookmark_name: &str) -> Resul
     Ok(())
 }
 
-/// Move a bookmark to point at a revision.
-pub fn bookmark_set(repo: &Path, bookmark: &str, revision: &str) -> Result<()> {
+/// Move a bookmark to an exact caller-selected revision.
+///
+/// Exact placement is allowed to move backwards or sideways. Callers that
+/// want a forward-only policy must enforce that policy before using this
+/// helper (or use a separate jj invocation without `--allow-backwards`).
+pub fn bookmark_set_exact(repo: &Path, bookmark: &str, revision: &str) -> Result<()> {
     run_jj(
         repo,
-        &["bookmark", "set", "--revision", revision, "--", bookmark],
+        &[
+            "bookmark",
+            "set",
+            "--allow-backwards",
+            "--revision",
+            revision,
+            "--",
+            bookmark,
+        ],
     )?;
     Ok(())
 }
@@ -1273,10 +1342,9 @@ fn parse_summary_line(line: &str) -> Option<FileChange> {
         (FileChangeKind::Added, rest)
     } else if let Some(rest) = line.strip_prefix("M ") {
         (FileChangeKind::Modified, rest)
-    } else if let Some(rest) = line.strip_prefix("D ") {
-        (FileChangeKind::Deleted, rest)
     } else {
-        return None;
+        let rest = line.strip_prefix("D ")?;
+        (FileChangeKind::Deleted, rest)
     };
     Some(FileChange {
         kind,
@@ -2072,6 +2140,28 @@ pub fn progress_workspace(ws_path: &Path, msg: &str, author: Option<&str>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jj_command_error_keeps_actual_command_and_stderr_separate() {
+        let error = classify_jj_nonzero(
+            &[
+                "bookmark",
+                "set",
+                "--allow-backwards",
+                "--revision",
+                "abc",
+                "--",
+                "recovery",
+            ],
+            b"Error: refused\nHint: retry\n",
+        );
+        let command_error = error.downcast_ref::<JjCommandError>().unwrap();
+        assert_eq!(
+            command_error.command(),
+            "jj bookmark set --allow-backwards --revision abc -- recovery"
+        );
+        assert_eq!(command_error.stderr(), "Error: refused\nHint: retry");
+    }
 
     /// Drift test: every named template literal in this module must reference
     /// the documented DELIM_FIELD (`\x1f`) and DELIM_RECORD (`\x1e`) escapes.

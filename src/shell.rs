@@ -813,6 +813,16 @@ pub fn apply_close_cd(origin: &Path, safety: &Path) -> Result<()> {
 // Environment
 // =====================================================================
 
+/// Source of the fish `$fish_complete_path` probe. `Live` spawns fish (production);
+/// `Probed`/`Failed` are injected by tests so detection and the probe-failure
+/// path are deterministic without a real fish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FishProbeSource {
+    Live,
+    Probed(Vec<PathBuf>),
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellEnv {
     pub home: PathBuf,
@@ -820,6 +830,9 @@ pub struct ShellEnv {
     pub zdotdir: PathBuf,
     pub zsh_custom: Option<PathBuf>,
     pub omz_root: Option<PathBuf>,
+    /// How `fish_completion_state` obtains fish's `$fish_complete_path`.
+    /// `Live` in production; tests inject `Probed`/`Failed`.
+    pub fish_complete_path: FishProbeSource,
 }
 
 impl ShellEnv {
@@ -846,6 +859,7 @@ impl ShellEnv {
             zdotdir,
             zsh_custom,
             omz_root,
+            fish_complete_path: FishProbeSource::Live,
         })
     }
 
@@ -1130,13 +1144,11 @@ fn strip_logical_guard(line: &str) -> &str {
 fn extract_source_directive_arg(s: &str) -> Option<String> {
     let rest = if let Some(r) = s.strip_prefix(". ").or_else(|| s.strip_prefix(".\t")) {
         r.trim_start()
-    } else if let Some(r) = s
-        .strip_prefix("source ")
-        .or_else(|| s.strip_prefix("source\t"))
-    {
-        r.trim_start()
     } else {
-        return None;
+        let r = s
+            .strip_prefix("source ")
+            .or_else(|| s.strip_prefix("source\t"))?;
+        r.trim_start()
     };
     let arg = match rest.chars().next()? {
         '"' => {
@@ -1803,6 +1815,251 @@ fn fish_shadow_path(env: &ShellEnv) -> PathBuf {
 }
 
 // =====================================================================
+// fish vendor-completion detection ($fish_complete_path)
+//
+// fish autoloads `ji.fish` from the first dir in `$fish_complete_path` that
+// has it. `ji config shell install fish` writes a completion into the user
+// dir (position 1), which shadows Homebrew's dynamic vendor completion. When
+// a reachable dynamic vendor completion exists, install removes the redundant
+// user file instead of writing another; otherwise it writes the user file.
+// =====================================================================
+
+/// Whether `contents` is ji's *dynamic* clap_complete registration — as opposed
+/// to the pre-0.1.4 static `generate` output or an unrelated file. Requires the
+/// exact callback signature ji emits via `write_registration("COMPLETE", …)`
+/// (see [`raw_registration`]): the `COMPLETE=fish ji` env-completer invocation
+/// and the `ji` command name. The static output contains neither.
+fn is_dynamic_ji_registration(contents: &str) -> bool {
+    contents.contains("COMPLETE=fish ji")
+        && (contents.contains("--command ji") || contents.contains("-c ji"))
+}
+
+/// One `$fish_complete_path` dir that contains a `ji.fish`. An existing but
+/// unreadable file is recorded with `is_dynamic == false` (a blocker), never
+/// skipped, so first-match order is honored.
+struct ProviderFact {
+    index: usize,
+    is_user: bool,
+    is_dynamic: bool,
+    path: PathBuf,
+}
+
+/// Order-aware conclusion of the fish completion scan (see [`fish_decide`]).
+struct FishCompletionScan {
+    /// Physical existence of `~/.config/fish/completions/ji.fish`, independent
+    /// of whether the user dir is on `$fish_complete_path`.
+    user_file_exists: bool,
+    /// The first non-user `ji.fish` in path order, iff it is a dynamic ji
+    /// registration (a reachable vendor completion).
+    vendor_provider: Option<PathBuf>,
+    /// The first non-user `ji.fish` in path order, iff it is not dynamic
+    /// (static / foreign / unreadable) — it shadows anything later.
+    blocking_non_user: Option<PathBuf>,
+    /// The user dir has a `ji.fish` before a reachable dynamic vendor provider.
+    user_shadows_vendor: bool,
+    /// A blocking non-user file precedes the user dir (exotic: user dir not
+    /// first), so a written user file would not take effect.
+    blocking_precedes_user: bool,
+}
+
+struct FishCompletionState {
+    scan: FishCompletionScan,
+    probe_failed: bool,
+}
+
+/// Canonicalize-tolerant directory identity: canonicalize a path that exists,
+/// else compare its lexically-normalized absolute form (a fresh cargo install
+/// may not have created `~/.config/fish/completions` yet — a failed
+/// `canonicalize` must not drop the user dir's position).
+fn norm_dir(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| {
+        use std::path::Component;
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop();
+                }
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    })
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    norm_dir(a) == norm_dir(b)
+}
+
+/// Walk the ordered `$fish_complete_path`, recording each dir with a `ji.fish`
+/// (all filesystem/content reads live here). Returns the facts in path order
+/// and the user dir's index (present regardless of whether it holds a
+/// `ji.fish`; `None` if the user dir isn't on the path).
+fn fish_collect_providers(
+    complete_path: &[PathBuf],
+    user_dir: &Path,
+) -> (Vec<ProviderFact>, Option<usize>) {
+    let mut facts = Vec::new();
+    let mut user_dir_index = None;
+    for (index, dir) in complete_path.iter().enumerate() {
+        let is_user = same_dir(dir, user_dir);
+        if is_user && user_dir_index.is_none() {
+            user_dir_index = Some(index);
+        }
+        let ji = dir.join("ji.fish");
+        if !ji.is_file() {
+            continue;
+        }
+        // Unreadable → not dynamic (a blocker), never skipped.
+        let is_dynamic = std::fs::read_to_string(&ji).is_ok_and(|c| is_dynamic_ji_registration(&c));
+        facts.push(ProviderFact {
+            index,
+            is_user,
+            is_dynamic,
+            path: ji,
+        });
+    }
+    (facts, user_dir_index)
+}
+
+/// Pure decision over collected facts (no filesystem/fish). The first non-user
+/// `ji.fish` is decisive under fish's first-available-file rule: an earlier
+/// static/foreign/unreadable file shadows any later dynamic vendor, so we never
+/// skip it to promote a later dynamic file.
+fn fish_decide(
+    facts: &[ProviderFact],
+    user_dir_index: Option<usize>,
+    user_file_exists: bool,
+) -> FishCompletionScan {
+    let fnu = facts.iter().find(|f| !f.is_user);
+    let (vendor_provider, blocking_non_user) = match fnu {
+        Some(f) if f.is_dynamic => (Some(f.path.clone()), None),
+        Some(f) => (None, Some(f.path.clone())),
+        None => (None, None),
+    };
+    let user_provider_index = facts.iter().find(|f| f.is_user).map(|f| f.index);
+    let user_shadows_vendor = vendor_provider.is_some()
+        && matches!((user_provider_index, fnu), (Some(ui), Some(f)) if ui < f.index);
+    let blocking_precedes_user = matches!(
+        (fnu, user_dir_index),
+        (Some(f), Some(ui)) if !f.is_dynamic && f.index < ui
+    );
+    FishCompletionScan {
+        user_file_exists,
+        vendor_provider,
+        blocking_non_user,
+        user_shadows_vendor,
+        blocking_precedes_user,
+    }
+}
+
+/// Monotonic per-call counter for the probe nonce (std-only; no `rand` dep).
+fn fish_probe_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Query fish for its ordered `$fish_complete_path`. `None` on any failure
+/// (fish missing / spawn error / nonzero exit / timeout / missing success
+/// sentinel); `Some(dirs)` — possibly empty — on success. A per-call nonce on
+/// the success sentinel makes an empty-but-successful result distinguishable
+/// from a failed or noisy `config.fish`. Bounded timeout with child-kill and a
+/// stdout-drain reader thread, mirroring `run_jj_bootstrap_timeout`
+/// (`src/jujutsu.rs`). `fish --no-config` yields an empty `$fish_complete_path`,
+/// so config must run.
+fn fish_complete_path_live() -> Option<Vec<PathBuf>> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let nonce = format!("{}-{}", std::process::id(), fish_probe_seq());
+    let script = format!(
+        "printf 'JI_FCP_OK:{nonce}\\n'; for d in $fish_complete_path; printf 'JI_FCP\\t%s\\n' $d; end"
+    );
+    let timeout = Duration::from_secs(5);
+    let start = Instant::now();
+    let mut child = Command::new("fish")
+        .arg("-c")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let deadline = start + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    drop(reader);
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(reader);
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let bytes = rx.recv_timeout(Duration::from_secs(1)).ok()?;
+    let _ = reader.join();
+    let out = String::from_utf8(bytes).ok()?;
+
+    let sentinel = format!("JI_FCP_OK:{nonce}");
+    if !out.lines().any(|l| l == sentinel) {
+        return None; // no success sentinel → failure or noise, not an empty path
+    }
+    Some(
+        out.lines()
+            .filter_map(|l| l.strip_prefix("JI_FCP\t"))
+            .map(PathBuf::from)
+            .collect(),
+    )
+}
+
+/// The full fish completion picture for install/status: resolve the probe
+/// source (injected in tests; live fish otherwise), collect providers, decide.
+fn fish_completion_state(env: &ShellEnv) -> FishCompletionState {
+    let (dirs, probe_failed): (Vec<PathBuf>, bool) = match &env.fish_complete_path {
+        FishProbeSource::Probed(dirs) => (dirs.clone(), false),
+        FishProbeSource::Failed => (Vec::new(), true),
+        FishProbeSource::Live => match fish_complete_path_live() {
+            Some(dirs) => (dirs, false),
+            None => (Vec::new(), true),
+        },
+    };
+    let completions = fish_completions_path(env);
+    let user_dir = completions
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let (facts, user_dir_index) = fish_collect_providers(&dirs, &user_dir);
+    let scan = fish_decide(&facts, user_dir_index, completions.exists());
+    FishCompletionState { scan, probe_failed }
+}
+
+// =====================================================================
 // chezmoi / dotfile-manager detection
 // =====================================================================
 
@@ -1902,20 +2159,46 @@ struct PlannedWrite {
     role: WriteRole,
 }
 
+/// A file the plan will delete (fish only): a redundant/stale user-dir
+/// completion healed because a dynamic vendor completion provides one.
+struct PlannedRemoval {
+    path: PathBuf,
+    existed: bool,
+}
+
+/// The fish completion delivery the plan settled on, recorded so post-apply
+/// health (`installed_ok`) is deterministic without re-probing fish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FishCompletionMode {
+    /// No reachable dynamic vendor — ji wrote the user-dir completion.
+    UserFile,
+    /// A dynamic vendor provides completions — ji relies on it (and removed a
+    /// redundant/stale user-dir file if present).
+    Vendor { provider: PathBuf },
+}
+
 struct ShellInstallPlan {
     shell: String,
     writes: Vec<PlannedWrite>,
+    removals: Vec<PlannedRemoval>,
     shadows: Vec<AliasHit>,
+    /// `Some` for fish, `None` for zsh/bash.
+    fish_completion_mode: Option<FishCompletionMode>,
 }
 
 impl ShellInstallPlan {
     fn changed(&self) -> bool {
-        self.writes.iter().any(|w| w.before != w.after)
+        self.writes.iter().any(|w| w.before != w.after) || self.removals.iter().any(|r| r.existed)
     }
 
     fn show(&self, w: &mut dyn std::io::Write) {
         for p in &self.writes {
             print_dry_run_diff(w, &p.path, &p.before, &p.after);
+        }
+        for r in &self.removals {
+            if r.existed {
+                let _ = writeln!(w, "- would delete {}", r.path.display());
+            }
         }
     }
 }
@@ -1935,7 +2218,7 @@ pub fn install(env: &ShellEnv, shell: &str, opts: InstallOpts) -> Result<()> {
         }
     }
     apply_plan(&plan)?;
-    if installed_ok(env, shell) {
+    if installed_ok(env, &plan) {
         clear_install_prompt_declined(env, shell);
     }
     Ok(())
@@ -1997,9 +2280,13 @@ fn probe_shells(env: &ShellEnv) -> ShellProbe {
     probe
 }
 
-fn installed_ok(env: &ShellEnv, shell: &str) -> bool {
-    match shell {
+/// Post-apply "files are canonical" health, derived deterministically from the
+/// plan (no fish re-probe — a transient probe timeout must not misclassify a
+/// healthy vendor install as failed).
+fn installed_ok(env: &ShellEnv, plan: &ShellInstallPlan) -> bool {
+    match plan.shell.as_str() {
         "zsh" | "bash" => {
+            let shell = plan.shell.as_str();
             let primary = if shell == "zsh" {
                 zsh_primary(env)
             } else {
@@ -2016,14 +2303,27 @@ fn installed_ok(env: &ShellEnv, shell: &str) -> bool {
                 && rc_stanza_status(&primary, &stanza) == TriState::Present
         }
         "fish" => {
-            let primary = fish_primary(env);
-            let completions = fish_completions_path(env);
             let wrapper_body = render_fish_wrapper_body();
-            let Ok(completion_body) = render_fish_completion_body() else {
-                return false;
+            let wrapper_ok = state_for(&fish_primary(env), &wrapper_body) == "present";
+            let completions_ok = match &plan.fish_completion_mode {
+                Some(FishCompletionMode::UserFile) => {
+                    let Ok(body) = render_fish_completion_body() else {
+                        return false;
+                    };
+                    state_for(&fish_completions_path(env), &body) == "present"
+                }
+                // Vendor mode: the provider must still be a dynamic ji completion,
+                // and every planned removal must have landed. `plan_install_fish`
+                // guarantees no *shadowing* user file survives unplanned, so this
+                // is exactly "no shadowing user file remains"; an intentionally
+                // inert non-shadowing file may remain.
+                Some(FishCompletionMode::Vendor { provider }) => {
+                    std::fs::read_to_string(provider).is_ok_and(|c| is_dynamic_ji_registration(&c))
+                        && plan.removals.iter().all(|r| !r.path.exists())
+                }
+                None => false,
             };
-            state_for(&primary, &wrapper_body) == "present"
-                && state_for(&completions, &completion_body) == "present"
+            wrapper_ok && completions_ok
         }
         _ => false,
     }
@@ -2118,7 +2418,7 @@ fn multi_install(
 
     for plan in &plans {
         match apply_plan(plan) {
-            Ok(()) if installed_ok(env, &plan.shell) => {
+            Ok(()) if installed_ok(env, plan) => {
                 if plan.changed() {
                     outcome.applied.push(plan.shell.clone());
                 } else {
@@ -2470,7 +2770,9 @@ fn plan_install_posix(
                 role: WriteRole::PrimaryRc,
             },
         ],
+        removals: Vec::new(),
         shadows,
+        fish_completion_mode: None,
     })
 }
 
@@ -2543,39 +2845,106 @@ fn plan_install_fish(
     }
     emit_shadow_notes(notes, &shadows);
 
-    let wrapper_body = render_fish_wrapper_body();
-    let completion_body = render_fish_completion_body()?;
-
-    for (path, label) in [(&primary, "wrapper"), (&completions, "completions")] {
-        if path.exists() {
-            let existing = std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            if !is_managed(&existing) && !force {
-                bail!(
-                    "(ji)::shell: {} exists and is not ji-managed — remove it manually, or pass --force to overwrite ({label}).",
-                    path.display(),
-                );
-            }
+    // The wrapper is always installed; a non-ji-managed wrapper still hard-bails.
+    if primary.exists() {
+        let existing = std::fs::read_to_string(&primary)
+            .with_context(|| format!("failed to read {}", primary.display()))?;
+        if !is_managed(&existing) && !force {
+            bail!(
+                "(ji)::shell: {} exists and is not ji-managed — remove it manually, or pass --force to overwrite (wrapper).",
+                primary.display(),
+            );
         }
     }
 
+    let mut writes = vec![PlannedWrite {
+        path: primary.clone(),
+        before: existing_or_empty(&primary),
+        after: render_fish_wrapper_body(),
+        role: WriteRole::FishWrapper,
+    }];
+    let mut removals = Vec::new();
+
+    // Completion delivery. When a reachable *dynamic* vendor completion exists
+    // (e.g. Homebrew's `vendor_completions.d/ji.fish`), rely on it and remove a
+    // redundant/stale user-dir completion rather than writing another that would
+    // shadow it (fish autoloads the first `ji.fish` in `$fish_complete_path`).
+    // Otherwise (cargo/manual, or probe failure) write the user-dir completion.
+    let state = fish_completion_state(env);
+    let scan = &state.scan;
+    let user_managed = scan.user_file_exists
+        && std::fs::read_to_string(&completions)
+            .map(|c| is_managed(&c))
+            .unwrap_or(false);
+
+    let fish_completion_mode = if let Some(provider) = scan.vendor_provider.clone() {
+        if scan.user_file_exists {
+            if user_managed || force {
+                removals.push(PlannedRemoval {
+                    path: completions.clone(),
+                    existed: true,
+                });
+                let _ = writeln!(
+                    notes,
+                    "(ji)::shell: fish completions are provided by {}; removing the redundant/stale user-dir completion {}",
+                    provider.display(),
+                    completions.display(),
+                );
+            } else if scan.user_shadows_vendor {
+                bail!(
+                    "(ji)::shell: {} shadows the vendor completion {} and is not ji-managed — remove it manually, or pass --force.",
+                    completions.display(),
+                    provider.display(),
+                );
+            } else {
+                let _ = writeln!(
+                    notes,
+                    "(ji)::shell: fish completions are provided by {} ({} is present but not in effect).",
+                    provider.display(),
+                    completions.display(),
+                );
+            }
+        } else {
+            let _ = writeln!(
+                notes,
+                "(ji)::shell: fish completions are provided by {}.",
+                provider.display(),
+            );
+        }
+        FishCompletionMode::Vendor { provider }
+    } else {
+        if scan.user_file_exists && !user_managed && !force {
+            bail!(
+                "(ji)::shell: {} exists and is not ji-managed — remove it manually, or pass --force to overwrite (completions).",
+                completions.display(),
+            );
+        }
+        // Exotic: a non-ji `ji.fish` earlier in the path would shadow the file we
+        // write, so warn (still write it — harmless).
+        if scan.blocking_precedes_user
+            && let Some(blocker) = &scan.blocking_non_user
+        {
+            let _ = writeln!(
+                notes,
+                "(ji)::shell: note: {} is earlier in $fish_complete_path and is not ji's dynamic completion — the user completion won't take effect until it's removed manually.",
+                blocker.display(),
+            );
+        }
+        writes.push(PlannedWrite {
+            path: completions.clone(),
+            before: existing_or_empty(&completions),
+            after: render_fish_completion_body()?,
+            role: WriteRole::FishCompletions,
+        });
+        FishCompletionMode::UserFile
+    };
+
     Ok(ShellInstallPlan {
         shell: "fish".to_string(),
-        writes: vec![
-            PlannedWrite {
-                path: primary.clone(),
-                before: existing_or_empty(&primary),
-                after: wrapper_body,
-                role: WriteRole::FishWrapper,
-            },
-            PlannedWrite {
-                path: completions.clone(),
-                before: existing_or_empty(&completions),
-                after: completion_body,
-                role: WriteRole::FishCompletions,
-            },
-        ],
+        writes,
+        removals,
         shadows,
+        fish_completion_mode: Some(fish_completion_mode),
     })
 }
 
@@ -2622,6 +2991,20 @@ fn apply_plan(plan: &ShellInstallPlan) -> Result<()> {
                 "(ji)::shell completions already up-to-date in {}",
                 w.path.display()
             ),
+        }
+    }
+
+    // Removals (fish heal): delete a redundant/stale user-dir completion shadowed
+    // by a dynamic vendor completion. Each op is individually atomic; the plan is
+    // a sequential multi-file apply, like the writes above.
+    for r in &plan.removals {
+        match std::fs::remove_file(&r.path) {
+            Ok(()) => eprintln!("(ji)::shell removed {}", r.path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("failed to remove {}", r.path.display()));
+            }
         }
     }
 
@@ -2785,7 +3168,7 @@ fn status_action(r: &ActiveReport) -> StatusAction {
     }
 }
 
-fn print_active_report(r: &ActiveReport) {
+fn print_active_report(r: &ActiveReport, w: &mut dyn std::io::Write) {
     let active = match &r.detected {
         Detection::Supported(s) => s.clone(),
         Detection::Unsupported(name) => format!("{name} (unsupported)"),
@@ -2796,8 +3179,9 @@ fn print_active_report(r: &ActiveReport) {
         .as_ref()
         .map(|p| format!("   [{}]", p.display()))
         .unwrap_or_default();
-    println!("  active shell (detected): {active}{exe}");
-    println!(
+    let _ = writeln!(w, "  active shell (detected): {active}{exe}");
+    let _ = writeln!(
+        w,
         "  login shell ($SHELL):    {}",
         r.shell_env_raw.as_deref().unwrap_or("<unset>")
     );
@@ -2806,17 +3190,23 @@ fn print_active_report(r: &ActiveReport) {
 /// Report shell-integration state. The detection step is **non-fatal**: an
 /// unsupported/unknown active shell is reported, not an error (only the
 /// mutating commands error on that). Genuine I/O errors from the underlying
-/// inspectors still propagate.
+/// inspectors still propagate. Output goes through an injected writer so tests
+/// can capture and assert it.
 pub fn status(env: &ShellEnv, target: Option<&str>) -> Result<()> {
+    status_to(env, target, &mut std::io::stdout())
+}
+
+fn status_to(env: &ShellEnv, target: Option<&str>, w: &mut dyn std::io::Write) -> Result<()> {
     let report = detect_active_report();
-    print_active_report(&report);
+    print_active_report(&report, w);
 
     let shell = match target {
         Some(t) => t.to_string(),
         None => match status_action(&report) {
             StatusAction::Inspect(s) => s,
             StatusAction::ReportOnly => {
-                println!(
+                let _ = writeln!(
+                    w,
                     "  no supported active shell to inspect; pass one explicitly (zsh|bash|fish)"
                 );
                 return Ok(());
@@ -2825,13 +3215,13 @@ pub fn status(env: &ShellEnv, target: Option<&str>) -> Result<()> {
     };
 
     match shell.as_str() {
-        "zsh" | "bash" => status_posix(env, &shell),
-        "fish" => status_fish(env),
+        "zsh" | "bash" => status_posix(env, &shell, w),
+        "fish" => status_fish(env, w),
         other => bail!("unsupported shell: {other} (supported: {SUPPORTED_SHELLS})"),
     }
 }
 
-fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
+fn status_posix(env: &ShellEnv, shell: &str, w: &mut dyn std::io::Write) -> Result<()> {
     let primary = if shell == "zsh" {
         zsh_primary(env)
     } else {
@@ -2841,8 +3231,8 @@ fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
     let body = render_managed_body(shell)?;
     let stanza = render_rc_stanza(shell)?;
 
-    println!("ji shell integration: {shell}");
-    println!("  primary rc: {}", display_canonical(&primary));
+    let _ = writeln!(w, "ji shell integration: {shell}");
+    let _ = writeln!(w, "  primary rc: {}", display_canonical(&primary));
     if shell == "bash" {
         let candidates: Vec<String> = [".bash_profile", ".bash_login", ".profile"]
             .iter()
@@ -2855,14 +3245,15 @@ fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
                 )
             })
             .collect();
-        println!("  bash candidates: {}", candidates.join(", "));
+        let _ = writeln!(w, "  bash candidates: {}", candidates.join(", "));
     }
-    println!(
+    let _ = writeln!(
+        w,
         "  managed file: {} ({})",
         display_canonical(&managed),
         state_for(&managed, &body)
     );
-    println!("  rc stanza: {}", rc_stanza_state(&primary, &stanza));
+    let _ = writeln!(w, "  rc stanza: {}", rc_stanza_state(&primary, &stanza));
 
     let locations = scan_locations(env, shell, &primary);
     let hits = find_hits(&locations, env)?;
@@ -2874,16 +3265,17 @@ fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
         .collect();
     cross.sort_by_key(|h| (h.path.clone(), h.line_no));
     if cross.is_empty() {
-        println!("  cross-file hits: none");
+        let _ = writeln!(w, "  cross-file hits: none");
     } else {
-        println!("  cross-file hits:");
+        let _ = writeln!(w, "  cross-file hits:");
         for h in cross {
             let via = h
                 .via
                 .as_ref()
                 .map(|(p, n)| format!(" (via source line {} in {})", n, p.display()))
                 .unwrap_or_default();
-            println!(
+            let _ = writeln!(
+                w,
                 "    {}:{}{} — {}",
                 h.path.display(),
                 h.line_no,
@@ -2894,9 +3286,9 @@ fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
     }
     let shadows = scan_bypass_aliases(env, shell, &primary);
     if shadows.is_empty() {
-        println!("  bypass aliases: none");
+        let _ = writeln!(w, "  bypass aliases: none");
     } else {
-        println!("  bypass aliases:");
+        let _ = writeln!(w, "  bypass aliases:");
         for h in &shadows {
             let what = if matches!(h.kind, ShadowKind::Function) {
                 "function ji".to_string()
@@ -2908,7 +3300,8 @@ fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
             } else {
                 "runs ji directly"
             };
-            println!(
+            let _ = writeln!(
+                w,
                 "    {}:{} — {} ({})",
                 h.path.display(),
                 h.line_no,
@@ -2922,7 +3315,7 @@ fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
         .filter(|h| matches!(h.kind, HitKind::UnresolvedSource(_)))
         .collect();
     if !unresolved.is_empty() {
-        println!("  unresolved source lines:");
+        let _ = writeln!(w, "  unresolved source lines:");
         for h in unresolved {
             println!("    {}:{} — {}", h.path.display(), h.line_no, h.line_text);
         }
@@ -2931,26 +3324,94 @@ fn status_posix(env: &ShellEnv, shell: &str) -> Result<()> {
     Ok(())
 }
 
-fn status_fish(env: &ShellEnv) -> Result<()> {
+/// The completion-related status line(s) for fish, given the scan, whether the
+/// probe failed, and the user file's state/managed-ness. Pure/unit-testable.
+fn fish_completion_status_lines(
+    scan: &FishCompletionScan,
+    probe_failed: bool,
+    user_path: &Path,
+    user_state: &str,
+    user_managed: bool,
+) -> Vec<String> {
+    let up = user_path.display();
+    if probe_failed {
+        return vec![
+            "  note: could not query fish's $fish_complete_path (fish missing or slow); vendor-shadow detection unavailable — run `ji config shell install fish` if completions misbehave".to_string(),
+            format!("  completions file: {up} ({user_state})"),
+        ];
+    }
+    let mut lines = Vec::new();
+    if let Some(vendor) = &scan.vendor_provider {
+        let vp = vendor.display();
+        if scan.user_file_exists && scan.user_shadows_vendor {
+            if !user_managed {
+                lines.push(format!(
+                    "  WARNING {up} (not ji-managed) shadows {vp} — remove it manually or run `ji config shell install fish --force`"
+                ));
+            } else if user_state == "drift" {
+                lines.push(format!(
+                    "  WARNING {up} is a stale completion shadowing {vp} — run `ji config shell install fish` to remove it"
+                ));
+            } else {
+                lines.push(format!(
+                    "  note: {up} shadows {vp} (redundant); `ji config shell install fish` will remove it"
+                ));
+            }
+        } else if scan.user_file_exists {
+            lines.push(format!(
+                "  note: {up} is present but not in effect; {vp} is used"
+            ));
+        } else {
+            lines.push(format!("  completions: provided by {vp}"));
+        }
+    } else {
+        lines.push(format!("  completions file: {up} ({user_state})"));
+    }
+    if let Some(p) = &scan.blocking_non_user {
+        lines.push(format!(
+            "  WARNING {} is earlier in $fish_complete_path and is not ji's dynamic completion — it shadows any ji completion later in the path; remove it manually",
+            p.display()
+        ));
+    }
+    lines
+}
+
+fn status_fish(env: &ShellEnv, w: &mut dyn std::io::Write) -> Result<()> {
     let primary = fish_primary(env);
     let completions = fish_completions_path(env);
     let shadow = fish_shadow_path(env);
     let wrapper_body = render_fish_wrapper_body();
-    let completion_body = render_fish_completion_body()?;
 
-    println!("ji shell integration: fish");
-    println!(
+    let _ = writeln!(w, "ji shell integration: fish");
+    let _ = writeln!(
+        w,
         "  wrapper file: {} ({})",
         display_canonical(&primary),
         state_for(&primary, &wrapper_body)
     );
-    println!(
-        "  completions file: {} ({})",
-        display_canonical(&completions),
-        state_for(&completions, &completion_body)
-    );
+
+    // Completion state (vendor-aware): the user-dir completion may be shadowing a
+    // dynamic vendor completion, or absent because a vendor provides it.
+    let state = fish_completion_state(env);
+    let completion_body = render_fish_completion_body()?;
+    let user_state = state_for(&completions, &completion_body);
+    let user_managed = completions.exists()
+        && std::fs::read_to_string(&completions)
+            .map(|c| is_managed(&c))
+            .unwrap_or(false);
+    for line in fish_completion_status_lines(
+        &state.scan,
+        state.probe_failed,
+        &completions,
+        user_state,
+        user_managed,
+    ) {
+        let _ = writeln!(w, "{line}");
+    }
+
     if shadow.exists() {
-        println!(
+        let _ = writeln!(
+            w,
             "  WARNING shadow file: {} (would override the autoload)",
             display_canonical(&shadow)
         );
@@ -2965,18 +3426,24 @@ fn status_fish(env: &ShellEnv) -> Result<()> {
         })
         .collect();
     if cross.is_empty() {
-        println!("  cross-file hits: none");
+        let _ = writeln!(w, "  cross-file hits: none");
     } else {
-        println!("  cross-file hits:");
+        let _ = writeln!(w, "  cross-file hits:");
         for h in cross {
-            println!("    {}:{} — {}", h.path.display(), h.line_no, h.line_text);
+            let _ = writeln!(
+                w,
+                "    {}:{} — {}",
+                h.path.display(),
+                h.line_no,
+                h.line_text
+            );
         }
     }
     let shadows = scan_bypass_aliases(env, "fish", &primary);
     if shadows.is_empty() {
-        println!("  bypass aliases: none");
+        let _ = writeln!(w, "  bypass aliases: none");
     } else {
-        println!("  bypass aliases:");
+        let _ = writeln!(w, "  bypass aliases:");
         for h in &shadows {
             let what = if matches!(h.kind, ShadowKind::Function) {
                 "function ji".to_string()
@@ -2988,7 +3455,8 @@ fn status_fish(env: &ShellEnv) -> Result<()> {
             } else {
                 "runs ji directly"
             };
-            println!(
+            let _ = writeln!(
+                w,
                 "    {}:{} — {} ({})",
                 h.path.display(),
                 h.line_no,
@@ -3422,12 +3890,16 @@ mod cd_tests {
 
     fn env_for(tmp: &TempDir) -> ShellEnv {
         let home = tmp.path().to_path_buf();
+        let xdg = home.join(".config");
         ShellEnv {
             home: home.clone(),
-            xdg_config_home: home.join(".config"),
+            xdg_config_home: xdg.clone(),
             zdotdir: home,
             zsh_custom: None,
             omz_root: None,
+            // Deterministic no-vendor: only the temp user completions dir on the
+            // path, so no real fish is spawned in the test suite.
+            fish_complete_path: FishProbeSource::Probed(vec![xdg.join("fish/completions")]),
         }
     }
 
@@ -3779,5 +4251,489 @@ mod cd_tests {
         )
         .unwrap();
         assert_eq!(wrapper_state(&env, "zsh"), WrapperState::Drift);
+    }
+}
+
+#[cfg(test)]
+mod fish_completion_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    fn dynamic_body() -> String {
+        packaged_completion("fish").unwrap()
+    }
+
+    /// A stale static user completion (pre-0.1.4 `generate` output), ji-managed:
+    /// contains the managed header but not ji's dynamic callback signature.
+    fn static_managed() -> String {
+        format!(
+            "{MANAGED_HEADER}\ncomplete -c ji -n \"__fish_ji_needs_command\" -f -a \"switch\"\n"
+        )
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn env_for(tmp: &TempDir, probe: FishProbeSource) -> ShellEnv {
+        let home = tmp.path().to_path_buf();
+        let xdg = home.join(".config");
+        ShellEnv {
+            home: home.clone(),
+            xdg_config_home: xdg,
+            zdotdir: home,
+            zsh_custom: None,
+            omz_root: None,
+            fish_complete_path: probe,
+        }
+    }
+
+    fn fact(index: usize, is_user: bool, is_dynamic: bool) -> ProviderFact {
+        ProviderFact {
+            index,
+            is_user,
+            is_dynamic,
+            path: PathBuf::from(format!("/d{index}/ji.fish")),
+        }
+    }
+
+    // ---- content classification ----
+
+    #[test]
+    fn is_dynamic_registration_pinned_to_real_bodies() {
+        assert!(is_dynamic_ji_registration(
+            &packaged_completion("fish").unwrap()
+        ));
+        assert!(is_dynamic_ji_registration(
+            &render_fish_completion_body().unwrap()
+        ));
+        assert!(!is_dynamic_ji_registration(&static_managed()));
+        // Mentions COMPLETE=fish but is not ji's callback → not a false positive.
+        assert!(!is_dynamic_ji_registration(
+            "set -x COMPLETE=fish\n# unrelated\n"
+        ));
+    }
+
+    // ---- pure order-aware decision ----
+
+    #[test]
+    fn decide_user_before_dynamic_vendor_shadows() {
+        let facts = vec![fact(0, true, false), fact(1, false, true)];
+        let s = fish_decide(&facts, Some(0), true);
+        assert_eq!(s.vendor_provider.as_deref(), Some(Path::new("/d1/ji.fish")));
+        assert!(s.user_shadows_vendor);
+        assert!(s.blocking_non_user.is_none());
+    }
+
+    #[test]
+    fn decide_dynamic_vendor_only_no_user() {
+        let facts = vec![fact(1, false, true)];
+        let s = fish_decide(&facts, Some(0), false);
+        assert_eq!(s.vendor_provider.as_deref(), Some(Path::new("/d1/ji.fish")));
+        assert!(!s.user_file_exists);
+        assert!(!s.user_shadows_vendor);
+    }
+
+    #[test]
+    fn decide_user_only_no_vendor() {
+        let facts = vec![fact(0, true, true)];
+        let s = fish_decide(&facts, Some(0), true);
+        assert!(s.vendor_provider.is_none());
+        assert!(s.blocking_non_user.is_none());
+    }
+
+    #[test]
+    fn decide_static_first_nonuser_blocks_later_dynamic() {
+        // First non-user is static (d1); a dynamic vendor (d2) is later but
+        // unreachable under fish first-match → no vendor_provider.
+        let facts = vec![
+            fact(0, true, false),
+            fact(1, false, false),
+            fact(2, false, true),
+        ];
+        let s = fish_decide(&facts, Some(0), true);
+        assert!(s.vendor_provider.is_none());
+        assert_eq!(
+            s.blocking_non_user.as_deref(),
+            Some(Path::new("/d1/ji.fish"))
+        );
+        assert!(!s.user_shadows_vendor);
+    }
+
+    #[test]
+    fn collect_unreadable_nonuser_is_blocking_not_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let user_dir = tmp.path().join("user");
+        let block_dir = tmp.path().join("block");
+        let vendor = tmp.path().join("vendor");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        // Dynamic content but unreadable → must be treated as a (non-dynamic) blocker.
+        write_file(&block_dir.join("ji.fish"), &dynamic_body());
+        std::fs::set_permissions(
+            block_dir.join("ji.fish"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        write_file(&vendor.join("ji.fish"), &dynamic_body());
+        // Skip if the sandbox ignores perms (e.g. running as root) — the file
+        // would then read as dynamic and the "unreadable" premise wouldn't hold.
+        if std::fs::read_to_string(block_dir.join("ji.fish")).is_ok() {
+            return;
+        }
+        let path = vec![user_dir.clone(), block_dir.clone(), vendor];
+        let (facts, _idx) = fish_collect_providers(&path, &user_dir);
+        let s = fish_decide(&facts, Some(0), false);
+        assert!(s.vendor_provider.is_none());
+        assert_eq!(
+            s.blocking_non_user.as_deref(),
+            Some(block_dir.join("ji.fish").as_path())
+        );
+    }
+
+    // ---- plan_install_fish decisions ----
+
+    fn user_completion_path(env: &ShellEnv) -> PathBuf {
+        fish_completions_path(env)
+    }
+
+    #[test]
+    fn install_vendor_present_removes_stale_managed_user_file() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Live);
+        let user = user_completion_path(&env);
+        let vendor = tmp.path().join("vendor");
+        write_file(&vendor.join("ji.fish"), &dynamic_body());
+        write_file(&user, &static_managed());
+        let env = ShellEnv {
+            fish_complete_path: FishProbeSource::Probed(vec![
+                user.parent().unwrap().to_path_buf(),
+                vendor.clone(),
+            ]),
+            ..env
+        };
+
+        let plan = plan_install_fish(&env, false, &mut Vec::new()).unwrap();
+        assert_eq!(
+            plan.fish_completion_mode,
+            Some(FishCompletionMode::Vendor {
+                provider: vendor.join("ji.fish")
+            })
+        );
+        assert_eq!(plan.removals.len(), 1);
+        assert_eq!(plan.removals[0].path, user);
+        assert!(
+            !plan
+                .writes
+                .iter()
+                .any(|w| w.role == WriteRole::FishCompletions)
+        );
+        assert!(plan.changed());
+    }
+
+    #[test]
+    fn install_vendor_present_no_user_file_is_noop_completion() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Live);
+        let user = user_completion_path(&env);
+        let vendor = tmp.path().join("vendor");
+        write_file(&vendor.join("ji.fish"), &dynamic_body());
+        let env = ShellEnv {
+            fish_complete_path: FishProbeSource::Probed(vec![
+                user.parent().unwrap().to_path_buf(),
+                vendor,
+            ]),
+            ..env
+        };
+        let plan = plan_install_fish(&env, false, &mut Vec::new()).unwrap();
+        assert!(plan.removals.is_empty());
+        assert!(
+            !plan
+                .writes
+                .iter()
+                .any(|w| w.role == WriteRole::FishCompletions)
+        );
+        assert!(matches!(
+            plan.fish_completion_mode,
+            Some(FishCompletionMode::Vendor { .. })
+        ));
+    }
+
+    #[test]
+    fn install_vendor_present_nonmanaged_shadow_bails() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Live);
+        let user = user_completion_path(&env);
+        let vendor = tmp.path().join("vendor");
+        write_file(&vendor.join("ji.fish"), &dynamic_body());
+        write_file(&user, "# hand authored, not ji-managed\n");
+        let env = ShellEnv {
+            fish_complete_path: FishProbeSource::Probed(vec![
+                user.parent().unwrap().to_path_buf(),
+                vendor,
+            ]),
+            ..env
+        };
+        let err = plan_install_fish(&env, false, &mut Vec::new())
+            .err()
+            .unwrap();
+        assert!(format!("{err}").contains("shadows the vendor completion"));
+    }
+
+    #[test]
+    fn install_no_vendor_writes_user_file() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(
+            &tmp,
+            FishProbeSource::Probed(vec![tmp.path().join(".config/fish/completions")]),
+        );
+        let plan = plan_install_fish(&env, false, &mut Vec::new()).unwrap();
+        assert_eq!(
+            plan.fish_completion_mode,
+            Some(FishCompletionMode::UserFile)
+        );
+        let cw = plan
+            .writes
+            .iter()
+            .find(|w| w.role == WriteRole::FishCompletions)
+            .expect("completion write");
+        assert!(is_dynamic_ji_registration(&cw.after));
+        assert!(plan.removals.is_empty());
+    }
+
+    #[test]
+    fn install_probe_failed_refreshes_managed_user_file() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Failed);
+        write_file(&user_completion_path(&env), &static_managed());
+        let plan = plan_install_fish(&env, false, &mut Vec::new()).unwrap();
+        assert_eq!(
+            plan.fish_completion_mode,
+            Some(FishCompletionMode::UserFile)
+        );
+        let cw = plan
+            .writes
+            .iter()
+            .find(|w| w.role == WriteRole::FishCompletions)
+            .expect("completion write");
+        assert!(is_dynamic_ji_registration(&cw.after));
+        assert!(plan.removals.is_empty());
+    }
+
+    #[test]
+    fn install_probe_failed_nonmanaged_user_file_bails() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Failed);
+        write_file(&user_completion_path(&env), "# hand authored\n");
+        let err = plan_install_fish(&env, false, &mut Vec::new())
+            .err()
+            .unwrap();
+        assert!(format!("{err}").contains("not ji-managed"));
+    }
+
+    #[test]
+    fn dry_run_show_lists_removal() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Live);
+        let user = user_completion_path(&env);
+        let vendor = tmp.path().join("vendor");
+        write_file(&vendor.join("ji.fish"), &dynamic_body());
+        write_file(&user, &static_managed());
+        let env = ShellEnv {
+            fish_complete_path: FishProbeSource::Probed(vec![
+                user.parent().unwrap().to_path_buf(),
+                vendor,
+            ]),
+            ..env
+        };
+        let plan = plan_install_fish(&env, false, &mut Vec::new()).unwrap();
+        let mut buf = Vec::new();
+        plan.show(&mut buf);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("- would delete"));
+        assert!(out.contains("completions/ji.fish"));
+    }
+
+    // ---- installed_ok (plan-driven) ----
+
+    fn fish_plan(mode: FishCompletionMode, removals: Vec<PlannedRemoval>) -> ShellInstallPlan {
+        ShellInstallPlan {
+            shell: "fish".to_string(),
+            writes: Vec::new(),
+            removals,
+            shadows: Vec::new(),
+            fish_completion_mode: Some(mode),
+        }
+    }
+
+    #[test]
+    fn installed_ok_vendor_mode_healthy() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Live);
+        write_file(&fish_primary(&env), &render_fish_wrapper_body());
+        let vendor_ji = tmp.path().join("vendor/ji.fish");
+        write_file(&vendor_ji, &dynamic_body());
+        let plan = fish_plan(
+            FishCompletionMode::Vendor {
+                provider: vendor_ji,
+            },
+            Vec::new(),
+        );
+        assert!(installed_ok(&env, &plan));
+    }
+
+    #[test]
+    fn installed_ok_vendor_mode_unapplied_removal_is_unhealthy() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Live);
+        write_file(&fish_primary(&env), &render_fish_wrapper_body());
+        let vendor_ji = tmp.path().join("vendor/ji.fish");
+        write_file(&vendor_ji, &dynamic_body());
+        let leftover = tmp.path().join("leftover/ji.fish");
+        write_file(&leftover, &static_managed());
+        let plan = fish_plan(
+            FishCompletionMode::Vendor {
+                provider: vendor_ji,
+            },
+            vec![PlannedRemoval {
+                path: leftover,
+                existed: true,
+            }],
+        );
+        assert!(!installed_ok(&env, &plan));
+    }
+
+    #[test]
+    fn installed_ok_user_file_mode_healthy() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Live);
+        write_file(&fish_primary(&env), &render_fish_wrapper_body());
+        write_file(
+            &fish_completions_path(&env),
+            &render_fish_completion_body().unwrap(),
+        );
+        let plan = fish_plan(FishCompletionMode::UserFile, Vec::new());
+        assert!(installed_ok(&env, &plan));
+    }
+
+    // ---- status lines ----
+
+    fn scan(
+        user_file_exists: bool,
+        vendor: Option<&str>,
+        blocking: Option<&str>,
+        user_shadows_vendor: bool,
+    ) -> FishCompletionScan {
+        FishCompletionScan {
+            user_file_exists,
+            vendor_provider: vendor.map(PathBuf::from),
+            blocking_non_user: blocking.map(PathBuf::from),
+            user_shadows_vendor,
+            blocking_precedes_user: false,
+        }
+    }
+
+    #[test]
+    fn status_lines_stale_managed_shadow_warns_with_install_fix() {
+        let s = scan(true, Some("/v/ji.fish"), None, true);
+        let lines = fish_completion_status_lines(&s, false, Path::new("/u/ji.fish"), "drift", true);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("stale completion shadowing")
+                    && l.contains("ji config shell install fish"))
+        );
+    }
+
+    #[test]
+    fn status_lines_nonmanaged_shadow_warns_with_force() {
+        let s = scan(true, Some("/v/ji.fish"), None, true);
+        let lines =
+            fish_completion_status_lines(&s, false, Path::new("/u/ji.fish"), "drift", false);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("not ji-managed") && l.contains("--force"))
+        );
+    }
+
+    #[test]
+    fn status_lines_inert_present_not_reported_as_shadow() {
+        let s = scan(true, Some("/v/ji.fish"), None, false);
+        let lines =
+            fish_completion_status_lines(&s, false, Path::new("/u/ji.fish"), "present", true);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("present but not in effect"))
+        );
+        assert!(!lines.iter().any(|l| l.contains("shadow")));
+    }
+
+    #[test]
+    fn status_lines_vendor_healthy_and_no_vendor_and_probe_failed() {
+        let healthy = fish_completion_status_lines(
+            &scan(false, Some("/v/ji.fish"), None, false),
+            false,
+            Path::new("/u/ji.fish"),
+            "absent",
+            false,
+        );
+        assert!(healthy.iter().any(|l| l.contains("provided by /v/ji.fish")));
+
+        let no_vendor = fish_completion_status_lines(
+            &scan(true, None, None, false),
+            false,
+            Path::new("/u/ji.fish"),
+            "present",
+            true,
+        );
+        assert!(no_vendor.iter().any(|l| l.contains("completions file:")));
+
+        let failed = fish_completion_status_lines(
+            &scan(true, None, None, false),
+            true,
+            Path::new("/u/ji.fish"),
+            "drift",
+            true,
+        );
+        assert!(failed.iter().any(|l| l.contains("could not query fish")));
+    }
+
+    #[test]
+    fn status_lines_blocking_non_user_warns() {
+        let s = scan(false, None, Some("/early/ji.fish"), false);
+        let lines =
+            fish_completion_status_lines(&s, false, Path::new("/u/ji.fish"), "absent", false);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("/early/ji.fish")
+                    && l.contains("earlier in $fish_complete_path"))
+        );
+    }
+
+    #[test]
+    fn status_fish_output_names_vendor_and_fix() {
+        let tmp = TempDir::new().unwrap();
+        let env = env_for(&tmp, FishProbeSource::Live);
+        let user = fish_completions_path(&env);
+        let vendor = tmp.path().join("vendor");
+        write_file(&vendor.join("ji.fish"), &dynamic_body());
+        write_file(&user, &static_managed());
+        write_file(&fish_primary(&env), &render_fish_wrapper_body());
+        let env = ShellEnv {
+            fish_complete_path: FishProbeSource::Probed(vec![
+                user.parent().unwrap().to_path_buf(),
+                vendor.clone(),
+            ]),
+            ..env
+        };
+        let mut buf = Vec::new();
+        status_fish(&env, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains(&vendor.join("ji.fish").display().to_string()));
+        assert!(out.contains("ji config shell install fish"));
     }
 }

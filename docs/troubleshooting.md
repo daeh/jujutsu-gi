@@ -18,6 +18,16 @@ See [shell-integration.md](shell-integration.md) for the mechanism and manual in
 
 ---
 
+## fish tab-completion shows files instead of workspaces
+
+**Symptom:** in fish, `ji switch`/`sync`/`transfer <TAB>` completes files and directories from the current directory instead of the workspaces; `ji <TAB>` (subcommands) still works.
+
+**Cause:** a stale or duplicate `~/.config/fish/completions/ji.fish` — typically written by an older `ji config shell install` before completions became dynamic — shadows the correct completion. fish autoloads the first `ji.fish` on `$fish_complete_path`, and the user directory comes first, so an out-of-date file there wins over the dynamic one Homebrew ships in `…/vendor_completions.d/`.
+
+**Fix:** `ji config shell install fish` — it removes the redundant/stale file when a vendor completion provides completions (or refreshes it to the current dynamic form otherwise). `ji config shell status fish` reports the shadow. You can also just delete `~/.config/fish/completions/ji.fish` to fall through to the vendor completion.
+
+---
+
 ## "working copy is stale — another tool modified the repo"
 
 **Symptom:** CLI prints `(ji)::stale ...` and exits 1; the TUI shows a stale-alert modal.

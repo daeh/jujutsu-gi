@@ -284,9 +284,11 @@ pub fn close_with_info(
         .collect();
     super::resolve_predicted_stale(&to_resolve, &fresh.ws_paths);
 
-    // Post-op: staleness warnings + operation warnings.
-    let mut stale_warnings = super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped);
-    stale_warnings.extend(op_warnings);
+    // Post-op reports are kept by category so bookmark/cleanup failures are
+    // never mislabeled as workspace staleness.
+    let stale_warnings = super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped);
+    let warnings = op_warnings;
+    let mut post_errors = Vec::new();
 
     // Post-op: singular bookmarks.
     let bm_result = super::post_op_bookmarks(
@@ -300,17 +302,36 @@ pub fn close_with_info(
         params.bookmarks.clone(),
         detach_src_head.as_deref(),
     );
-    stale_warnings.extend(bm_result.warnings);
+    post_errors.extend(bm_result.errors);
 
     // Post-op: manual bookmark action for remaining non-singular bookmarks.
     if !bm_result.remaining.is_empty() {
-        let manual_warnings = super::post_op_manual_bookmarks(
+        let manual_errors = super::post_op_manual_bookmarks(
             repo,
             &bm_result.remaining,
             params.bookmark_action,
             params.target_change_id,
         );
-        stale_warnings.extend(manual_warnings);
+        post_errors.extend(manual_errors);
+    }
+
+    // Bookmark policy has been applied above; discard only the former trivial
+    // prefix that is no longer pinned.
+    let mut cleanup_chains: Vec<&[String]> = Vec::new();
+    if !matches!(operation, Operation::Abandon) {
+        cleanup_chains.push(&src_hi.trivial_ids);
+    }
+    if matches!(
+        operation,
+        Operation::MergeClose | Operation::MergeSquashClose | Operation::FastForwardTargetClose
+    ) {
+        cleanup_chains.push(&tgt_hi.trivial_ids);
+    }
+    for chain in cleanup_chains {
+        let ids: Vec<&str> = chain.iter().map(String::as_str).collect();
+        if let Err(e) = jj_utils::abandon_trivial_heads(repo, &ids) {
+            post_errors.push(super::types::PostOperationError::from_anyhow(&e));
+        }
     }
 
     // Determine if file removal should be prompted.
@@ -325,6 +346,9 @@ pub fn close_with_info(
 
     Ok(CloseTransferResult {
         stale_warnings,
+        warnings,
+        post_errors,
+        resolved_operation: operation,
         predicted_stale,
         pending_remove_path,
     })

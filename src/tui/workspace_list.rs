@@ -1,3 +1,4 @@
+use super::status::StatusLevel;
 use crate::jujutsu::{DiffSummary, FileChangeKind, Workspace};
 use crate::text_utils;
 use crossterm::event::KeyCode;
@@ -214,7 +215,7 @@ impl WorkspaceList {
         area: Rect,
         focused: bool,
         selected_stale: bool,
-        has_status: bool,
+        status_level: Option<StatusLevel>,
         description_override: Option<&str>,
         diff_summary: Option<&DiffSummary>,
         show_files: bool,
@@ -258,10 +259,10 @@ impl WorkspaceList {
         if can_undo {
             hints.push(super::key_hints::key_pair("Z", " undo  "));
         }
-        if has_status {
+        if let Some(level) = status_level {
             hints.push(super::key_hints::marker(
                 "STATUS ",
-                Style::default().fg(Color::Red).bold(),
+                Style::default().fg(level.color()).bold(),
             ));
             hints.push(super::key_hints::key_pair("p", " copy  "));
             hints.push(super::key_hints::key_pair("P", " clear  "));

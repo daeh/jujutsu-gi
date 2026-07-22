@@ -9,6 +9,7 @@ mod key_hints;
 mod line_edit;
 mod op_log_pane;
 mod revision_picker;
+mod status;
 mod sync_dialog;
 mod transfer_close_dialog;
 mod update_stale_dialog;
@@ -34,6 +35,7 @@ use copy_dialog::CopyDialog;
 use create_dialog::CreateDialog;
 use graph_pane::GraphPane;
 use revision_picker::RevisionPicker;
+use status::{StatusLevel, StatusStack};
 use sync_dialog::SyncDialog;
 use update_stale_dialog::UpdateStaleDiffDialog;
 use workspace_list::WorkspaceList;
@@ -101,6 +103,34 @@ enum LeftPanel {
     OpLog,
 }
 
+/// Why mutating dialogs are refused to open (their list-derived data may be
+/// pre-snapshot). Carries its own severity so the status line colors the
+/// "— retry" message correctly.
+#[derive(Clone, Copy)]
+enum DialogBlock {
+    /// The staleness probe loop hit its cap while the repo changed rapidly — a
+    /// transient, retryable condition.
+    ProbeIncomplete,
+    /// `list_workspaces` failed — a pre-execution failure.
+    WorkspaceListUnavailable,
+}
+
+impl DialogBlock {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ProbeIncomplete => "workspace probe incomplete (repo changing rapidly)",
+            Self::WorkspaceListUnavailable => "workspace list unavailable",
+        }
+    }
+
+    fn level(self) -> StatusLevel {
+        match self {
+            Self::ProbeIncomplete => StatusLevel::Warning,
+            Self::WorkspaceListUnavailable => StatusLevel::Error,
+        }
+    }
+}
+
 struct App {
     mode: Mode,
     focus: Focus,
@@ -145,7 +175,7 @@ struct App {
     /// (probe-loop cap hit, or the list rebuild failed). While `Some`,
     /// mutating dialogs (sync/close/transfer) refuse to open and surface the
     /// reason — their list-derived data could be stale/pre-snapshot.
-    dialog_open_block: Option<&'static str>,
+    dialog_open_block: Option<DialogBlock>,
     /// Op head captured at the end of the most recent `refresh()` — after its
     /// probe-loop snapshot and final list rebuild, before the open handlers read
     /// any list-derived dialog data. Used as the dialog freshness baseline so
@@ -162,8 +192,9 @@ struct App {
     last_stale_probe_op_head: String,
     /// Error message from a failed update-stale attempt.
     stale_error: Option<String>,
-    /// Transient status/error messages (rendered as stacked lines).
-    status_messages: Vec<String>,
+    /// Transient status/error messages with severity (rendered as stacked
+    /// lines; the STATUS marker follows the most-severe level present).
+    status: StatusStack,
     /// Target workspace for the update-stale dialog.
     update_stale_target: Option<(String, PathBuf)>,
     /// Diff dialog for stale workspaces.
@@ -400,7 +431,7 @@ impl App {
             fresh_op_head: String::new(),
             last_stale_probe_op_head: String::new(),
             stale_error: None,
-            status_messages: Vec::new(),
+            status: StatusStack::default(),
             update_stale_target: None,
             update_stale_diff: None,
             stale_diff_rx: None,
@@ -486,6 +517,52 @@ impl App {
             self.sync_graph_to_revision();
         } else {
             self.sync_graph_to_selection();
+        }
+    }
+
+    fn move_revision_cursor_right(&mut self) -> bool {
+        if let Some(ws) = self.workspace_list.selected_workspace()
+            && !ws.revisions.is_empty()
+        {
+            let max = ws.revisions.len() - 1;
+            self.revision_cursor = Some(match self.revision_cursor {
+                None => 0,
+                Some(i) if i < max => i + 1,
+                Some(i) => i,
+            });
+            self.workspace_list.reset_desc_scroll();
+            self.sync_graph_to_revision();
+            if self.show_files {
+                self.ensure_files_cached();
+            }
+            return true;
+        }
+        false
+    }
+
+    fn move_revision_cursor_left(&mut self) -> bool {
+        if self.revision_cursor.is_some() {
+            self.revision_cursor = match self.revision_cursor {
+                Some(0) => None,
+                Some(i) => Some(i - 1),
+                None => None,
+            };
+            self.sync_graph_to_cursor();
+            self.workspace_list.reset_desc_scroll();
+            if self.show_files {
+                self.ensure_files_cached();
+            }
+            return true;
+        }
+        false
+    }
+
+    fn sync_copy_dialog_change_id(&mut self) {
+        let Some(change_id) = self.focused_change_id() else {
+            return;
+        };
+        if let Some(dialog) = &mut self.copy_dialog {
+            dialog.set_change_id(change_id);
         }
     }
 
@@ -613,25 +690,24 @@ impl App {
         match result {
             Ok(v) => Some(v),
             Err(e) => {
-                self.append_status(format!("{context}: {e}"));
+                self.append_status(format!("{context}: {e}"), StatusLevel::Error);
                 None
             }
         }
     }
 
     fn clear_status(&mut self) {
-        self.status_messages.clear();
+        self.status.clear();
     }
 
-    /// Replace all status messages with a single message.
-    fn set_status(&mut self, msg: String) {
-        self.status_messages.clear();
-        self.status_messages.push(msg);
+    /// Replace all status messages with a single message at `level`.
+    fn set_status(&mut self, msg: String, level: StatusLevel) {
+        self.status.set(msg, level);
     }
 
-    /// Append a status message (stacks vertically with existing messages).
-    fn append_status(&mut self, msg: String) {
-        self.status_messages.push(msg);
+    /// Append a status message at `level` (stacks with existing messages).
+    fn append_status(&mut self, msg: String, level: StatusLevel) {
+        self.status.append(msg, level);
     }
 
     /// Save action history to disk. Errors are silently ignored.
@@ -748,7 +824,7 @@ impl App {
                 break;
             }
             if round == STALE_PROBE_MAX_ROUNDS {
-                self.dialog_open_block = Some("workspace probe incomplete (repo changing rapidly)");
+                self.dialog_open_block = Some(DialogBlock::ProbeIncomplete);
                 break;
             }
             stale_names.extend(Self::probe_staleness(unprobed, &mut probed));
@@ -757,7 +833,7 @@ impl App {
         // A failed final list rebuild leaves stale (possibly pre-snapshot)
         // list data — refuse to open mutating dialogs against it.
         if !rebuilt {
-            self.dialog_open_block = Some("workspace list unavailable");
+            self.dialog_open_block = Some(DialogBlock::WorkspaceListUnavailable);
         }
         self.workspace_list.set_stale_names(stale_names);
         // fresh_op_head (the dialog baseline) is captured inside rebuild_lists,
@@ -1089,9 +1165,9 @@ impl App {
         // If the refresh could not produce reliable list data, do not
         // re-resolve the dialog from the stale list — leave the prior plan,
         // surface the reason, and let the gate refuse the next Enter.
-        if let Some(reason) = self.dialog_open_block {
+        if let Some(block) = self.dialog_open_block {
             if let Some(d) = &mut self.sync_dialog {
-                d.notice = vec![format!("{reason} — retry")];
+                d.notice = vec![format!("{} — retry", block.reason())];
             }
             return;
         }
@@ -1203,9 +1279,9 @@ impl App {
         // If the refresh could not produce reliable list data, do not
         // re-resolve from the stale list — leave the prior plan, surface the
         // reason, and let the gate refuse the next Enter.
-        if let Some(reason) = self.dialog_open_block {
+        if let Some(block) = self.dialog_open_block {
             if let Some(d) = &mut self.close_dialog {
-                d.notice = vec![format!("{reason} — retry")];
+                d.notice = vec![format!("{} — retry", block.reason())];
             }
             return;
         }
@@ -1312,7 +1388,7 @@ impl App {
             return;
         };
         let Some(info) = dialog.sync_info() else {
-            self.set_status("sync mode not detected".to_string());
+            self.set_status("sync mode not detected".to_string(), StatusLevel::Error);
             return;
         };
         let params = commands::sync::SyncParamsOwned {
@@ -1353,7 +1429,7 @@ impl App {
         if let Err(e) =
             commands::create::validate_resolved_path(&ws_path, &self.repo_root, template_arg)
         {
-            self.set_status(format!("{e:#}"));
+            self.set_status(format!("{e:#}"), StatusLevel::Error);
             return;
         }
         let params = commands::create::CreateParamsOwned {
@@ -1408,7 +1484,10 @@ impl App {
         match intent {
             DialogIntent::Close => {
                 let Ok(method) = commands::types::CloseMethod::try_from(operation) else {
-                    self.set_status(format!("unexpected close operation: {operation:?}"));
+                    self.set_status(
+                        format!("unexpected close operation: {operation:?}"),
+                        StatusLevel::Error,
+                    );
                     return false;
                 };
                 let info = match close_info {
@@ -1419,7 +1498,10 @@ impl App {
                             commands::types::CloseMethod::Detach
                                 | commands::types::CloseMethod::Abandon
                         ) {
-                            self.set_status("sync mode not detected".to_string());
+                            self.set_status(
+                                "sync mode not detected".to_string(),
+                                StatusLevel::Error,
+                            );
                             return false;
                         }
                         commands::detect_sync_mode(&self.repo_root, &name, &target_name)
@@ -1450,11 +1532,14 @@ impl App {
             }
             DialogIntent::Transfer => {
                 let Ok(method) = commands::types::TransferMethod::try_from(operation) else {
-                    self.set_status(format!("unexpected transfer operation: {operation:?}"));
+                    self.set_status(
+                        format!("unexpected transfer operation: {operation:?}"),
+                        StatusLevel::Error,
+                    );
                     return false;
                 };
                 let Some(info) = close_info else {
-                    self.set_status("sync mode not detected".to_string());
+                    self.set_status("sync mode not detected".to_string(), StatusLevel::Error);
                     return false;
                 };
                 let params = commands::transfer::TransferParamsOwned {
@@ -1788,35 +1873,10 @@ impl App {
                 }
             }
             KeyCode::Right => {
-                if let Some(ws) = self.workspace_list.selected_workspace()
-                    && !ws.revisions.is_empty()
-                {
-                    let max = ws.revisions.len() - 1;
-                    self.revision_cursor = Some(match self.revision_cursor {
-                        None => 0,
-                        Some(i) if i < max => i + 1,
-                        Some(i) => i,
-                    });
-                    self.workspace_list.reset_desc_scroll();
-                    self.sync_graph_to_revision();
-                    if self.show_files {
-                        self.ensure_files_cached();
-                    }
-                }
+                self.move_revision_cursor_right();
             }
             KeyCode::Left => {
-                if self.revision_cursor.is_some() {
-                    self.revision_cursor = match self.revision_cursor {
-                        Some(0) => None,
-                        Some(i) => Some(i - 1),
-                        None => None,
-                    };
-                    self.sync_graph_to_cursor();
-                    self.workspace_list.reset_desc_scroll();
-                    if self.show_files {
-                        self.ensure_files_cached();
-                    }
-                }
+                self.move_revision_cursor_left();
             }
             // Vim keys: graph scroll when graph focused, workspace nav when workspace focused
             KeyCode::Char('k') if self.focus == Focus::Graph => {
@@ -1835,8 +1895,8 @@ impl App {
                 self.clear_status();
             }
             KeyCode::Char('p') if self.focus == Focus::Workspaces => {
-                if !self.status_messages.is_empty() {
-                    copy_dialog::copy_to_clipboard(&self.status_messages.join("\n"));
+                if !self.status.is_empty() {
+                    copy_dialog::copy_to_clipboard(&self.status.plain_text());
                 }
             }
             KeyCode::Char('u') if self.focus == Focus::Workspaces => {
@@ -1892,8 +1952,8 @@ impl App {
             }
             KeyCode::Char('s') if self.focus == Focus::Workspaces => {
                 self.refresh();
-                if let Some(reason) = self.dialog_open_block {
-                    self.set_status(format!("{reason} — retry"));
+                if let Some(block) = self.dialog_open_block {
+                    self.set_status(format!("{} — retry", block.reason()), block.level());
                     return;
                 }
                 if let Some(ws) = self.workspace_list.selected_workspace() {
@@ -1937,8 +1997,8 @@ impl App {
             KeyCode::Char('t') if self.focus == Focus::Workspaces => {
                 // Refresh before opening dialog to ensure workspace data is current.
                 self.refresh();
-                if let Some(reason) = self.dialog_open_block {
-                    self.set_status(format!("{reason} — retry"));
+                if let Some(block) = self.dialog_open_block {
+                    self.set_status(format!("{} — retry", block.reason()), block.level());
                     return;
                 }
                 if let Some(ws) = self.workspace_list.selected_workspace() {
@@ -2006,7 +2066,11 @@ impl App {
             }
             KeyCode::Char('c') if self.focus == Focus::Workspaces => {
                 if let Some(ws) = self.workspace_list.selected_workspace() {
-                    self.copy_dialog = Some(CopyDialog::new(ws));
+                    let change_id = self
+                        .revision_cursor
+                        .and_then(|i| ws.revisions.get(i))
+                        .map_or_else(|| ws.change_id.clone(), |rev| rev.change_id.clone());
+                    self.copy_dialog = Some(CopyDialog::new(ws, change_id));
                     self.mode = Mode::Copy;
                 }
             }
@@ -2024,8 +2088,8 @@ impl App {
             }
             KeyCode::Char('x') if self.focus == Focus::Workspaces => {
                 self.refresh();
-                if let Some(reason) = self.dialog_open_block {
-                    self.set_status(format!("{reason} — retry"));
+                if let Some(block) = self.dialog_open_block {
+                    self.set_status(format!("{} — retry", block.reason()), block.level());
                     return;
                 }
                 if let Some(ws) = self.workspace_list.selected_workspace() {
@@ -2133,6 +2197,21 @@ impl App {
                 }
                 self.copy_dialog = None;
                 self.mode = Mode::List;
+            }
+            KeyCode::Left | KeyCode::Right
+                if self
+                    .copy_dialog
+                    .as_ref()
+                    .is_some_and(CopyDialog::selected_is_change_id) =>
+            {
+                let moved = match key.code {
+                    KeyCode::Left => self.move_revision_cursor_left(),
+                    KeyCode::Right => self.move_revision_cursor_right(),
+                    _ => false,
+                };
+                if moved {
+                    self.sync_copy_dialog_change_id();
+                }
             }
             other => {
                 if let Some(dialog) = &mut self.copy_dialog {
@@ -2333,7 +2412,7 @@ impl App {
                         if !cmds.is_empty() {
                             let text = cmd_spans::lines_to_plain(&cmds);
                             copy_dialog::copy_to_clipboard(&text);
-                            self.set_status("copied to clipboard".to_string());
+                            self.set_status("copied to clipboard".to_string(), StatusLevel::Info);
                         }
                     }
                 }
@@ -2529,18 +2608,13 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         self.terminal_area = frame.area();
-        let content_area = if self.status_messages.is_empty() {
+        let content_area = if self.status.is_empty() {
             frame.area()
         } else {
-            let n = self.status_messages.len() as u16;
+            let n = self.status.len() as u16;
             let outer =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(n)]).split(frame.area());
-            let lines: Vec<Line> = self
-                .status_messages
-                .iter()
-                .map(|msg| Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red))))
-                .collect();
-            frame.render_widget(Paragraph::new(lines), outer[1]);
+            frame.render_widget(Paragraph::new(self.status.lines()), outer[1]);
             outer[0]
         };
         let main_chunks =
@@ -2554,7 +2628,7 @@ impl App {
                     .workspace_list
                     .selected_workspace()
                     .is_some_and(|ws| self.workspace_list.is_stale(&ws.name));
-                let has_status = !self.status_messages.is_empty();
+                let status_level = self.status.marker_level();
                 let (desc_override_text, diff_summary);
                 let desc_override;
                 if self.show_files {
@@ -2576,7 +2650,7 @@ impl App {
                     main_chunks[0],
                     self.focus == Focus::Workspaces,
                     selected_stale,
-                    has_status,
+                    status_level,
                     desc_override,
                     diff_summary,
                     self.show_files,
@@ -2942,7 +3016,7 @@ impl App {
                 self.op_graph_debounce = std::time::Instant::now();
             }
             Err(e) => {
-                self.set_status(format!("op log failed: {e}"));
+                self.set_status(format!("op log failed: {e}"), StatusLevel::Error);
             }
         }
     }
@@ -3371,6 +3445,60 @@ fn re_enter_raw_mode(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> i
     Ok(())
 }
 
+/// The success line for a per-workspace stale update. `saved == 0` uses the plain
+/// success string; `saved > 0` adds the recovery-path detail (diffs saved to `.ji/diffs/`).
+fn stale_update_success_text(name: &str, saved: usize) -> String {
+    if saved > 0 {
+        format!(
+            "{name}: updated successfully - no longer stale ({saved} diff(s) saved to .ji/diffs/)"
+        )
+    } else {
+        format!("{name}: updated successfully - no longer stale")
+    }
+}
+
+/// (text, level) for a per-workspace stale update. `update_err` = the rendered
+/// error if the update itself failed (takes precedence). `saved` = `Ok(n)` diffs
+/// backed up, or `Err(rendered)` = the backup failed (possibly partial — the save
+/// writes incrementally and returns on the first error).
+fn stale_update_status(
+    name: &str,
+    update_err: Option<&str>,
+    saved: Result<usize, &str>,
+) -> (String, StatusLevel) {
+    match update_err {
+        Some(e) => (format!("{name}: update failed: {e}"), StatusLevel::Error),
+        None => match saved {
+            Ok(n) => (stale_update_success_text(name, n), StatusLevel::Success),
+            Err(e) => (
+                format!(
+                    "{name}: no longer stale, but some backup diffs may not have been saved: {e}"
+                ),
+                StatusLevel::Warning,
+            ),
+        },
+    }
+}
+
+/// Status for the whole-repo stale resolve (the update already succeeded);
+/// `None` = stay silent. The target is always the workspace named `"default"`
+/// (`repo_root` comes from `workspace_root()`, which resolves `"default"`), so a
+/// backup-failure Warning names it literally. The `Ok(n)` success text stays
+/// nameless (recolor-only).
+fn stale_sequence_status(saved: Result<usize, &str>) -> Option<(String, StatusLevel)> {
+    match saved {
+        Ok(0) => None,
+        Ok(n) => Some((
+            format!("Resolved. {n} diff(s) saved to .ji/diffs/"),
+            StatusLevel::Success,
+        )),
+        Err(e) => Some((
+            format!("default: no longer stale, but some backup diffs may not have been saved: {e}"),
+            StatusLevel::Warning,
+        )),
+    }
+}
+
 /// Drain one pending side effect from `app.pending_handoff`. Non-interactive
 /// work stays inside the alternate screen with a blocking working overlay;
 /// interactive work exits raw mode and hands the terminal to the subprocess.
@@ -3420,13 +3548,13 @@ fn drain_pending_handoff(
             match jujutsu::op_restore(repo_root, &op_id) {
                 Ok(_) => {
                     let verb = if is_redo { "redid" } else { "undid" };
-                    app.set_status(format!("{verb}: {label}"));
+                    app.set_status(format!("{verb}: {label}"), StatusLevel::Success);
                     app.action_history.last_op_head = jujutsu::current_op_id(repo_root);
                     app.save_history();
                 }
                 Err(e) => {
                     let verb = if is_redo { "redo" } else { "undo" };
-                    app.set_status(format!("{verb} failed: {e}"));
+                    app.set_status(format!("{verb} failed: {e}"), StatusLevel::Error);
                 }
             }
             // op_restore records its own history above (last_op_head update);
@@ -3443,15 +3571,18 @@ fn drain_pending_handoff(
             kind,
             rel_path,
         } => match update_stale_dialog::save_diff_inline(&ws_path, kind, &rel_path) {
-            Ok(Some(path)) => app.set_status(format!("Saved: {path}")),
+            Ok(Some(path)) => app.set_status(format!("Saved: {path}"), StatusLevel::Success),
             Ok(None) => {}
-            Err(e) => app.set_status(format!("Diff failed: {e:#}")),
+            Err(e) => app.set_status(format!("Diff failed: {e:#}"), StatusLevel::Error),
         },
         PendingHandoff::SaveAllDiffs { ws_path, items } => {
             match update_stale_dialog::save_all_diffs_inline(&ws_path, &items) {
-                Ok(0) => app.set_status("No diffs to save".into()),
-                Ok(n) => app.set_status(format!("Saved {n} diff(s) to .ji/diffs/")),
-                Err(e) => app.set_status(format!("Diff failed: {e:#}")),
+                Ok(0) => app.set_status("No diffs to save".into(), StatusLevel::Info),
+                Ok(n) => app.set_status(
+                    format!("Saved {n} diff(s) to .ji/diffs/"),
+                    StatusLevel::Success,
+                ),
+                Err(e) => app.set_status(format!("Diff failed: {e:#}"), StatusLevel::Error),
             }
         }
         PendingHandoff::WorkspaceForget { name } => {
@@ -3467,14 +3598,17 @@ fn drain_pending_handoff(
         PendingHandoff::UpdateStaleSequence => {
             // Save diffs first as a safety net, then resolve staleness. Both
             // steps run under one working screen.
-            let saved = update_stale_dialog::save_all_stale_diffs(repo_root).unwrap_or(0);
+            let saved: Result<usize, String> =
+                update_stale_dialog::save_all_stale_diffs(repo_root).map_err(|e| format!("{e:#}"));
             match jujutsu::update_stale(repo_root) {
                 Ok(_) => {
                     app.stale = false;
                     app.stale_error = None;
                     app.mode = Mode::List;
-                    if saved > 0 {
-                        app.set_status(format!("Resolved. {saved} diff(s) saved to .ji/diffs/"));
+                    if let Some((text, level)) =
+                        stale_sequence_status(saved.as_ref().copied().map_err(String::as_str))
+                    {
+                        app.set_status(text, level);
                     }
                 }
                 Err(e) => {
@@ -3483,20 +3617,20 @@ fn drain_pending_handoff(
             }
         }
         PendingHandoff::UpdateWorkspaceStale { ws_path, name } => {
-            let saved = update_stale_dialog::save_all_stale_diffs(&ws_path).unwrap_or(0);
-            match jujutsu::update_workspace_stale(&ws_path) {
-                Ok(_) => {
-                    let msg = if saved > 0 {
-                        format!("{name}: resolved. {saved} diff(s) saved to .ji/diffs/")
-                    } else {
-                        format!("{name}: staleness resolved")
-                    };
-                    app.set_status(msg);
-                    app.refresh_staleness();
-                }
-                Err(e) => {
-                    app.set_status(format!("{name}: update failed: {e:#}"));
-                }
+            // Save diffs first as a safety net, then update. The backup save is
+            // best-effort; its failure surfaces as a Warning.
+            let saved: Result<usize, String> =
+                update_stale_dialog::save_all_stale_diffs(&ws_path).map_err(|e| format!("{e:#}"));
+            let update = jujutsu::update_workspace_stale(&ws_path);
+            let update_err = update.as_ref().err().map(|e| format!("{e:#}"));
+            let (text, level) = stale_update_status(
+                &name,
+                update_err.as_deref(),
+                saved.as_ref().copied().map_err(String::as_str),
+            );
+            app.set_status(text, level);
+            if update.is_ok() {
+                app.refresh_staleness();
             }
         }
         PendingHandoff::OpRestoreFromLog { op_id } => {
@@ -3508,7 +3642,7 @@ fn drain_pending_handoff(
         }
         PendingHandoff::BookmarkTug { names, head_id } => {
             for bm in &names {
-                let r = jujutsu::bookmark_set(repo_root, bm, &head_id);
+                let r = jujutsu::bookmark_set_exact(repo_root, bm, &head_id);
                 app.log_err(r, "tug bookmark");
             }
             history_label = Some(format!("bookmark tug {}", names.join(", ")));
@@ -3536,15 +3670,15 @@ fn drain_pending_handoff(
             );
             match result {
                 Ok(operations::SyncOutcome::AlreadyInSync) => {
-                    app.set_status("already in sync".to_string());
+                    app.set_status("already in sync".to_string(), StatusLevel::Info);
                 }
                 Ok(operations::SyncOutcome::Done { warnings }) => {
                     if !warnings.is_empty() {
-                        app.set_status(warnings.join("; "));
+                        app.set_status(warnings.join("; "), StatusLevel::Warning);
                     }
                 }
                 Err(e) => {
-                    app.set_status(format!("{e:#}"));
+                    app.set_status(format!("{e:#}"), StatusLevel::Error);
                 }
             }
             history_label = Some(label);
@@ -3573,7 +3707,7 @@ fn drain_pending_handoff(
                     history_label = Some(format!("create {}", create_result.workspace_name));
                 }
                 Err(e) => {
-                    app.set_status(format!("create workspace: {e}"));
+                    app.set_status(format!("create workspace: {e}"), StatusLevel::Error);
                 }
             }
         }
@@ -3602,10 +3736,37 @@ fn drain_pending_handoff(
                 repo_name: &params.repo_name,
                 author: params.author.as_deref(),
             };
+            let mut recorded_label = label;
             match commands::close::close_with_info(&close_params, &info) {
                 Ok(outcome) => {
+                    if let Some(method) = outcome.resolved_operation.close_method_label() {
+                        recorded_label = format!("close {} ({method})", close_params.source_name);
+                    }
+                    if !outcome.post_errors.is_empty() {
+                        app.set_status(
+                            commands::types::format_post_close_errors(
+                                close_params.source_name,
+                                &outcome.post_errors,
+                            ),
+                            StatusLevel::Error,
+                        );
+                    }
+                    if !outcome.warnings.is_empty() {
+                        let text = outcome.warnings.join("; ");
+                        if outcome.post_errors.is_empty() {
+                            app.set_status(text, StatusLevel::Warning);
+                        } else {
+                            app.append_status(text, StatusLevel::Warning);
+                        }
+                    }
                     if !outcome.stale_warnings.is_empty() {
-                        app.set_status(format!("stale: {}", outcome.stale_warnings.join(", ")));
+                        let text =
+                            format!("stale workspaces: {}", outcome.stale_warnings.join(", "));
+                        if outcome.post_errors.is_empty() && outcome.warnings.is_empty() {
+                            app.set_status(text, StatusLevel::Warning);
+                        } else {
+                            app.append_status(text, StatusLevel::Warning);
+                        }
                     }
                     if let Some(remove_path) = outcome.pending_remove_path {
                         app.pending_remove_path = Some(remove_path);
@@ -3618,11 +3779,11 @@ fn drain_pending_handoff(
                     }
                 }
                 Err(e) => {
-                    app.set_status(format!("{e:#}"));
+                    app.set_status(format!("{e:#}"), StatusLevel::Error);
                     app.mode = Mode::List;
                 }
             }
-            history_label = Some(label);
+            history_label = Some(recorded_label);
         }
         PendingHandoff::Transfer {
             params,
@@ -3642,13 +3803,42 @@ fn drain_pending_handoff(
             };
             match commands::transfer::transfer_with_info(&transfer_params, &info) {
                 Ok(outcome) => {
+                    if !outcome.post_errors.is_empty() {
+                        let blocks = outcome
+                            .post_errors
+                            .iter()
+                            .map(commands::types::PostOperationError::display_block)
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        app.set_status(
+                            format!(
+                                "transfer '{}' → '{}' completed with error.\n{blocks}",
+                                transfer_params.source_name, transfer_params.target_name
+                            ),
+                            StatusLevel::Error,
+                        );
+                    }
+                    if !outcome.warnings.is_empty() {
+                        let text = outcome.warnings.join("; ");
+                        if outcome.post_errors.is_empty() {
+                            app.set_status(text, StatusLevel::Warning);
+                        } else {
+                            app.append_status(text, StatusLevel::Warning);
+                        }
+                    }
                     if !outcome.stale_warnings.is_empty() {
-                        app.set_status(format!("stale: {}", outcome.stale_warnings.join(", ")));
+                        let text =
+                            format!("stale workspaces: {}", outcome.stale_warnings.join(", "));
+                        if outcome.post_errors.is_empty() && outcome.warnings.is_empty() {
+                            app.set_status(text, StatusLevel::Warning);
+                        } else {
+                            app.append_status(text, StatusLevel::Warning);
+                        }
                     }
                     app.mode = Mode::List;
                 }
                 Err(e) => {
-                    app.set_status(format!("{e:#}"));
+                    app.set_status(format!("{e:#}"), StatusLevel::Error);
                     app.mode = Mode::List;
                 }
             }
@@ -3840,8 +4030,54 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn workspace() -> jujutsu::Workspace {
+        jujutsu::Workspace {
+            name: "feature".to_string(),
+            change_id: "head-change".to_string(),
+            description: "workspace head".to_string(),
+            bookmarks_at_head: vec![],
+            bookmarks_behind: vec![],
+            is_current: true,
+            path: PathBuf::from("/repo/feature"),
+            revisions: vec![
+                jujutsu::RevisionInfo {
+                    change_id: "rev-0".to_string(),
+                    description: "head".to_string(),
+                },
+                jujutsu::RevisionInfo {
+                    change_id: "rev-1".to_string(),
+                    description: "parent".to_string(),
+                },
+            ],
+            last_modified: None,
+        }
+    }
+
+    fn app_with_revisions() -> App {
+        App::new(
+            vec![workspace()],
+            config::Config::default(),
+            PathBuf::from("/repo"),
+            PathBuf::from("/repo/feature"),
+            "repo".to_string(),
+            "rev-0\nrev-1\nhead-change\n",
+            vec![
+                Some("rev-0".to_string()),
+                Some("rev-1".to_string()),
+                Some("head-change".to_string()),
+            ],
+            action_history::ActionHistory::new(),
+            PathBuf::from("/tmp/ji-history.json"),
+        )
+    }
 
     #[test]
     fn post_close_action_origin_is_launch_cwd_not_repo_root() {
@@ -3889,5 +4125,217 @@ mod tests {
         assert!(rendered.contains("Working"));
         assert!(rendered.contains("Syncing workspaces"));
         assert!(rendered.contains("Input resumes when done."));
+    }
+
+    #[test]
+    fn copy_dialog_opens_on_focused_revision_change_id() {
+        let mut app = app_with_revisions();
+        app.revision_cursor = Some(1);
+
+        app.handle_key_list(key(KeyCode::Char('c')));
+
+        assert!(matches!(app.mode, Mode::Copy));
+        assert_eq!(
+            app.copy_dialog
+                .as_ref()
+                .and_then(CopyDialog::selected_value),
+            Some("rev-1")
+        );
+    }
+
+    #[test]
+    fn copy_dialog_change_id_arrows_share_revision_cursor() {
+        let mut app = app_with_revisions();
+        app.handle_key_list(key(KeyCode::Char('c')));
+
+        app.handle_key_copy(key(KeyCode::Right));
+        assert_eq!(app.revision_cursor, Some(0));
+        assert_eq!(
+            app.copy_dialog
+                .as_ref()
+                .and_then(CopyDialog::selected_value),
+            Some("rev-0")
+        );
+
+        app.handle_key_copy(key(KeyCode::Right));
+        assert_eq!(app.revision_cursor, Some(1));
+        assert_eq!(
+            app.copy_dialog
+                .as_ref()
+                .and_then(CopyDialog::selected_value),
+            Some("rev-1")
+        );
+
+        app.handle_key_copy(key(KeyCode::Left));
+        assert_eq!(app.revision_cursor, Some(0));
+        assert_eq!(
+            app.copy_dialog
+                .as_ref()
+                .and_then(CopyDialog::selected_value),
+            Some("rev-0")
+        );
+
+        app.handle_key_copy(key(KeyCode::Left));
+        assert_eq!(app.revision_cursor, None);
+        assert_eq!(
+            app.copy_dialog
+                .as_ref()
+                .and_then(CopyDialog::selected_value),
+            Some("head-change")
+        );
+    }
+
+    #[test]
+    fn copy_dialog_arrows_ignore_non_change_id_rows() {
+        let mut app = app_with_revisions();
+        app.handle_key_list(key(KeyCode::Char('c')));
+        app.handle_key_copy(key(KeyCode::Up));
+
+        app.handle_key_copy(key(KeyCode::Right));
+
+        assert_eq!(app.revision_cursor, None);
+        assert_eq!(
+            app.copy_dialog
+                .as_ref()
+                .and_then(CopyDialog::selected_value),
+            Some("feature")
+        );
+    }
+
+    #[test]
+    fn stale_update_success_text_wording() {
+        assert_eq!(
+            stale_update_success_text("ws3", 0),
+            "ws3: updated successfully - no longer stale"
+        );
+        assert_eq!(
+            stale_update_success_text("ws3", 2),
+            "ws3: updated successfully - no longer stale (2 diff(s) saved to .ji/diffs/)"
+        );
+    }
+
+    #[test]
+    fn stale_update_status_classifies_outcomes() {
+        assert_eq!(
+            stale_update_status("ws3", None, Ok(0)),
+            (
+                "ws3: updated successfully - no longer stale".to_string(),
+                StatusLevel::Success
+            )
+        );
+        assert_eq!(
+            stale_update_status("ws3", None, Err("io error")),
+            (
+                "ws3: no longer stale, but some backup diffs may not have been saved: io error"
+                    .to_string(),
+                StatusLevel::Warning
+            )
+        );
+        // The update error takes precedence over a backup failure.
+        assert_eq!(
+            stale_update_status("ws3", Some("boom"), Err("io error")),
+            ("ws3: update failed: boom".to_string(), StatusLevel::Error)
+        );
+    }
+
+    #[test]
+    fn stale_sequence_status_classifies_outcomes() {
+        assert_eq!(stale_sequence_status(Ok(0)), None);
+        assert_eq!(
+            stale_sequence_status(Ok(3)),
+            Some((
+                "Resolved. 3 diff(s) saved to .ji/diffs/".to_string(),
+                StatusLevel::Success
+            ))
+        );
+        assert_eq!(
+            stale_sequence_status(Err("disk full")),
+            Some((
+                "default: no longer stale, but some backup diffs may not have been saved: disk full"
+                    .to_string(),
+                StatusLevel::Warning
+            ))
+        );
+    }
+
+    #[test]
+    fn dialog_block_levels() {
+        assert_eq!(DialogBlock::ProbeIncomplete.level(), StatusLevel::Warning);
+        assert_eq!(
+            DialogBlock::WorkspaceListUnavailable.level(),
+            StatusLevel::Error
+        );
+        assert!(!DialogBlock::ProbeIncomplete.reason().is_empty());
+        assert!(!DialogBlock::WorkspaceListUnavailable.reason().is_empty());
+    }
+
+    /// Foreground color of the first cell of the first occurrence of `needle` in
+    /// the rendered buffer. Matched cell-by-cell so multi-byte border glyphs
+    /// don't offset the match.
+    fn find_fg(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<Color> {
+        let width = buf.area.width as usize;
+        let needle: Vec<char> = needle.chars().collect();
+        if needle.is_empty() {
+            return None;
+        }
+        for row in buf.content().chunks(width) {
+            if row.len() < needle.len() {
+                continue;
+            }
+            for start in 0..=(row.len() - needle.len()) {
+                let hit = needle
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &ch)| row[start + j].symbol().chars().eq(std::iter::once(ch)));
+                if hit {
+                    return Some(row[start].fg);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn status_message_and_marker_share_level_color() {
+        let cases = [
+            (StatusLevel::Error, Color::Red, "zzsentinelerror"),
+            (StatusLevel::Warning, Color::Yellow, "zzsentinelwarn"),
+            (StatusLevel::Info, Color::LightBlue, "zzsentinelinfo"),
+            (StatusLevel::Success, Color::LightGreen, "zzsentinelok"),
+        ];
+        for (level, color, sentinel) in cases {
+            let mut app = app_with_revisions();
+            app.set_status(sentinel.to_string(), level);
+            let backend = TestBackend::new(120, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buf = terminal.backend().buffer();
+            assert_eq!(
+                find_fg(buf, sentinel),
+                Some(color),
+                "status message color for {level:?}"
+            );
+            assert_eq!(
+                find_fg(buf, "STATUS"),
+                Some(color),
+                "STATUS marker color for {level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_stack_keeps_per_message_color_and_most_severe_marker() {
+        let mut app = app_with_revisions();
+        app.set_status("zzgreenmsg".to_string(), StatusLevel::Success);
+        app.append_status("zzredmsg".to_string(), StatusLevel::Error);
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Each message keeps its own color; the Success line is not dropped.
+        assert_eq!(find_fg(buf, "zzgreenmsg"), Some(Color::LightGreen));
+        assert_eq!(find_fg(buf, "zzredmsg"), Some(Color::Red));
+        // The single marker follows the most-severe level present.
+        assert_eq!(find_fg(buf, "STATUS"), Some(Color::Red));
     }
 }

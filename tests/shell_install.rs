@@ -4,7 +4,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use ji::shell::{InstallOpts, ShellEnv, UninstallOpts, install, install_all, status, uninstall};
+use ji::shell::{
+    FishProbeSource, InstallOpts, ShellEnv, UninstallOpts, install, install_all, status, uninstall,
+};
 use tempfile::TempDir;
 
 fn env_for(tmp: &TempDir) -> ShellEnv {
@@ -12,10 +14,13 @@ fn env_for(tmp: &TempDir) -> ShellEnv {
     let xdg = home.join(".config");
     ShellEnv {
         home: home.clone(),
-        xdg_config_home: xdg,
+        xdg_config_home: xdg.clone(),
         zdotdir: home,
         zsh_custom: None,
         omz_root: None,
+        // Deterministic no-vendor default: only the temp user completions dir, so
+        // the suite never spawns the host's fish or reads its real $fish_complete_path.
+        fish_complete_path: FishProbeSource::Probed(vec![xdg.join("fish/completions")]),
     }
 }
 
@@ -639,6 +644,93 @@ fn fish_user_authored_completions_overwritten_with_force() {
     )
     .unwrap();
     assert!(read(&comp).contains("# ji-managed: do not edit"));
+}
+
+/// ji's dynamic vendor completion (what Homebrew ships).
+fn dynamic_vendor_body() -> String {
+    ji::shell::packaged_completion("fish").unwrap()
+}
+
+/// Env whose `$fish_complete_path` is the temp user dir followed by `vendor`.
+fn env_with_vendor(tmp: &TempDir, vendor: &Path) -> ShellEnv {
+    let mut env = env_for(tmp);
+    let user_dir = env.xdg_config_home.join("fish/completions");
+    env.fish_complete_path = FishProbeSource::Probed(vec![user_dir, vendor.to_path_buf()]);
+    env
+}
+
+#[test]
+fn fish_install_vendor_present_removes_stale_user_completion() {
+    let tmp = TempDir::new().unwrap();
+    let vendor = tmp.path().join("vendor");
+    write(&vendor.join("ji.fish"), &dynamic_vendor_body());
+    let env = env_with_vendor(&tmp, &vendor);
+    let comp = env.xdg_config_home.join("fish/completions/ji.fish");
+    // A stale, ji-managed static user completion that shadows the vendor one.
+    write(
+        &comp,
+        "# ji-managed: do not edit\ncomplete -c ji -a switch\n",
+    );
+    install(&env, "fish", InstallOpts::default()).unwrap();
+    assert!(
+        !comp.exists(),
+        "stale shadowing user completion should be removed"
+    );
+    assert!(env.xdg_config_home.join("fish/functions/ji.fish").exists());
+}
+
+#[test]
+fn fish_install_no_vendor_writes_user_completion() {
+    let tmp = TempDir::new().unwrap();
+    let env = env_for(&tmp); // default: no vendor on the path
+    install(&env, "fish", InstallOpts::default()).unwrap();
+    let comp = env.xdg_config_home.join("fish/completions/ji.fish");
+    assert!(comp.exists());
+    assert!(
+        read(&comp).contains("COMPLETE=fish"),
+        "user completion is dynamic"
+    );
+}
+
+#[test]
+fn fish_install_vendor_present_is_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let vendor = tmp.path().join("vendor");
+    write(&vendor.join("ji.fish"), &dynamic_vendor_body());
+    let env = env_with_vendor(&tmp, &vendor);
+    let comp = env.xdg_config_home.join("fish/completions/ji.fish");
+    write(
+        &comp,
+        "# ji-managed: do not edit\ncomplete -c ji -a switch\n",
+    );
+    install(&env, "fish", InstallOpts::default()).unwrap();
+    assert!(!comp.exists());
+    // A second install has nothing to remove and the wrapper is unchanged.
+    install(&env, "fish", InstallOpts::default()).unwrap();
+    assert!(!comp.exists());
+}
+
+#[test]
+fn fish_install_dry_run_does_not_delete() {
+    let tmp = TempDir::new().unwrap();
+    let vendor = tmp.path().join("vendor");
+    write(&vendor.join("ji.fish"), &dynamic_vendor_body());
+    let env = env_with_vendor(&tmp, &vendor);
+    let comp = env.xdg_config_home.join("fish/completions/ji.fish");
+    write(
+        &comp,
+        "# ji-managed: do not edit\ncomplete -c ji -a switch\n",
+    );
+    install(
+        &env,
+        "fish",
+        InstallOpts {
+            dry_run: true,
+            ..InstallOpts::default()
+        },
+    )
+    .unwrap();
+    assert!(comp.exists(), "dry-run must not delete the file");
 }
 
 #[test]

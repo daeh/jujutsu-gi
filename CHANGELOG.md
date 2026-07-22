@@ -1,31 +1,26 @@
 # Changelog
 
 
-## [0.1.4] - 2026-06-28
+## 0.1.5
 
-### Changed
+### Fixed
 
-- prose: de-slop code comments and docs
-- shell: multi-shell `--all` install, inline install offer, bypass-alias detection
-- completion: harden bootstrap-query timeout and document tab-completion
-- completion: dynamic annotated shell completions for workspace/bookmark args
-- completion: dynamic, annotated shell tab-completion (wt-style times)
-- update depts
+- **fish:** `ji switch`/`sync`/`transfer <TAB>` no longer fall back to file completion when a stale pre-0.1.4 static completion at `~/.config/fish/completions/ji.fish` shadowed Homebrew's dynamic vendor completion.
+`ji config shell install fish` now removes a redundant/stale user-dir completion when a vendor completion already provides one (and installs one only where nothing else does); `ji config shell status fish` reports the shadow.
 
-## [Unreleased]
+## 0.1.4
 
 ### Added
 
-- Dynamic, annotated shell tab-completion for workspace and bookmark arguments. `ji switch <TAB>` — plus `close`/`transfer`/`sync` (including `--source`) and `ji new` — now completes live targets annotated with a relative last-modified time and a status marker: `(2h)[*]` for the current workspace, `(1y)[x]` for an orphaned one. zsh and fish show the annotations (recency-sorted); bash completes plain names. `ji new` completes existing local bookmarks with their times. Candidates come from a single non-mutating `jj` call per keystroke under a bounded timeout, so completion never snapshots the working copy or stalls the prompt.
-- `ji config shell install --all` installs integration for every shell that already has a config (zsh, bash, fish), reporting each skipped shell — it never creates a config for a shell you don't use.
-A new inline offer uses the same flow: when `ji switch`/`new`/`close` can't change the directory because the wrapper isn't installed, a terminal run offers to install it then (`[y/N/?]`), configuring the shell you're in plus any other shell with a config; a decline is remembered per shell.
-- `ji config shell status` now reports bypass aliases — a `ji` alias (or fish `function ji`) that shadows the wrapper, or a differently-named alias that runs the `ji` binary directly — and `install` warns about any it finds. The `installed but wasn't active` and `invoke ji as a bare command` cd notes now point to `ji config shell status`.
+- Dynamic, annotated shell tab-completion for workspace and bookmark arguments.
+- `ji config shell install --all` installs integration for every shell that already has a config (zsh, bash, fish).
+- `ji config shell status` now reports bypass aliases — a `ji` alias (or fish `function ji`) that shadows the wrapper, or a differently-named alias that runs the `ji` binary directly — and `install` warns about any it finds.
 
 ### Changed
 
 - Shell completions are now generated dynamically (clap_complete's dynamic engine) rather than statically; `ji config shell install` and the packaged Homebrew completions emit the same dynamic registration, so completion always reflects the installed binary.
 
-## [0.1.3] - 2026-06-25
+## 0.1.3
 
 ### Added
 
@@ -59,35 +54,3 @@ Closing the workspace you're standing in *and removing its files* prints a `curr
 ## 0.1.0
 
 Initial public release.
-
-## [0.1.2] - 2026-06-23
-
-### Changed
-
-- publish: harden Homebrew release flow (adversarial-review fixes)
-- publish: add Homebrew tap install path (daeh/jujutsu-gi/ji)
-- update publish pipeline
-
-## [0.1.1] - 2026-06-12
-
-### Changed
-
-- bump version
-- clean comments
-- tui: delegate BookmarksDialog-internal keys to BookmarksDialog::handle_key
-- tui: delegate CreateDialog-internal keys to CreateDialog::handle_key
-- tui: delegate CloseDialog-internal keys to CloseDialog::handle_key
-- tui: extract handle_key mode arms into per-mode methods (pure motion)
-- tui: extract shared LineEditor for single-line text fields
-- operations: name the workspace triple as WsRef
-- record parsing: one records() helper for DELIM_RECORD-framed output
-- surplus removal: delete dead code across jj layer, TUI, commands
-- snapshot policy: taxonomy + maintained census, doc reconciliation
-- snapshot consolidation: probe-layer trim, dead policy deletion, broad fail-loud execution freshness
-- freshness gates: close dialog-open baseline race, gate the staleness poll
-- add work in progress screen
-- update depts
-- freshness gates for mutating operations (sync/close/transfer)
-- reorder new dialog fields
-- publish: port pipeline from zsh to fish
-
