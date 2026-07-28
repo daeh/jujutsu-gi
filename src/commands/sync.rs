@@ -18,6 +18,7 @@ pub struct SyncParamsOwned {
     pub workspace_path_template: String,
     pub repo_name: String,
     pub author: Option<String>,
+    pub preserve_finder_xattrs: bool,
 }
 
 /// Execute sync between two workspaces.
@@ -34,6 +35,7 @@ pub fn sync(
     workspace_path_template: &str,
     repo_name: &str,
     author: Option<&str>,
+    preserve_finder_xattrs: bool,
 ) -> Result<operations::SyncOutcome> {
     sync_with_info(
         repo,
@@ -45,6 +47,7 @@ pub fn sync(
         workspace_path_template,
         repo_name,
         author,
+        preserve_finder_xattrs,
     )
 }
 
@@ -60,6 +63,7 @@ pub fn sync_with_info(
     workspace_path_template: &str,
     repo_name: &str,
     author: Option<&str>,
+    preserve_finder_xattrs: bool,
 ) -> Result<operations::SyncOutcome> {
     // Lenient validation: SyncModeInfo is the complete sync plan, so an
     // op-head move with a plan-equivalent re-detection may proceed (with the
@@ -72,7 +76,16 @@ pub fn sync_with_info(
     // workspace whose `@` descends from src/tgt — the broad descendant-first
     // snapshot captures those edits before they could be staled.
     let fresh = super::prepare_execution_freshness(
-        repo, &validated, src_name, src_path, tgt_name, tgt_path, true, true, None,
+        repo,
+        &validated,
+        src_name,
+        src_path,
+        tgt_name,
+        tgt_path,
+        true,
+        true,
+        None,
+        preserve_finder_xattrs,
     )?;
     let validated = fresh.info;
     let src_hi = validated.src_head_info();
@@ -96,6 +109,9 @@ pub fn sync_with_info(
         // against jj 0.41's reduced sibling-op false positives (#9314).
         let _ = jujutsu::update_workspace_stale(src_path);
         let _ = jujutsu::update_workspace_stale(tgt_path);
+        // Materializations are done — restore Finder metadata and report
+        // link fidelity.
+        warnings.extend(fresh.xattr_guard.restore(&fresh.ws_paths));
         // Advance singular bookmarks for both workspaces to their effective head.
         for ws_name in [src_name, tgt_name] {
             if let Err(e) = jj_utils::advance_singular_bookmark_to_effective_head(

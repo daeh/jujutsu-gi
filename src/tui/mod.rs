@@ -1401,6 +1401,7 @@ impl App {
             workspace_path_template: self.config.workspace_path.clone(),
             repo_name: self.repo_name.clone(),
             author: self.config.ji_author.clone(),
+            preserve_finder_xattrs: self.config.preserve_finder_xattrs,
         };
         self.pending_handoff = Some(PendingHandoff::Sync { params, label });
     }
@@ -1522,6 +1523,7 @@ impl App {
                     workspace_path_template: self.config.workspace_path.clone(),
                     repo_name: self.repo_name.clone(),
                     author: self.config.ji_author.clone(),
+                    preserve_finder_xattrs: self.config.preserve_finder_xattrs,
                 };
                 self.pending_handoff = Some(PendingHandoff::Close {
                     params,
@@ -1552,6 +1554,7 @@ impl App {
                     workspace_path_template: self.config.workspace_path.clone(),
                     repo_name: self.repo_name.clone(),
                     author: self.config.ji_author.clone(),
+                    preserve_finder_xattrs: self.config.preserve_finder_xattrs,
                 };
                 self.pending_handoff = Some(PendingHandoff::Transfer {
                     params,
@@ -3356,6 +3359,10 @@ pub fn create(
         false,
     )?;
 
+    for w in &result.warnings {
+        eprintln!("(ji)::warning: {w}");
+    }
+
     shell::apply_followup_cd(&result.workspace_path)
 }
 
@@ -3667,6 +3674,7 @@ fn drain_pending_handoff(
                 &params.workspace_path_template,
                 &params.repo_name,
                 params.author.as_deref(),
+                params.preserve_finder_xattrs,
             );
             match result {
                 Ok(operations::SyncOutcome::AlreadyInSync) => {
@@ -3697,6 +3705,9 @@ fn drain_pending_handoff(
             );
             match result {
                 Ok(create_result) => {
+                    if !create_result.warnings.is_empty() {
+                        app.set_status(create_result.warnings.join("; "), StatusLevel::Warning);
+                    }
                     // Defer the select_by_name until after the post-match
                     // `app.refresh()` — at this point `workspace_list` is
                     // still the pre-create snapshot and does not contain
@@ -3735,6 +3746,7 @@ fn drain_pending_handoff(
                 workspace_path_template: &params.workspace_path_template,
                 repo_name: &params.repo_name,
                 author: params.author.as_deref(),
+                preserve_finder_xattrs: params.preserve_finder_xattrs,
             };
             let mut recorded_label = label;
             match commands::close::close_with_info(&close_params, &info) {
@@ -3800,6 +3812,7 @@ fn drain_pending_handoff(
                 workspace_path_template: &params.workspace_path_template,
                 repo_name: &params.repo_name,
                 author: params.author.as_deref(),
+                preserve_finder_xattrs: params.preserve_finder_xattrs,
             };
             match commands::transfer::transfer_with_info(&transfer_params, &info) {
                 Ok(outcome) => {

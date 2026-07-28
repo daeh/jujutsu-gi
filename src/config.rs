@@ -27,6 +27,14 @@ pub struct Config {
     /// Override the author on every revision created by ji via `jj metaedit --author`.
     #[serde(rename = "ji-author", default)]
     pub ji_author: Option<String>,
+    /// Restore Finder-relevant xattrs (macOS alias flag, resource fork) after
+    /// operations that materialize working-copy files. Gates the xattr writes
+    /// only — the fidelity warnings are always emitted.
+    #[serde(
+        rename = "preserve-finder-xattrs",
+        default = "default_preserve_finder_xattrs"
+    )]
+    pub preserve_finder_xattrs: bool,
     /// Template validation warnings collected at config load time.
     #[serde(skip)]
     pub warnings: Vec<TemplateWarning>,
@@ -34,6 +42,10 @@ pub struct Config {
 
 fn default_workspace_path() -> String {
     "../{{ repo }}.{{ bookmark }}".to_string()
+}
+
+fn default_preserve_finder_xattrs() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -46,6 +58,7 @@ impl Default for Config {
             templates: BTreeMap::new(),
             log_template: None,
             ji_author: None,
+            preserve_finder_xattrs: default_preserve_finder_xattrs(),
             warnings: Vec::new(),
         }
     }

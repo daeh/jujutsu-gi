@@ -70,6 +70,16 @@ ji-author = "Jujutsu Gi <ji@null.com>"
 
 This isolates ji-generated helper revisions — such as the empty "step-forward" commits ji inserts to keep workspaces from sharing `@`, or the merge/fast-forward markers from close and transfer operations — from your personal author identity, so that `jj log --filter 'author(me)'` stays focused on your work. See [operations.md](operations.md#terminology) for what these helper revisions look like.
 
+### `preserve-finder-xattrs` — bool, default `true`
+
+jj stores only file content and mode; whenever it materializes working-copy files it strips macOS Finder metadata (`com.apple.FinderInfo`, `com.apple.ResourceFork`), which breaks Finder aliases. ji restores that metadata after its workspace operations. Set to `false` to disable the restore writes — the fidelity warnings are still reported.
+
+```toml
+preserve-finder-xattrs = false
+```
+
+See [xattrs.md](xattrs.md) for the mechanism, restore rules, and limitations.
+
 ## Hooks
 
 Two hook tables, both keyed by hook name and mapping to a shell command. Commands are run via `sh -c` with the new workspace directory as cwd.

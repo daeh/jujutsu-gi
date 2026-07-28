@@ -159,6 +159,10 @@ pub enum TransferMethod {
     Merge,
     FastForwardTarget,
     FastForwardSource,
+    /// Disabled: `#[value(skip)]` removes it from the parser and from `--help`,
+    /// so `--method merge-abandon-old` is rejected. The variant and its
+    /// execution path stay in the tree for development use only.
+    #[value(skip)]
     MergeAbandonOld,
     Rebase,
     MergeSquash,
@@ -263,6 +267,9 @@ pub fn format_post_close_errors(workspace_name: &str, errors: &[PostOperationErr
 pub struct CreateResult {
     pub workspace_name: String,
     pub workspace_path: PathBuf,
+    /// Non-fatal fidelity notes from the Finder-metadata restore pass
+    /// (see `finder_xattrs`).
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]

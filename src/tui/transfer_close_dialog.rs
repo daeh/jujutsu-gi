@@ -364,6 +364,10 @@ impl CloseDialog {
     }
 
     /// Merge/sync operations available for the current state.
+    ///
+    /// `Operation::MergeAbandonOld` ("merge (old)") is deliberately not offered:
+    /// it is disabled at both entry points (here and the CLI `TransferMethod`
+    /// value enum), leaving its execution path intact but unreachable.
     fn available_operations(&self) -> Vec<Operation> {
         let mode = self.close_info.as_ref().map(|i| &i.mode);
         let squashable = || self.is_squashable();
@@ -378,14 +382,12 @@ impl CloseDialog {
                     if squashable() {
                         ops.push(Operation::MergeSquash);
                     }
-                    ops.push(Operation::MergeAbandonOld);
                     ops
                 }
                 Some(SyncMode::TargetOnly) => vec![
                     Operation::AdaptiveMerge,
                     Operation::FastForwardSource,
                     Operation::Merge,
-                    Operation::MergeAbandonOld,
                 ],
                 Some(SyncMode::Diverged) => {
                     let mut ops = vec![
@@ -396,7 +398,6 @@ impl CloseDialog {
                     if squashable() {
                         ops.push(Operation::MergeSquash);
                     }
-                    ops.push(Operation::MergeAbandonOld);
                     ops
                 }
                 _ => vec![],

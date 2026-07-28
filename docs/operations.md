@@ -189,30 +189,6 @@ jj abandon -- {src_trivial}             # only if the source had a trivial head 
 
 **Diagram:** mirror of [`fast-forward-target`](#transfer-fast-forward-target) with `src` and `tgt` swapped.
 
-### Transfer: merge-abandon-old
-
-```
-ji transfer [target] --method merge-abandon-old
-```
-
-An alternative merge implementation that uses the raw `@` heads of both workspaces as merge parents, then relies on jj's auto-rebase-on-abandon to clean up trivial heads after the fact. Structurally, the end state is equivalent to `merge` — both workspaces have fresh step-forward commits under a merge of the effective heads — but the intermediate steps and the final merge commit's direct parents differ.
-
-**Available in:** any non-`InSync` mode. Retained as a fallback; prefer `merge` for new work.
-
-**Commands:**
-
-```bash
-[{src}] jj new -m "(ji::merge) {tgt}@{tgt_eff} into {src}@{src_eff}" -- {src_at} {tgt_at}
-[{src}] jj new -m "(ji::step-forward)" -- {merge_id}
-[{tgt}] jj new -m "(ji::step-forward)" -- {merge_id}
-jj abandon -- {src_trivial} {tgt_trivial}   # jj auto-rebases the merge
-                                            # onto the trivials' parents
-```
-
-The final abandon triggers jj's auto-rebase: because the merge's direct parents included trivial heads (the pre-op `@`s of both workspaces), abandoning those trivial heads causes jj to rewrite the merge so its parents become the trivials' parents (`src_eff` and `tgt_eff`). The end graph is the same as [`merge`](#transfer-merge).
-
-**Diagram:** same shape as [`merge`](#transfer-merge) after the auto-rebase.
-
 ### Transfer: rebase
 
 ```

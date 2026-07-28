@@ -161,6 +161,9 @@ pub(crate) fn records(output: &str) -> impl Iterator<Item = &str> {
 //   - `snapshot_ws`: `workspace_forget` (here);
 //     `commands::snapshot_workspaces` (bucket 2);
 //     `commands::prepare_execution_freshness` ×2 tiers (bucket 3);
+//     `commands::create` best-effort entry snapshot ahead of the
+//     Finder-metadata capture (bucket 2 — makes the capture's `file list`
+//     see pending source files);
 //     `operations.rs` create step-source, `merge`, `merge_squash`,
 //     `merge_abandon_parents_old` target snapshots (bucket 8).
 //   - `run_jj_ws_live`: `jj_utils` head movers + safety checks (buckets
@@ -1877,14 +1880,10 @@ pub fn stale_workspace_diff_threaded(ws_path: PathBuf, tx: std::sync::mpsc::Send
     let _ = tx.send(StaleDiffMsg::Done(result));
 }
 
-fn stale_workspace_diff_inner(
-    ws_path: &Path,
-    tx: Option<&std::sync::mpsc::Sender<StaleDiffMsg>>,
-) -> Result<StaleDiff> {
-    use std::collections::HashSet;
-
-    // 1. Get the list of files jj expects at @.
-    let file_list_output = run_jj_output(
+/// List the files jj tracks at `@` in a workspace (workspace-relative paths).
+/// Read policy: reflects the last snapshot, never triggers one.
+pub fn tracked_files(ws_path: &Path) -> Result<Vec<String>> {
+    let output = run_jj_output(
         jj_cmd_ws(ws_path).stdin(std::process::Stdio::null()).args([
             "file",
             "list",
@@ -1894,16 +1893,29 @@ fn stale_workspace_diff_inner(
         "file list --revision @",
     )
     .context("failed to run jj file list")?;
-    if !file_list_output.status.success() {
+    if !output.status.success() {
         anyhow::bail!(
             "jj file list failed: {}",
-            String::from_utf8_lossy(&file_list_output.stderr)
+            String::from_utf8_lossy(&output.stderr)
         );
     }
-    let file_list_str =
-        String::from_utf8(file_list_output.stdout).context("invalid utf-8 in file list")?;
-    let jj_files: Vec<&str> = file_list_str.lines().filter(|l| !l.is_empty()).collect();
-    let jj_set: HashSet<&str> = jj_files.iter().copied().collect();
+    let stdout = String::from_utf8(output.stdout).context("invalid utf-8 in file list")?;
+    Ok(stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn stale_workspace_diff_inner(
+    ws_path: &Path,
+    tx: Option<&std::sync::mpsc::Sender<StaleDiffMsg>>,
+) -> Result<StaleDiff> {
+    use std::collections::HashSet;
+
+    // 1. Get the list of files jj expects at @.
+    let jj_files = tracked_files(ws_path)?;
+    let jj_set: HashSet<&str> = jj_files.iter().map(String::as_str).collect();
 
     if let Some(tx) = tx {
         let _ = tx.send(StaleDiffMsg::Total(jj_files.len()));
@@ -1912,7 +1924,7 @@ fn stale_workspace_diff_inner(
     let mut diff = StaleDiff::default();
 
     // 2. For each jj-tracked file, compare content.
-    for (i, &rel_path) in jj_files.iter().enumerate() {
+    for (i, rel_path) in jj_files.iter().enumerate() {
         let disk_path = ws_path.join(rel_path);
         if disk_path.exists() {
             let mut hasher = blake3::Hasher::new();
@@ -1931,7 +1943,7 @@ fn stale_workspace_diff_inner(
                     "show",
                     "--revision",
                     "@",
-                    rel_path,
+                    rel_path.as_str(),
                 ]),
                 &format!("file show --revision @ {rel_path}"),
             )
@@ -1939,13 +1951,13 @@ fn stale_workspace_diff_inner(
             if show_output.status.success() {
                 let jj_hash = blake3::hash(&show_output.stdout);
                 if disk_hash != jj_hash {
-                    diff.modified.push(rel_path.to_string());
+                    diff.modified.push(rel_path.clone());
                 }
             } else {
-                diff.modified.push(rel_path.to_string());
+                diff.modified.push(rel_path.clone());
             }
         } else {
-            diff.jj_only.push(rel_path.to_string());
+            diff.jj_only.push(rel_path.clone());
         }
 
         if let Some(tx) = tx {
@@ -2340,7 +2352,7 @@ mod tests {
         // (b) Live/snapshot wrapper tripwire. Function names only — the `(`
         // is appended at runtime so the table doesn't count itself.
         let expected: &[(&str, usize)] = &[
-            ("snapshot_ws", 9),
+            ("snapshot_ws", 10),
             ("run_jj_ws_live", 6),
             ("jj_cmd_wc", 6),
             ("jj_cmd_ws_wc", 7),

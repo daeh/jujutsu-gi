@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Component, Path, PathBuf};
 
-use crate::{config, hooks, jujutsu, operations};
+use crate::{config, finder_xattrs, hooks, jujutsu, operations};
 
 use super::types::CreateResult;
 
@@ -35,6 +35,16 @@ pub fn create(
     msg: &str,
     quiet: bool,
 ) -> Result<CreateResult> {
+    // Finder-metadata capture from the source workspace before anything
+    // materializes. The best-effort entry snapshot makes `jj file list`
+    // (the capture's enumeration) see not-yet-snapshotted files, e.g. a
+    // Finder alias just dropped on the source disk; capture reads the disk
+    // regardless, so a failed snapshot only shrinks the tracked list.
+    let _ = jujutsu::snapshot_ws(source_ws_path);
+    let source_capture = [("source".to_string(), source_ws_path.to_path_buf())];
+    let xattr_guard =
+        finder_xattrs::XattrGuard::capture(&source_capture, config.preserve_finder_xattrs);
+
     operations::create_workspace(
         repo_root,
         source_ws_path,
@@ -52,6 +62,13 @@ pub fn create(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+
+    // Restore Finder metadata before templates/hooks run: pre-start hooks
+    // must see intact aliases. The source pass heals any source file the
+    // update-stale above rewrote; the new-workspace pass scans everything
+    // that was just materialized.
+    let mut warnings = xattr_guard.restore(&source_capture);
+    warnings.extend(xattr_guard.restore_new_workspace(&ws_name, ws_path));
 
     if quiet {
         let _ = jujutsu::create_bookmark(repo_root, &ws_name, bookmark);
@@ -74,6 +91,7 @@ pub fn create(
     Ok(CreateResult {
         workspace_name: ws_name,
         workspace_path: ws_path.to_path_buf(),
+        warnings,
     })
 }
 

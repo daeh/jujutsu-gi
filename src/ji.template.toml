@@ -67,6 +67,17 @@
 # ji-author = "Jujutsu Gi <ji@null.com>"
 #
 # ============================================================================
+# Finder alias fidelity
+# ============================================================================
+# jj stores only file content + mode; whenever it materializes or rewrites
+# working-copy files, macOS Finder metadata (com.apple.FinderInfo /
+# com.apple.ResourceFork) is stripped, which breaks Finder aliases. ji
+# restores that metadata after workspace operations. Set to false to disable
+# the restore writes (fidelity warnings are still reported).
+#
+# preserve-finder-xattrs = true
+#
+# ============================================================================
 # Hooks
 # ============================================================================
 # Hooks run in the new workspace directory after creation.

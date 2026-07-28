@@ -1,6 +1,25 @@
 # Changelog
 
 
+## 0.1.6 - 2026-07-28
+
+### Changed
+
+- add images to readme
+- transfer: disable the merge-abandon-old method
+- demo: record a VHS tour of the TUI against a fixed-shape fixture
+- fidelity: promote tests to the default suite; changelog + docs
+- fidelity: preserve Finder alias xattrs and warn on broken links
+- plan: prepare release 0.1.5
+
+## Unreleased
+
+### Added
+
+- macOS Finder-metadata fidelity: workspace operations (`new`, `close`, `transfer`, `sync`) now restore the Finder metadata (`com.apple.FinderInfo`, `com.apple.ResourceFork`) that jj strips whenever it materializes working-copy files, so Finder aliases survive workspace creation and merge-back.
+The restore writes can be disabled with the new `preserve-finder-xattrs` config key (default on); see [docs/xattrs.md](docs/xattrs.md).
+- Fidelity warnings: ji reports hard links broken by materialization (jj cannot represent them; content is preserved, the shared inode is not) and aliases it cannot restore (no on-disk copy to take metadata from), on CLI stderr and in the TUI status line.
+
 ## 0.1.5
 
 ### Fixed

@@ -21,6 +21,9 @@ pub struct CloseParams<'a> {
     pub workspace_path_template: &'a str,
     pub repo_name: &'a str,
     pub author: Option<&'a str>,
+    /// Config gate for the post-op Finder-metadata restore writes
+    /// (`preserve-finder-xattrs`); fidelity warnings are unconditional.
+    pub preserve_finder_xattrs: bool,
 }
 
 /// Owned-data mirror of `CloseParams`, used by the deferred-handoff path
@@ -45,6 +48,7 @@ pub struct CloseParamsOwned {
     pub workspace_path_template: String,
     pub repo_name: String,
     pub author: Option<String>,
+    pub preserve_finder_xattrs: bool,
 }
 
 /// Execute close, computing sync info fresh.
@@ -107,6 +111,7 @@ pub fn close_with_info(
         !disposal,
         !disposal,
         advance_id,
+        params.preserve_finder_xattrs,
     )?;
     let validated = fresh.info;
     let src_hi = validated.src_head_info();
@@ -287,7 +292,10 @@ pub fn close_with_info(
     // Post-op reports are kept by category so bookmark/cleanup failures are
     // never mislabeled as workspace staleness.
     let stale_warnings = super::post_op_stale(&fresh.ws_paths, &fresh.stale_skipped);
-    let warnings = op_warnings;
+    let mut warnings = op_warnings;
+    // All materializations (operation arms, update-stale, predicted-stale
+    // resolution) are done — restore Finder metadata and report link fidelity.
+    warnings.extend(fresh.xattr_guard.restore(&fresh.ws_paths));
     let mut post_errors = Vec::new();
 
     // Post-op: singular bookmarks.

@@ -140,6 +140,22 @@ See [operations.md](operations.md#sync-mode-detection).
 
 ---
 
+## Finder alias became a plain file
+
+**Symptom:** a Finder alias in a workspace (or in `default@` after a merge-back) opens as a plain document instead of resolving; `ls -l@` shows no `com.apple.FinderInfo` attribute on it.
+
+**Cause:** jj stores only file content + mode. Any jj materialization (workspace add, merge into a working copy, update-stale) writes a fresh file without xattrs, and the FinderInfo xattr is what marks the file as an alias. ji restores the metadata around its own operations (see [xattrs.md](xattrs.md)); files materialized by plain jj commands, by an older ji, or with `preserve-finder-xattrs = false` stay stripped.
+
+**Fix:** the bookmark data survives, so re-add the xattr:
+
+```sh
+xattr -wx com.apple.FinderInfo "616C69734D414353800000000000000000000000000000000000000000000000" <file>
+```
+
+Hard links are related but not repairable in-place: jj materializes each path as an independent file (content preserved, shared inode lost) and ji warns (`hard link broken: …`). Re-link manually with `ln -f <original> <copy>`, or use a symlink — the only link type jj represents faithfully.
+
+---
+
 ## Build errors
 
 **Symptom:** `task build` or `task release` fails.

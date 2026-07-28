@@ -16,6 +16,7 @@ The docs assume you already know jj — ji is a tool for people who work with jj
 | [cli.md](cli.md) | Full CLI reference for every subcommand and flag |
 | [tui.md](tui.md) | Layout, keybindings, dialogs, modes |
 | [operations.md](operations.md) | How sync, transfer, and close work — with diagrams and jj command sequences |
+| [xattrs.md](xattrs.md) | macOS Finder aliases, xattrs, and hard links across workspace operations |
 | [troubleshooting.md](troubleshooting.md) | Problem/solution pairs |
 
 ## Reading paths

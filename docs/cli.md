@@ -172,7 +172,6 @@ Transfer changes between two workspaces. Both workspaces remain open afterward â
 | `merge` | Merge commit with both effective heads as parents; both workspaces step forward past the merge |
 | `fast-forward-target` | Fast-forward the target to the source's effective head |
 | `fast-forward-source` | Fast-forward the source to the target's effective head |
-| `merge-abandon-old` | Merge using actual `@` heads (not effective heads), abandoning trivial heads afterward |
 | `rebase` | Rebase the source's unique chain onto the target â€” produces linear history |
 | `merge-squash` | Squash the source's chain into one commit, then merge with target |
 

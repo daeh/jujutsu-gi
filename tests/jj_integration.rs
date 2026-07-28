@@ -815,6 +815,7 @@ fn detach_moves_singular_bookmark_and_abandons_trivial_tip() {
         workspace_path_template: "{{ bookmark }}",
         repo_name: "repo",
         author: None,
+        preserve_finder_xattrs: false,
     };
     let result = commands::close::close(&params).expect("detach should succeed");
 
@@ -880,6 +881,7 @@ fn detach_abandons_stacked_unreferenced_trivial_tips() {
         workspace_path_template: "{{ bookmark }}",
         repo_name: "repo",
         author: None,
+        preserve_finder_xattrs: false,
     };
     let result = commands::close::close(&params).expect("detach should succeed");
 
@@ -939,6 +941,7 @@ fn detach_preserves_trivial_tip_pinned_by_no_action_bookmark() {
         workspace_path_template: "{{ bookmark }}",
         repo_name: "repo",
         author: None,
+        preserve_finder_xattrs: false,
     };
     let result = commands::close::close(&params).expect("detach should succeed");
 
@@ -1132,6 +1135,7 @@ fn sync_entry_snapshot_prevents_orphaned_placeholder() {
         "",
         "repo",
         None,
+        false,
     )
     .expect("sync must succeed");
     match outcome {
@@ -1354,6 +1358,7 @@ fn abandon_verifies_live_revision_set() {
         workspace_path_template: "",
         repo_name: "repo",
         author: None,
+        preserve_finder_xattrs: false,
     };
     let err = match commands::close::close(&params) {
         Ok(_) => panic!("stale set must bail"),
@@ -1393,6 +1398,7 @@ fn abandon_verifies_live_revision_set() {
         workspace_path_template: "",
         repo_name: "repo",
         author: None,
+        preserve_finder_xattrs: false,
     };
     commands::close::close(&params).expect("correct frozen set must pass");
     for id in &live {
@@ -1475,6 +1481,7 @@ fn protection_snapshot_preserves_third_party_edits() {
         workspace_path_template: "",
         repo_name: "repo",
         author: None,
+        preserve_finder_xattrs: false,
     };
     let result = commands::transfer::transfer(&params).expect("transfer must succeed");
 
@@ -1523,6 +1530,7 @@ fn protection_skips_stale_third_party_and_reports() {
         workspace_path_template: "",
         repo_name: "repo",
         author: None,
+        preserve_finder_xattrs: false,
     };
     let result = commands::close::close(&params).expect("close must proceed despite stale obs");
     assert!(
@@ -1560,6 +1568,7 @@ fn sync_protection_preserves_third_party_edits() {
         "",
         "repo",
         None,
+        false,
     )
     .expect("sync must succeed");
     let warnings = match outcome {
@@ -1616,6 +1625,7 @@ fn sync_required_snapshot_captures_post_gate_edit_and_aborts() {
         "",
         "repo",
         None,
+        false,
     )
     .expect_err("flipped target head must abort");
     assert!(
@@ -1673,6 +1683,7 @@ fn sync_aborts_on_relocated_involved_path() {
         "",
         "repo",
         None,
+        false,
     )
     .expect_err("stale involved path must abort");
     assert!(

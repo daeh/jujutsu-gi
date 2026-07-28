@@ -2,7 +2,9 @@ version: '3'
 
 set: [errexit, pipefail]
 
-# Optional, untracked local overrides (personal tasks, machine-specific tweaks).
+# Optional dev-only local tasks (publish pipeline, demo recording). Tracked, but
+# excluded from public snapshots, so anything referenced from it must also be
+# dev-only. Absent from a published checkout, hence `optional: true`.
 includes:
   local:
     taskfile: Taskfile.local.yml

@@ -1,5 +1,7 @@
 # ji — Jujutsu workspace manager
 
+![ji](docs/assets/ji-create.jpg)
+
 `ji` is a convenience utility for managing [Jujutsu (jj)](https://jj-vcs.github.io) workspaces. (_Workspaces_ are the jj equivalent of git _worktrees_.)
 
 `ji` creates, switches, syncs, merges, and cleans up workspaces. It includes:
@@ -8,6 +10,7 @@
 - Per-project configuration: workspace-path templates, pre/post-start hooks, and file templates
 - Graph-aware operations that adapt to how the workspaces relate — auto-selecting fast-forward or merge, with rebase, squash, and other methods available explicitly
 - One-shot undo/redo of `ji` actions, via `ji`-managed bulk operations in the `jj op log`
+- macOS file-metadata fidelity: Finder aliases survive workspace operations (jj strips xattrs when materializing files; `ji` restores them), and broken hard links are reported
 
 Currently, only macOS is fully supported, but cross-platform support is on the roadmap.
 
@@ -18,6 +21,10 @@ Currently, only macOS is fully supported, but cross-platform support is on the r
 ## A handrail for learning jj
 
 Every `ji` operation is a short sequence of jj commands. The TUI close/transfer dialog shows the jj command sequence it will run *before* you confirm (and the dialog's `c` key copies them to the clipboard). If you are still building intuition for jj's primitives, `ji` is a useful way to watch what fast-forward, merge, rebase, and squash look like as jj command sequences on real repository state.
+
+![ji-merge](docs/assets/ji-transfer-detail.gif)
+
+
 
 ## Requirements
 
@@ -102,7 +109,7 @@ ji close [target] [--source <NAME>] [--delete-files]
 
 ji transfer [target] [--source <NAME>]
                      [--method {adaptive, merge, fast-forward-target, fast-forward-source,
-                                merge-abandon-old, rebase, merge-squash}]
+                                rebase, merge-squash}]
 
 ji sync [target] [--source <NAME>]
 ```
@@ -171,6 +178,7 @@ Full field reference, template variables, and hook semantics: [`docs/configurati
 | [docs/cli.md](docs/cli.md) | Every subcommand and flag |
 | [docs/tui.md](docs/tui.md) | TUI layout, keybindings, dialogs, modes |
 | [docs/operations.md](docs/operations.md) | Sync, transfer, close — diagrams and command sequences |
+| [docs/xattrs.md](docs/xattrs.md) | macOS Finder aliases, xattrs, and hard links across workspace operations |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Problem / solution pairs |
 
 ## License

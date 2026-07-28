@@ -135,6 +135,7 @@ fn main() -> anyhow::Result<()> {
                 workspace_path_template: &cfg.workspace_path,
                 repo_name: &repo_name,
                 author: cfg.ji_author.as_deref(),
+                preserve_finder_xattrs: cfg.preserve_finder_xattrs,
             };
 
             let result = commands::close::close(&params)?;
@@ -204,6 +205,7 @@ fn main() -> anyhow::Result<()> {
                 workspace_path_template: &cfg.workspace_path,
                 repo_name: &repo_name,
                 author: cfg.ji_author.as_deref(),
+                preserve_finder_xattrs: cfg.preserve_finder_xattrs,
             };
 
             let result = commands::transfer::transfer(&params)?;
@@ -250,6 +252,7 @@ fn main() -> anyhow::Result<()> {
                 &cfg.workspace_path,
                 &repo_name,
                 cfg.ji_author.as_deref(),
+                cfg.preserve_finder_xattrs,
             )?;
 
             match outcome {

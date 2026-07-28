@@ -8,7 +8,7 @@ pub mod types;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
-use crate::{jj_utils, jujutsu};
+use crate::{finder_xattrs, jj_utils, jujutsu};
 use types::{Operation, SyncMode, SyncModeInfo};
 
 // ---------------------------------------------------------------------------
@@ -259,6 +259,11 @@ pub struct ExecutionFreshness {
     /// jj-stale. This is the pre-op stale baseline for `post_op_stale`
     /// (no separate detection pass), and is excluded from auto-resolution.
     pub stale_skipped: Vec<String>,
+    /// Pre-operation Finder-metadata/hard-link capture across `ws_paths`,
+    /// taken after the broad protection snapshot (so the tracked list
+    /// includes just-snapshotted files). The command restores from it after
+    /// its materializations (see `finder_xattrs`).
+    pub xattr_guard: finder_xattrs::XattrGuard,
 }
 
 /// Execution-time freshness + protection phase. Runs after
@@ -294,6 +299,7 @@ pub fn prepare_execution_freshness(
     target_involved: bool,
     plan_consuming: bool,
     advance_target_change_id: Option<&str>,
+    preserve_finder_xattrs: bool,
 ) -> Result<ExecutionFreshness> {
     // 1. Fail closed on an unusable baseline: an empty op head means the
     // read failed when `validated` was computed (and "" == "" would have
@@ -389,10 +395,17 @@ pub fn prepare_execution_freshness(
         plan_consuming,
     )?;
 
+    // 6. Finder-metadata capture — after the recheck (a bailed freshness
+    // check never pays the capture cost) and after the broad snapshot (the
+    // tracked lists are current). `preserve_finder_xattrs` gates the restore
+    // writes only; the fidelity warnings are unconditional.
+    let xattr_guard = finder_xattrs::XattrGuard::capture(&ws_paths, preserve_finder_xattrs);
+
     Ok(ExecutionFreshness {
         info,
         ws_paths,
         stale_skipped,
+        xattr_guard,
     })
 }
 

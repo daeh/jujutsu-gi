@@ -3,7 +3,7 @@ members = [".", "xtask"]
 
 [package]
 name = "ji"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.97"
 description = "Jujutsu workspace manager TUI"
@@ -43,6 +43,9 @@ serde_json = "1"
 toml = "1.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
+# Safe-Rust route to list/get/setxattr under `unsafe_code = "forbid"`; its sole
+# dependency (rustix) is already in the build graph.
+xattr = "1"
 
 [dev-dependencies]
 tempfile = "3"
